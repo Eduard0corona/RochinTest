@@ -1125,3 +1125,15 @@ Compuerta en verde.
 - Un salto del reloj de prueba (`FakeTimeProvider`) mayor que la duración de un lease lo vence: las pruebas que avanzan el reloj renuevan los leases que siguen usando.
 - El directorio de locks debe ser el mismo para todas las instancias de una máquina y escribible por la cuenta del servicio.
 
+## Fase 6 · Perfil extendido (T09, T20): NO_APLICA
+
+### Plan
+
+- **Entregables:** ninguno. `PROMPT_IMPLEMENTACION.md` fija `PERFIL_EXTENDIDO=NO`, y OT-14 ("¿Es obligatorio conservar la historia de todos los ciclos durante una interrupción?") sigue abierta. El perfil extendido (FIFO del PLC, `AckCycleId`, journal SQLite con `synchronous=FULL`) solo se activa si OT lo exige (ADR 0009, I14).
+- **Pruebas:** T09 y T20 quedan `NO_APLICA (OT-14 abierta)` en `docs/TEST_STATUS.md`. No se implementaron ni se ejecutaron, y no cuentan como superadas.
+- **Etiqueta:** `fase-6-ok` sin código, como indica el prompt.
+
+### Lo que no se verificó
+
+- Todo el perfil extendido: journal SQLite, `AckCycleId`, reproducción tardía del journal, I21 y G09. La FIFO simulada de T11 (Fase 2) es solo la recuperación de ciclos tras reconectar del perfil mínimo.
+
