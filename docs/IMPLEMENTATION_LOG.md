@@ -471,6 +471,11 @@ La prueba nueva de MEDIA-2 se ejecutó también contra `OpcUaCycleSource.cs` de 
 
 Sin hallazgos ALTA en la segunda revisión: no se pide una tercera.
 
+### Decisiones de la persona (2026-10-14)
+
+- **SI-11 (clase A):** edición aprobada y aplicada en `8798b85` (especificación 1.1.4). Después: `py spec/tools/generate_artifacts.py` (regeneró `tests/MATRIZ_PRUEBAS.md`), `py spec/tools/update_checksums.py` (150 archivos) y `py spec/tools/verify_package.py` (`Resultado: 15 grupos OK, 0 errores`); `generate_artifacts.py --check`: artefactos al día.
+- **SI-10, SI-12 y SI-13 (clase B):** se mantienen los interinos de falla cerrada; quedan abiertos para OT-04.
+
 ### Lo que no se verificó
 
 - Ningún PLC real: el servidor OPC UA es el simulador. El formato del registro latched, el eco de cierre y la FIFO son del simulador (OT-04, OT-14).
