@@ -137,7 +137,9 @@ public sealed class PrinterOwnership(
             }
 
             var requested = clock.GetTimestamp();
-            var renewal = leases.AcquireAsync(printerId, ownerInstanceId, ownerHost, leaseDurationMs, leaseGraceMs, clock.UtcNow, ct);
+            // En el pool de hilos: parte de SqlClient es síncrona por debajo (BeginTransactionAsync), y con SQL colgado la llamada
+            // no devolvería su tarea hasta el tiempo de espera del comando.
+            var renewal = Task.Run(() => leases.AcquireAsync(printerId, ownerInstanceId, ownerHost, leaseDurationMs, leaseGraceMs, clock.UtcNow, ct), ct);
             if (await Task.WhenAny(renewal, Task.Delay(remaining, clock.TimeProvider, ct)) != renewal)
             {
                 // La llamada sigue colgada: el sender se detiene igual; su resultado, si llega, ya no cuenta.

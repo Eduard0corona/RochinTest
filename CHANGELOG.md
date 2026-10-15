@@ -10,6 +10,7 @@ Cambios de la implementación. Los de la especificación están en `spec/CHANGEL
 - Métricas `exceptional_reprints_total{risk,result}` y `unknown_resolution_total{result}`.
 - Pruebas: T27, T34, T36, T40, T41 y T43 en verde contra SQL Server real, la impresora simulada, el PLC simulado y procesos reales.
 - Revisión independiente: el arranque no sigue sin la impresora de línea (y el lease se libera al detener); una renovación que falla cuenta como lease perdido; TX-R0 antes de volver a enviar, probado con un `SENDING` heredado; los fallos del arranque se registran; una autorización rechazada no bloquea a las demás; validación de la API (400) y solicitud pendiente tras un rechazo.
+- Segunda revisión independiente: el sender se detiene al vencer la cobertura local del lease (duración menos gracia), aunque SQL cuelgue, y un error transitorio se reintenta; el ciclo de propiedad sobrevive a un error del sender; la etapa 3 no se completa sin la impresora; desbloqueo decidido en TX-M; cualquier rechazo de TX-X espera; pruebas de la liberación del lease y del NOT_SENT del sender manual.
 
 ## Fase 4 · Print Agent (2026-10-15)
 

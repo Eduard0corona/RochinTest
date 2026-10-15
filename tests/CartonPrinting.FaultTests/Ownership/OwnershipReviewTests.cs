@@ -126,7 +126,10 @@ public sealed class OwnershipReviewTests(SqlServerFixture sql) : IAsyncLifetime
             await steal.ExecuteNonQueryAsync(Ct);
         }
 
-        await AdvanceUntilAsync(s, () => resumed.Task.IsCompleted);
+        // Una vez detectada la pérdida y vuelta a tomar la impresora, el reloj de prueba deja de avanzar: si siguiera, podría
+        // vencer la cobertura del lease mientras SQL responde en tiempo real.
+        await AdvanceUntilAsync(s, () => resumed.Task.IsCompleted,
+            stopAdvancing: () => runner.Owned && s.Metrics.Total(MetricNames.PrinterOwnerConflicts, ("printer", s.PrinterId), ("cause", "lease_lost")) >= 1);
         Assert.Equal(["primera", $"{JobStatus.Unknown}/{JobReason.RestartDuringSend}"], runs);
         Assert.Equal(1, s.Metrics.Total(MetricNames.PrinterOwnerConflicts, ("printer", s.PrinterId), ("cause", "lease_lost")));
         Assert.Equal(2, runner.SenderRuns);
@@ -263,10 +266,12 @@ public sealed class OwnershipReviewTests(SqlServerFixture sql) : IAsyncLifetime
                 .RunAsync(TimeSpan.FromMilliseconds(50), TimeProvider.System, null, ct), stop.Token);
         try
         {
-            await Task.Delay(1_200, Ct);   // la renovación siguiente cae durante el corte
+            // Corte de 1,3 s: más largo que el intervalo de renovación (1 s), así que al menos una renovación falla, y más corto
+            // que la cobertura del lease (duración menos gracia, 2,5 s), así que un reintento llega a tiempo.
+            await Task.Delay(1_200, Ct);
             proxy.AcceptNew = false;
             proxy.SeverAll();
-            await Task.Delay(400, Ct);
+            await Task.Delay(1_300, Ct);
             proxy.AcceptNew = true;
             await Task.Delay(2_500, Ct);
 
@@ -320,7 +325,7 @@ public sealed class OwnershipReviewTests(SqlServerFixture sql) : IAsyncLifetime
             await Task.Delay(Timeout.Infinite, ct);
         }, stop.Token);
 
-        await AdvanceUntilAsync(s, () => resumed.Task.IsCompleted || run.IsFaulted);
+        await AdvanceUntilAsync(s, () => resumed.Task.IsCompleted || run.IsFaulted, stopAdvancing: () => runner.Owned);
         Assert.False(run.IsFaulted, run.Exception?.GetBaseException().Message);
         Assert.Equal($"{JobStatus.Unknown}/{JobReason.RestartDuringSend}", seenAtSecondRun);
         Assert.Equal(2, runner.SenderRuns);

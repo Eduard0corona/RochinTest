@@ -129,11 +129,13 @@ public sealed class PrintAgentThirdReviewTests(SqlServerFixture sql) : IAsyncLif
     }
 
     /// <summary>
-    /// MEDIA-4: el EdgeHost real, con la impresora configurada y SQL Server inalcanzable, se detiene con el código 70, no con 0:
-    /// un supervisor que reinicia ante falla lo relanza.
+    /// MEDIA-4 (tercera revisión de la Fase 4), con el arranque coordinado de la Fase 5: el EdgeHost real, con la impresora
+    /// configurada y SQL Server inalcanzable, no sale con 0: la etapa 2 (lock y lease) falla, se registra y se reintenta, y el
+    /// proceso sigue vivo para completar el arranque cuando SQL vuelva (ESTRATEGIA_RECUPERACION §3). En la Fase 4, sin arranque
+    /// coordinado, el mismo caso salía con el código 70.
     /// </summary>
     [Fact]
-    public async Task The_edge_host_exits_with_a_failure_code_when_sql_server_is_unreachable()
+    public async Task The_edge_host_keeps_retrying_its_startup_while_sql_server_is_unreachable()
     {
         var dll = AppContext.BaseDirectory.Replace(
             Path.Combine("tests", "CartonPrinting.FaultTests"), Path.Combine("src", "EdgeHost"), StringComparison.Ordinal) + "CartonPrinting.EdgeHost.dll";
@@ -144,12 +146,29 @@ public sealed class PrintAgentThirdReviewTests(SqlServerFixture sql) : IAsyncLif
         psi.Environment["Printer__PrinterId"] = "PRN-EXIT";
         psi.Environment["Printer__Transport__Port"] = "9";
         psi.Environment["Urls"] = "http://127.0.0.1:0";
-        using var host = Process.Start(psi)!;
-        var output = host.StandardOutput.ReadToEndAsync(Ct);
-        var errors = host.StandardError.ReadToEndAsync(Ct);
+        using var host = new Process { StartInfo = psi };
+        var retried = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var output = new System.Text.StringBuilder();
+        host.OutputDataReceived += (_, e) =>
+        {
+            lock (output)
+            {
+                output.AppendLine(e.Data);
+            }
+
+            if (e.Data?.Contains("Ownership:lock y lease de PRN-EXIT", StringComparison.Ordinal) == true)
+            {
+                retried.TrySetResult();
+            }
+        };
+        host.Start();
+        host.BeginOutputReadLine();
+        host.BeginErrorReadLine();
         try
         {
-            await host.WaitForExitAsync(Ct).WaitAsync(TimeSpan.FromSeconds(90), Ct);
+            await retried.Task.WaitAsync(TimeSpan.FromSeconds(60), Ct);
+            await Task.Delay(3_000, Ct);   // varios reintentos con espera creciente
+            Assert.False(host.HasExited, $"el EdgeHost salió con {(host.HasExited ? host.ExitCode : 0)}; salida: {output}");
         }
         finally
         {
@@ -158,8 +177,6 @@ public sealed class PrintAgentThirdReviewTests(SqlServerFixture sql) : IAsyncLif
                 host.Kill(entireProcessTree: true);
             }
         }
-
-        Assert.True(host.ExitCode == 70, $"código de salida {host.ExitCode}; salida: {await output} {await errors}");
     }
 
     /// <summary>Espera a que SQL Server muestre una petición compartida del lock de un ciclo en espera (la aplicación de TX-D).</summary>

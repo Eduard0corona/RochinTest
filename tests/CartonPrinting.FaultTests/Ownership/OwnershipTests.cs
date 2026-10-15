@@ -74,7 +74,7 @@ public sealed class OwnershipTests(SqlServerFixture sql) : IAsyncLifetime
 
             other.Kill(entireProcessTree: true);
             await other.WaitForExitAsync(Ct);
-            await AdvanceUntilAsync(s, () => sent.Task.IsCompleted);
+            await AdvanceUntilAsync(s, () => sent.Task.IsCompleted, stopAdvancing: () => runner.Owned);
             Assert.Equal(1, runner.SenderRuns);
             Assert.Equal(1, rig.Printer.TransmissionsOf((await s.JobAsync(job, Ct)).LabelSerial));
 
@@ -200,12 +200,20 @@ public sealed class OwnershipTests(SqlServerFixture sql) : IAsyncLifetime
         Port = port, ExpectsAcceptance = printer.Capabilities.ReportsAcceptance, AcceptanceTimeoutMs = 1_000,
     }, s.Provider);
 
-    /// <summary>Avanza el reloj de a poco hasta que se cumpla la condición (los temporizadores del ciclo de propiedad).</summary>
-    private static async Task AdvanceUntilAsync(StationScenario s, Func<bool> done)
+    /// <summary>
+    /// Avanza el reloj de a poco hasta que se cumpla la condición (los temporizadores del ciclo de propiedad). Con
+    /// <paramref name="stopAdvancing"/> deja de avanzarlo cuando se cumple: si siguiera mientras SQL responde en tiempo real,
+    /// vencería la cobertura del lease del dueño nuevo.
+    /// </summary>
+    private static async Task AdvanceUntilAsync(StationScenario s, Func<bool> done, Func<bool>? stopAdvancing = null)
     {
         for (var i = 0; i < 200 && !done(); i++)
         {
-            s.AdvanceMs(100_000);
+            if (stopAdvancing?.Invoke() != true)
+            {
+                s.AdvanceMs(100_000);
+            }
+
             await Task.Delay(50, Ct);
         }
 

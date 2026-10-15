@@ -940,8 +940,9 @@ Compuerta en verde.
    - `OwnedPrinterRunner` no invoca el sender sin el lock y el lease.
    - Reintenta tomar la impresora cada duración del lease, con una alerta por intento (`printer_owner_conflicts_total{cause}`).
    - Si pierde el lease, detiene el sender, y antes de volver a enviar ejecuta TX-R0.
-   - Una renovación que falla (SQL Server no responde) cuenta como lease perdido; un error al volver a tomar la impresora se registra y se reintenta (revisión, A2).
-   - Al detener el proceso, el lease se libera (queda vencido): la instancia siguiente no espera a que venza (revisión, A1).
+   - El sender se detiene antes de que el lease venza, con un margen igual a `LeaseGraceMs` (`ARQUITECTURA_TECNICA`). Cada toma o renovación fija una cobertura local, con el reloj monotónico: la duración menos la gracia, contada desde que se pidió. Si hasta ese instante no hay una renovación confirmada, porque SQL Server no responde, falla o cuelga la llamada, el lease cuenta como perdido sin esperar a que la llamada termine. Los errores de una renovación se reintentan mientras dure la cobertura: un corte breve no detiene el sender (revisión, A2; segunda revisión, MEDIA 1). La llamada corre en el pool de hilos, porque parte de SqlClient es síncrona por debajo (`BeginTransactionAsync`) y con SQL colgado no devolvería su tarea.
+   - Un error al volver a tomar la impresora, o del sender fuera de la escritura (por ejemplo, SQL al prepararlo), se registra y la vuelta siguiente vuelve a tomar la impresora con TX-R0; el ciclo de propiedad no termina (segunda revisión, MEDIA 2). La renovación siempre se detiene y se espera al terminar cada vuelta, también si el sender se detuvo (segunda revisión, BAJA 2).
+   - Al detener el proceso, el lease se libera (queda vencido): la instancia siguiente no espera a que venza (revisión, A1). Solo lo libera su dueño, con su token; las dos cosas tienen prueba (segunda revisión, MEDIA 3).
    - `OwnerInstanceId` lleva un GUID por arranque: dos contenedores con el mismo nombre de host y el mismo PID no son el mismo dueño. Un archivo de lock que la cuenta del servicio no puede abrir cuenta como lock ajeno (revisión, BAJA 1 y 3).
    - El lease no impide que un agente que ya validó su token transmita (T36): solo el aislamiento físico del canal lo garantiza (ADR 0010).
 3. **Arranque ordenado.**
@@ -949,7 +950,7 @@ Compuerta en verde.
    - Los senders arrancan después del barrido inicial; el latido periódico, después del primer `LabelingReady`.
    - La etapa 4 (vaciar la cola del dispositivo) se registra sin hacer nada: no hay una capacidad confirmada (OT-07).
    - La etapa 2 falla mientras otro proceso o instancia sea dueño de la impresora de línea: el arranque la reintenta con alerta y no llega a la suscripción ni a `LabelingReady` sin la impresora ni sin TX-R0 (revisión, A1). La impresora manual no detiene la estación: su ciclo de propiedad la toma, con TX-R0, antes de la primera reimpresión.
-   - TX-R0 renueva antes el lease: si la etapa se reintentó después de que venciera y otra instancia lo tomó, no cierra el intento en curso de esa instancia (revisión, BAJA 6).
+   - TX-R0 renueva antes el lease: si la etapa se reintentó después de que venciera y otra instancia lo tomó, no cierra el intento en curso de esa instancia (revisión, BAJA 6). Para la impresora de línea, la etapa 3 sin ser dueña falla también al reintentarse: no se da por terminada sin TX-R0. Y antes del primer envío, que llega después de las etapas 3 a 6 sin renovar, se confirma el lease; si dejó de ser de este proceso, se vuelve a tomar con TX-R0 (segunda revisión, BAJA 1).
    - El coordinador se crea antes que los servicios del host, así que el servicio de arranque le pasa el logger del host al ejecutarlo: cada fallo de un paso queda registrado con su etapa (revisión, M1).
 4. **Identidad en la Operations API.**
    - Cabeceras `X-Operator-Id` y `X-Operator-Key`. La configuración guarda solo el SHA-256 de cada clave y se compara en tiempo constante.
@@ -960,8 +961,9 @@ Compuerta en verde.
    - El destino es la `ManualPrinterId` de la revisión activa y la ventana de evidencia la de la revisión.
    - La API nunca envía bytes: la reimpresión la ejecuta el sender de la impresora manual con su lease.
    - Un rechazo de TX-M, de un trigger o de una restricción es 409 con el número de error. Una solicitud mal formada (un dato obligatorio vacío, un `firstCycleId` que no es la cadena decimal canónica de la regla 9, o un 515 de SQL) es 400.
-   - Si TX-M rechaza la aprobación, la solicitud vuelve a quedar pendiente (revisión, BAJA 5). Desbloquear una estación que no está bloqueada es 409 y no deja una `OperatorAction` sin efecto (revisión, BAJA 4).
-   - El sender manual deja esperando 5 s una autorización que TX-X rechaza (por ejemplo, LABEL_DAMAGED sin el retiro registrado): las aprobadas después se ejecutan (revisión, M3). TX-X devuelve `DuplicateRisk` en su `OUTPUT`, y entre TX-X y la escritura cualquier error o apagado es NOT_SENT, como en el sender de línea.
+   - Si TX-M rechaza la aprobación (409 o 400), la solicitud vuelve a quedar pendiente (revisión, BAJA 5). Un error desconocido, por ejemplo la conexión cortada después del commit, no la restaura, porque la autorización pudo quedar creada; TX-M no se cancela con la petición (segunda revisión, BAJA 7).
+   - Desbloquear una estación que no está bloqueada es 409 y no deja una `OperatorAction` sin efecto (revisión, BAJA 4). TX-M lo decide con la fila de la estación bloqueada (`UPDLOCK`), así que con desbloqueos concurrentes uno la desbloquea y los demás reciben 409 sin registro. Con 0 filas no lanza excepción (T47) (segunda revisión, BAJA 4).
+   - El sender manual deja esperando 5 s, con el reloj monotónico, una autorización que TX-X rechaza por cualquier causa, y las aprobadas después se ejecutan (revisión, M3; segunda revisión, BAJA 3 y 6). Causas: el trigger (LABEL_DAMAGED sin el retiro registrado), un índice (otro intento abierto del job) o SQL sin respuesta. TX-X devuelve `DuplicateRisk` en su `OUTPUT`, y entre TX-X y la escritura cualquier error o apagado es NOT_SENT, como en el sender de línea; lo comprueba una prueba (segunda revisión, MEDIA 3).
    - `exceptional_reprints_total` se cuenta con `{risk, result=EXECUTED}` al ejecutar y con `{result=UNRESOLVED}` en cada X03 (revisión, BAJA 7). En X03 el riesgo no está a mano sin otra consulta: las dos series se leen por separado, no se suman.
 6. **`unknown_resolution_total{result}`** se cuenta en las resoluciones manuales (reconciliación negativa y cierre). La resolución por evidencia (J15) no se cuenta.
 7. **T41 en sucesión.** `UX_ReprintAuthorization_OpenPerJob` admite una sola autorización `APPROVED` por job: las tres autorizaciones del catálogo se aprueban una después de otra.
@@ -997,7 +999,7 @@ Durante el desarrollo:
 
 ### Pruebas de la fase
 
-- **T27, T34, T36, T40, T41 y T43: PASA** (detalle en `docs/TEST_STATUS.md`).
+- **T27, T34, T36, T40, T41 y T43: PASA** (detalle en `docs/TEST_STATUS.md`). Dos revisiones independientes; la segunda no encontró hallazgos ALTA.
 
 ### Revisión independiente
 
@@ -1051,6 +1053,59 @@ Resultado: trazabilidad OK, 0 errores
 Compuerta en verde.
 ```
 
+### Segunda revisión independiente
+
+Subagente `revisor-adversarial` sobre una copia limpia de `50f789c` (2026-10-15). Ejecutó la compuerta (dos corridas: 168, 96 y 84 de 86, con dos fallos intermitentes que pasan solos; y 168, 96 y 86), la trazabilidad, repitió sus sondas de la primera revisión, hizo seis sondas nuevas (N1 a N6) y doce mutaciones. Los hallazgos A1, A2, M2, M3 (el caso 51021), M4 y las BAJA 5 y 8 quedaron resueltos. Resultado: 0 ALTA, 3 MEDIA y 7 BAJA.
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| MEDIA 1: con SQL colgado (no cortado), el sender seguía 20 s después del congelamiento, cuando el lease ya había vencido y otra instancia lo tenía; al revés, un solo error transitorio detenía el sender | Media | Decisión 2: cobertura local del lease con reintentos. Pruebas `A_renewal_that_hangs_stops_the_sender_before_the_lease_can_expire` (proxy congelado: se detiene en menos de 3 s) y `A_transient_renewal_error_does_not_stop_the_sender` (corte de 1,3 s, sin alerta) |
+| MEDIA 2: un error de SQL en el preámbulo del sender terminaba el ciclo de propiedad y el EdgeHost salía con 0 | Media | Decisión 2 y el código de salida 70 ante cualquier falla (tercera revisión de la Fase 4, MEDIA-4). Prueba `An_error_in_the_sender_does_not_end_the_ownership_cycle_and_tx_r0_runs_before_it_runs_again` |
+| MEDIA 3: tres correcciones sin prueba (NOT_SENT entre TX-X y la escritura, la liberación del lease, TX-R0 con el lease robado) | Media | Pruebas `A_reprint_whose_connection_fails_after_tx_x_is_not_sent`, `Only_the_owner_releases_the_lease_and_the_next_instance_takes_it_at_once` y `Tx_r0_does_not_run_after_the_lease_was_taken_by_another_instance` |
+| BAJA 1: el reintento de la etapa 3 la completaba sin TX-R0 y sin la impresora | Baja | Decisión 3. La misma prueba de TX-R0 con el lease robado lo comprueba |
+| BAJA 2: una renovación huérfana volvía a tomar el lease liberado | Baja | Decisión 2 (`finally` en el ciclo de propiedad) |
+| BAJA 3: la espera de 5 s solo cubría 52001 y 51021 | Baja | Decisión 5: cualquier rechazo de TX-X |
+| BAJA 4: desbloqueos concurrentes dejaban `OperatorAction` sin efecto | Baja | Decisión 5: TX-M con la fila bloqueada. La prueba de las acciones de estación hace ocho desbloqueos a la vez |
+| BAJA 5: pruebas de T27 y T43 inestables bajo carga (reloj de prueba que seguía avanzando; retardos negativos) | Baja | El reloj de prueba deja de avanzar cuando el runner vuelve a tener la impresora; los retardos se acotan en cero. En las pruebas nuevas con reloj manual pasó lo mismo con la cobertura del lease: se aplicó la misma corrección. Tres corridas seguidas, 15 de 15 |
+| BAJA 6: la espera de 5 s usaba el reloj de pared | Baja | Reloj monotónico (decisión 5) |
+| BAJA 7: restaurar la solicitud tras un commit ambiguo podía permitir una segunda autorización | Baja | Decisión 5: solo se restaura ante un rechazo definitivo. Sin prueba: no hay una forma determinista de cortar la conexión justo después del commit |
+
+Al integrar la Fase 4 cerrada aparecieron tres efectos de estas correcciones en pruebas existentes, todos corregidos en las pruebas:
+
+- **La prueba de T27 en el mismo host** (`OwnershipTests`) fallaba con dos corridas del sender en lugar de una. El reloj manual seguía avanzando 100 s cada 50 ms después de que el runner tomaba la impresora, y con la cobertura local del lease eso lo vencía mientras SQL respondía en tiempo real. El reloj deja de avanzar cuando el runner es dueño.
+- **`T51018_51019`** obtenía su `OperatorAction` desbloqueando una estación habilitada, y TX-M ya no la registra. Ahora usa un desbloqueo real que la estación ya no referencia: de lo contrario, el DELETE lo rechazaría la FK `FK_StationConfig_OperatorAction` y no el trigger.
+- **La prueba de proceso del EdgeHost** de la tercera revisión de la Fase 4 esperaba el código de salida 70 con SQL Server inalcanzable. Con el arranque coordinado, el EdgeHost no sale: la etapa 2 falla, se registra y se reintenta hasta que SQL vuelva (ESTRATEGIA_RECUPERACION §3). La prueba ahora comprueba eso (`The_edge_host_keeps_retrying_its_startup_while_sql_server_is_unreachable`). El código 70 queda para una falla que termina el servicio de impresora después del arranque, como un sender detenido.
+
+Mutaciones ejecutadas después de las correcciones, cada una revertida:
+
+- **Sin la cobertura local del lease:** falla la prueba del SQL colgado.
+- **El primer error de renovación detiene el sender:** falla la del corte breve. En su primera versión el corte duraba 400 ms y no coincidía con ninguna renovación, así que la prueba pasaba con la mutación; ahora dura 1,3 s.
+- **Un error del sender termina el ciclo de propiedad:** falla la prueba de MEDIA 2.
+- **Liberación sin comprobar dueño y token:** falla la de la liberación.
+- **La etapa 3 sin dueño se da por terminada:** falla la de TX-R0 con el lease robado.
+- **Un error antes de escribir en el sender manual relanza la excepción:** falla la de NOT_SENT después de TX-X.
+- **Desbloqueo sin comprobar en TX-M:** falla la de las acciones de estación.
+
+Compuerta completa después de las correcciones, 2026-10-15 05:46 (`powershell -File build/ci.ps1 --fase 5`, con la Fase 4 cerrada integrada):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   168, Omitido:     0, Total:   168, Duración: 9 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    97, Omitido:     0, Total:    97, Duración: 2 m 31 s - CartonPrinting.IntegrationTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    96, Omitido:     0, Total:    96, Duración: 3 m 13 s - CartonPrinting.FaultTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 62 ejecutadas
+  Fase 2: T11=1 destino(s), 1 ejecutadas, T13=5 destino(s), 5 ejecutadas, T24=1 destino(s), 1 ejecutadas, T25=8 destino(s), 10 ejecutadas, T26=2 destino(s), 3 ejecutadas, T30=2 destino(s), 3 ejecutadas, T35=2 destino(s), 2 ejecutadas, T45=4 destino(s), 12 ejecutadas
+  Fase 3: T03=1 destino(s), 1 ejecutadas, T04=1 destino(s), 1 ejecutadas, T17=1 destino(s), 1 ejecutadas, T18=4 destino(s), 4 ejecutadas, T21=1 destino(s), 1 ejecutadas, T33=1 destino(s), 1 ejecutadas, T37=6 destino(s), 7 ejecutadas, T46=1 destino(s), 1 ejecutadas
+  Fase 4: T05=4 destino(s), 4 ejecutadas, T06=1 destino(s), 1 ejecutadas, T07=1 destino(s), 1 ejecutadas, T15=3 destino(s), 3 ejecutadas, T22=8 destino(s), 8 ejecutadas, T29=4 destino(s), 4 ejecutadas, T31=1 destino(s), 1 ejecutadas, T38=1 destino(s), 1 ejecutadas, T39=1 destino(s), 1 ejecutadas, T42=1 destino(s), 1 ejecutadas, T44=2 destino(s), 2 ejecutadas
+  Fase 5: T27=6 destino(s), 6 ejecutadas, T34=2 destino(s), 2 ejecutadas, T36=1 destino(s), 1 ejecutadas, T40=1 destino(s), 1 ejecutadas, T41=2 destino(s), 2 ejecutadas, T43=3 destino(s), 3 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
 ### Lo que no se verificó
 
 - Dos máquinas reales: los "hosts distintos" de T27 y T36 se simulan con directorios de lock separados en una máquina, y el aislamiento del canal de T36 con un proxy TCP.
@@ -1059,7 +1114,9 @@ Compuerta en verde.
 - Las solicitudes de reimpresión pendientes se pierden si el EdgeHost reinicia: hay que volver a pedirlas.
 - La etapa 4 del arranque (vaciar la cola del dispositivo) no tiene implementación.
 - `unknown_resolution_total` no cuenta las resoluciones por evidencia.
-- La composición del EdgeHost (`Program.cs`, `PrinterHostedService`, `StartupHostedService`) no tiene prueba: la liberación del lease al detener, la etapa 2 que falla solo para la impresora de línea, el logger del arranque y el código de salida 70 se comprueban por partes, no en el proceso.
+- La composición del EdgeHost (`Program.cs`, `PrinterHostedService`, `StartupHostedService`) solo tiene una prueba de proceso: con SQL Server inalcanzable, el arranque se reintenta y el proceso no sale. El código de salida 70 de una falla posterior al arranque no tiene prueba de proceso. La liberación del lease al detener (el `finally` del servicio), la etapa 2 que falla solo para la impresora de línea y el logger del arranque se comprueban en sus piezas (`PrinterOwnership`, `OwnedPrinterRunner`, `StartupCoordinator`), no en el proceso.
+- La restauración de una solicitud tras un commit ambiguo (segunda revisión, BAJA 7) no tiene prueba.
+- La cobertura local del lease supone que el reloj monotónico del EdgeHost no se detiene; una suspensión del proceso más larga que la cobertura la cubre el aislamiento físico del canal (T36), no el software.
 - El lock de sistema operativo en Linux: depende de `TMPDIR` y de `PrivateTmp` del servicio, y `DOTNET_SYSTEM_IO_DISABLEFILELOCKING` lo anula. No se probó en Linux.
 - Un `firstCycleId` de más de 20 dígitos o con signo lo rechaza la validación canónica; no hay prueba de cada forma inválida, solo del número JSON y del cero a la izquierda.
 
