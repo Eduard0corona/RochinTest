@@ -59,6 +59,16 @@ public sealed class PrinterHostedService(
         await using var transport = new TcpPrinterTransport(options.Transport, clock.TimeProvider);
         var sender = new PrinterSenderService(options.PrinterId, db, new ClaimService(db, new TxbClaim(db), metrics, clock, services.GetService<ClockGuard>() ?? new ClockGuard(clock)), new TxcWriteResult(db),
             new StationConfigStore(db), lease, transport, clock, metrics, logger: loggers.CreateLogger<PrinterSenderService>(), evidence: evidence);
-        await sender.RunAsync(TimeSpan.FromMilliseconds(options.PollIntervalMs), clock.TimeProvider, null, stoppingToken);
+        try
+        {
+            await sender.RunAsync(TimeSpan.FromMilliseconds(options.PollIntervalMs), clock.TimeProvider, null, stoppingToken);
+        }
+        catch (SenderHaltedException)
+        {
+            // El host se detiene con un código distinto de 0, para que el supervisor lo relance y el arranque siguiente
+            // ejecute TX-R0 (segunda revisión de la Fase 4, B-3).
+            Environment.ExitCode = 70;
+            throw;
+        }
     }
 }

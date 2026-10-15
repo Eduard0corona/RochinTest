@@ -14,6 +14,12 @@ namespace CartonPrinting.PrintAgent;
 /// </summary>
 public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, CartonMetrics metrics)
 {
+    /// <summary>
+    /// Horizonte de la reaplicación del arranque: una observación registrada y sin aplicar (el proceso cayó entre las dos
+    /// transacciones de TX-D) se reaplica si se recibió dentro de las 24 h anteriores al arranque.
+    /// </summary>
+    public static readonly TimeSpan StartupHorizon = TimeSpan.FromHours(24);
+
     private readonly ConcurrentDictionary<Guid, DateTime> _printedAt = new();
     private readonly ConcurrentDictionary<Guid, DateTime> _appliedAt = new();
     private readonly ConcurrentDictionary<Guid, ConcurrentQueue<(string Level, DateTime ObservedAt)>> _pending = new();
@@ -44,16 +50,22 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
         }
 
         outcome ??= await txd.ApplyAsync(id, clock.UtcNow, ct);
-        await MeasureAsync(observation, outcome, ct);
+        await MeasureAsync(id, observation, outcome, ct);
         return outcome;
     }
 
     /// <summary>
-    /// Al arrancar el sender, después de TX-R0: reaplica la evidencia de los jobs de la impresora que todavía esperan
-    /// evidencia o quedaron sin resolver (TRANSMITTED o UNKNOWN), por si una observación quedó registrada sin aplicar.
+    /// Al arrancar el sender, después de TX-R0, reaplica en orden lo que pudo quedar registrado sin aplicar si el proceso cayó
+    /// entre las dos transacciones de TX-D, dentro de <see cref="StartupHorizon"/>:
+    /// <list type="bullet">
+    /// <item>la evidencia de los jobs de la impresora que esperan evidencia o quedaron sin resolver (TRANSMITTED o UNKNOWN);</item>
+    /// <item>las lecturas VERIFIED con otro serial de sus jobs CONFIRMED o UNKNOWN, que son J18 (segunda revisión de la Fase 4,
+    /// M-3; I25 y T44: una corrección nunca se pierde en silencio).</item>
+    /// </list>
     /// </summary>
     public async Task<int> ReapplyOpenAsync(string printerId, CancellationToken ct)
     {
+        var horizon = clock.UtcNow - StartupHorizon;
         var jobs = await db.ReadAsync<IReadOnlyList<Guid>>(async conn =>
         {
             await using var cmd = conn.Command(null, """
@@ -79,29 +91,14 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
             if (await db.ReadAsync(conn => JobQueries.GetJobAsync(conn, null, jobId, ct), ct) is { } job
                 && await LastClaimAsync(jobId, ct) is { } since)
             {
-                applied += await ReapplyForJobAsync(job, since, ct);
+                applied += await ReapplyForJobAsync(job, since > horizon ? since : horizon, ct);
             }
         }
 
-        return applied;
-    }
-
-    /// <summary>
-    /// Reaplica, en orden, las observaciones de la estación registradas desde <paramref name="since"/> (por
-    /// ejemplo, al arrancar: una observación pudo quedar registrada y sin aplicar si el proceso cayó entre las
-    /// dos transacciones de TX-D). Es seguro: una observación ya aplicada, o anterior al estado vigente del job
-    /// (ADR 0016), queda sin efecto.
-    /// </summary>
-    public async Task<int> ReapplySinceAsync(string siteId, string stationId, DateTime since, CancellationToken ct)
-    {
-        var ids = await db.ReadAsync<IReadOnlyList<long>>(async conn =>
+        var contradictions = await db.ReadAsync<IReadOnlyList<long>>(async conn =>
         {
-            await using var cmd = conn.Command(null, """
-                SELECT ObservationId FROM dbo.EvidenceObservation
-                WHERE SiteId = @site AND StationId = @station AND ReceivedAt >= @since
-                ORDER BY ObservationId;
-                """);
-            cmd.NVarChar("@site", siteId, 64).NVarChar("@station", stationId, 64).DateTime2("@since", since);
+            await using var cmd = conn.Command(null, EvidenceQueries.StartupContradictions);
+            cmd.DateTime2("@since", horizon).NVarChar("@printer", printerId, 64);
             var list = new List<long>();
             await using var r = await cmd.ExecuteReaderAsync(ct);
             while (await r.ReadAsync(ct))
@@ -111,10 +108,11 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
 
             return list;
         }, ct);
-        var applied = 0;
-        foreach (var id in ids)
+        foreach (var id in contradictions)
         {
-            if ((await txd.ApplyAsync(id, clock.UtcNow, ct)).Action != EvidenceAction.Recorded)
+            var outcome = await txd.ApplyAsync(id, clock.UtcNow, ct);
+            CountAlerts(outcome);
+            if (outcome.Action != EvidenceAction.Recorded)
             {
                 applied++;
             }
@@ -149,13 +147,7 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
     {
         var ids = await db.ReadAsync<IReadOnlyList<long>>(async conn =>
         {
-            await using var cmd = conn.Command(null, """
-                SELECT ObservationId FROM dbo.EvidenceObservation
-                WHERE ReceivedAt >= @since
-                  AND (PrintJobId = @job
-                       OR (SiteId = @site AND StationId = @station AND PlcEpoch = @epoch AND CycleId = @cycle))
-                ORDER BY ObservationId;
-                """);
+            await using var cmd = conn.Command(null, EvidenceQueries.ForJobSince);
             cmd.DateTime2("@since", since).Guid("@job", job.PrintJobId).NVarChar("@site", job.SiteId, 64).NVarChar("@station", job.StationId, 64)
                 .BigInt("@epoch", job.PlcEpoch).Cycle("@cycle", job.CycleId);
             var list = new List<long>();
@@ -217,7 +209,7 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
         }
     }
 
-    private async Task MeasureAsync(ObservationInput o, EvidenceOutcome outcome, CancellationToken ct)
+    private async Task MeasureAsync(long observationId, ObservationInput o, EvidenceOutcome outcome, CancellationToken ct)
     {
         CountAlerts(outcome);
 
@@ -226,16 +218,26 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
             return;
         }
 
-        if (await SentAtAsync(jobId, ct) is { } sent)
+        var attempts = await db.ReadAsync(conn => JobQueries.GetAttemptsAsync(conn, null, jobId, ct), ct);
+        if (SentAt(attempts) is { } sent)
         {
-            // Lo que quedó pendiente durante SENDING se mide antes, en su orden.
+            // Lo que quedó pendiente durante SENDING se mide antes, en su orden. La confirmación cuenta aunque la haya
+            // aplicado la reaplicación del sender antes que este pase (segunda revisión de la Fase 4, B-5).
             await MeasurePendingAsync(jobId, ct);
-            Measure(jobId, sent, o.EvidenceLevel, o.ObservedAt, outcome.Action is EvidenceAction.Confirmed or EvidenceAction.ExceptionalConfirmed);
+            var confirmed = outcome.Action is EvidenceAction.Confirmed or EvidenceAction.ExceptionalConfirmed
+                || attempts.Any(a => a.ConfirmingObservationId == observationId);
+            Measure(jobId, sent, o.EvidenceLevel, o.ObservedAt, confirmed);
         }
         else
         {
             // Llegó antes de TX-C (todavía sin WriteStartedAt): se mide al reaplicar después de TX-C, o ahora mismo
-            // si TX-C confirmó entre la lectura y el encolado.
+            // si TX-C confirmó entre la lectura y el encolado. Solo para métricas: si se acumulan jobs que nunca se
+            // escriben, lo pendiente se descarta.
+            if (_pending.Count > 10_000)
+            {
+                _pending.Clear();
+            }
+
             _pending.GetOrAdd(jobId, _ => new ConcurrentQueue<(string, DateTime)>()).Enqueue((o.EvidenceLevel, o.ObservedAt));
             await MeasurePendingAsync(jobId, ct);
         }
@@ -295,9 +297,54 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
         }
     }
 
-    private async Task<DateTime?> SentAtAsync(Guid jobId, CancellationToken ct)
-    {
-        var attempts = await db.ReadAsync(conn => JobQueries.GetAttemptsAsync(conn, null, jobId, ct), ct);
-        return attempts.Where(a => a.WriteStartedAt is not null).MaxBy(a => a.AttemptNumber)?.WriteStartedAt;
-    }
+    private async Task<DateTime?> SentAtAsync(Guid jobId, CancellationToken ct) =>
+        SentAt(await db.ReadAsync(conn => JobQueries.GetAttemptsAsync(conn, null, jobId, ct), ct));
+
+    private static DateTime? SentAt(IReadOnlyList<AttemptRecord> attempts) =>
+        attempts.Where(a => a.WriteStartedAt is not null).MaxBy(a => a.AttemptNumber)?.WriteStartedAt;
+}
+
+/// <summary>
+/// Consultas de evidencia de la ruta crítica (segunda revisión de la Fase 4, M-2). <c>EvidenceObservation</c> solo crece y no
+/// tiene índice por <c>PrintJobId</c> ni por <c>ReceivedAt</c>: estas consultas no la recorren completa. Son públicas para que
+/// las pruebas comprueben su plan.
+/// </summary>
+public static class EvidenceQueries
+{
+    /// <summary>
+    /// Cota inferior de ObservationId para "recibida desde @since": el último ObservationId recibido más de 5 minutos antes de
+    /// @since, buscado hacia atrás en la clave primaria, así que solo se leen las filas recientes. ReceivedAt se toma del reloj
+    /// del EdgeHost justo antes de insertar: una fila recibida desde @since no puede tener un ObservationId menor salvo que el
+    /// reloj de pared retroceda más de 5 minutos, lo que CLOCK_JUMP detecta. Quien la usa fuerza la búsqueda en la clave
+    /// primaria (FORCESEEK): al compilar, el optimizador no conoce el valor de @from y elegiría recorrer la tabla.
+    /// </summary>
+    public const string FromObservation = """
+        DECLARE @from BIGINT = ISNULL((SELECT TOP (1) ObservationId FROM dbo.EvidenceObservation
+            WHERE ReceivedAt < DATEADD(MINUTE, -5, @since) ORDER BY ObservationId DESC), 0);
+
+        """;
+
+    /// <summary>
+    /// La evidencia de un job recibida desde @since, en orden: la de su ciclo (@site, @station, @epoch, @cycle) por
+    /// IX_EvidenceObservation_Cycle y la del job (@job, PRINTED) desde la cota de la clave primaria.
+    /// </summary>
+    public const string ForJobSince = FromObservation + """
+        SELECT ObservationId FROM dbo.EvidenceObservation
+        WHERE SiteId = @site AND StationId = @station AND PlcEpoch = @epoch AND CycleId = @cycle AND ReceivedAt >= @since
+        UNION
+        SELECT ObservationId FROM dbo.EvidenceObservation WITH (INDEX (PK_EvidenceObservation), FORCESEEK)
+        WHERE ObservationId > @from AND PrintJobId = @job AND ReceivedAt >= @since
+        ORDER BY ObservationId;
+        """;
+
+    /// <summary>Las lecturas VERIFIED con otro serial, recibidas desde @since, de jobs CONFIRMED o UNKNOWN de @printer (J18 pendientes).</summary>
+    public const string StartupContradictions = FromObservation + """
+        SELECT eo.ObservationId
+        FROM dbo.EvidenceObservation AS eo WITH (INDEX (PK_EvidenceObservation), FORCESEEK)
+        INNER JOIN dbo.PrintJob AS pj
+            ON pj.SiteId = eo.SiteId AND pj.StationId = eo.StationId AND pj.PlcEpoch = eo.PlcEpoch AND pj.CycleId = eo.CycleId
+        WHERE eo.ObservationId > @from AND eo.ReceivedAt >= @since AND eo.EvidenceLevel = 'VERIFIED'
+          AND pj.PrinterId = @printer AND pj.Status IN ('CONFIRMED', 'UNKNOWN') AND eo.ReadSerial <> pj.LabelSerial
+        ORDER BY eo.ObservationId;
+        """;
 }

@@ -40,8 +40,8 @@ public sealed class SenderHaltedException(string message, Exception inner) : Exc
 
 /// <summary>
 /// Sender único de una impresora (I11): toma el siguiente job READY en orden de envío (época por
-/// AcceptedAt, después CycleId), lo reclama con TX-B (que confirma antes de cualquier I/O, I19), hace la
-/// segunda comprobación con el reloj monotónico, la estación y la compuerta justo antes de escribir y
+/// AcceptedAt, después CycleId), lo reclama con TX-B (que confirma antes de cualquier I/O, I19), abre el canal,
+/// relee la estación y la compuerta, hace la segunda comprobación con el reloj monotónico justo antes de escribir y
 /// cierra con TX-C en una transacción nueva (I20). NOT_SENT solo si la escritura nunca se invocó; cualquier
 /// error desde que se invoca es UNKNOWN (I02). Nunca reintenta un envío que pudo ocurrir (I03).
 /// </summary>
@@ -98,44 +98,57 @@ public sealed class PrinterSenderService(
         var backoff = context.Frozen.RetryBackoffMs;
         var maxAttempts = context.EffectiveMaxAutoAttempts;
 
-        if (faults is not null)
-        {
-            await faults.OnPointAsync(SenderPoint.AfterClaimCommit, attemptId, ct);
-        }
-
-        // Lo que necesita I/O va antes de la comprobación final (DOCUMENTO_PRINCIPAL §10.2, paso 2): la estación
-        // (leída ahora, en memoria al escribir), la compuerta física y el canal.
-        var station = await stations.GetActiveAsync(context.Job.SiteId, context.Job.StationId, ct);
-        if (station is not { State.LabelingEnabled: true })
-        {
-            metrics.Increment(MetricNames.PresendCheckRejected, ("cause", "station"));
-            return await NotSentAsync(printJobId, claim, attemptId, clock.UtcNow, "Segunda comprobación: estación bloqueada", NotSentCause.GateOrStation,
-                backoff, maxAttempts);
-        }
-
-        if (context.EffectiveGateFreshnessMs is { } freshness
-            && (gate is null || !await gate.IsOpenForAsync(context.Job.Identity, freshness, ct)))
-        {
-            metrics.Increment(MetricNames.PresendCheckRejected, ("cause", "gate"));
-            return await NotSentAsync(printJobId, claim, attemptId, clock.UtcNow, "Segunda comprobación: compuerta física cerrada", NotSentCause.GateOrStation,
-                backoff, maxAttempts);
-        }
-
-        // Abrir el canal no es escribir: si falla (o se cancela), la escritura nunca se invocó. Una conexión ociosa que
-        // la impresora cerró no cuenta como abierta y se reabre. Si el plazo venció mientras tanto, es J08.
+        // Entre el claim y la escritura nada se invocó todavía: un rechazo, cualquier error (SQL, la compuerta) o un
+        // apagado terminan en NOT_SENT y nunca dejan el intento en SENDING (I02; segunda revisión de la Fase 4, M-1). Con
+        // el plazo monotónico vencido es J08; si no, J07 cuando falla el canal y J06 en lo demás (no consume intento).
+        string? rejection = null;
+        var cause = NotSentCause.GateOrStation;
         try
         {
-            if (!transport.Connected)
+            if (faults is not null)
             {
-                await transport.ConnectAsync(ct);
+                await faults.OnPointAsync(SenderPoint.AfterClaimCommit, attemptId, ct);
+            }
+
+            // Abrir el canal no es escribir. Una conexión ociosa que la impresora cerró no cuenta como abierta y se reabre.
+            try
+            {
+                if (!transport.Connected)
+                {
+                    await transport.ConnectAsync(ct);
+                }
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                transport.Reset();
+                (rejection, cause) = ($"Conexión fallida: {ex.Message}", NotSentCause.ConnectionFailed);
+            }
+
+            // Lo que necesita I/O va justo antes de la comprobación final (DOCUMENTO_PRINCIPAL §10.2, paso 2), ya con el
+            // canal abierto: la estación (leída ahora, en memoria al escribir) y la compuerta física.
+            if (rejection is null && await stations.GetActiveAsync(context.Job.SiteId, context.Job.StationId, ct) is not { State.LabelingEnabled: true })
+            {
+                metrics.Increment(MetricNames.PresendCheckRejected, ("cause", "station"));
+                rejection = "Segunda comprobación: estación bloqueada";
+            }
+            else if (rejection is null && context.EffectiveGateFreshnessMs is { } freshness
+                && (gate is null || !await gate.IsOpenForAsync(context.Job.Identity, freshness, ct)))
+            {
+                metrics.Increment(MetricNames.PresendCheckRejected, ("cause", "gate"));
+                rejection = "Segunda comprobación: compuerta física cerrada";
             }
         }
         catch (Exception ex)
         {
             transport.Reset();
+            _logger.LogWarning("Sender de {Printer}: error antes de escribir el job {Job}: {Error}. NOT_SENT.", printerId, printJobId, ex.Message);
+            (rejection, cause) = ($"Error antes de escribir: {ex.Message}", NotSentCause.GateOrStation);
+        }
+
+        if (rejection is not null)
+        {
             var expired = clock.GetTimestamp() >= deadlineTs;
-            return await NotSentAsync(printJobId, claim, attemptId, clock.UtcNow, $"Conexión fallida: {ex.Message}",
-                expired ? NotSentCause.DeadlinePassed : NotSentCause.ConnectionFailed, backoff, maxAttempts);
+            return await NotSentAsync(printJobId, claim, attemptId, clock.UtcNow, rejection, expired ? NotSentCause.DeadlinePassed : cause, backoff, maxAttempts);
         }
 
         // Segunda comprobación: la última instrucción antes de escribir, sin I/O. Plazo con el reloj monotónico.

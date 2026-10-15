@@ -93,7 +93,7 @@ public sealed class PrintAgentReviewTests(SqlServerFixture sql) : IAsyncLifetime
         await s.Stations.BlockAsync(StationScenario.SiteId, s.StationId, BlockReason.IdentityCollision, "SYSTEM", null, s.Clock.UtcNow, Ct);
 
         using var stop = CancellationTokenSource.CreateLinkedTokenSource(Ct);
-        stop.CancelAfter(TimeSpan.FromSeconds(1));
+        stop.CancelAfter(TimeSpan.FromSeconds(3));
         try
         {
             await rig.Sender.RunAsync(TimeSpan.FromMilliseconds(200), TimeProvider.System, null, stop.Token);
@@ -103,7 +103,7 @@ public sealed class PrintAgentReviewTests(SqlServerFixture sql) : IAsyncLifetime
             // Fin de la ventana de observación.
         }
 
-        Assert.InRange(s.Metrics.Total(MetricNames.ClaimRejected, ("cause", nameof(ClaimRejection.StationDisabled))), 1, 8);
+        Assert.InRange(s.Metrics.Total(MetricNames.ClaimRejected, ("cause", nameof(ClaimRejection.StationDisabled))), 1, 20);
         Assert.Equal(0L, rig.Printer.BytesReceived);
     }
 
