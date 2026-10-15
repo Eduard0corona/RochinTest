@@ -66,12 +66,11 @@ public sealed class RegistrationService(
         var deadline = DeadlinePolicy.Compute(revision, record.DetectionTimestamp, record.ReceivedAt, record.Transport, record.QueueOverflow,
             opensGap: sequence.Gap is not null);
 
-        if (record.WorkOrderId is null || (revision.RequiresCartonId && record.CartonId is null))
+        if (record.WorkOrderId is null)
         {
-            // Registro incompleto: la orden es obligatoria en el contrato con el PLC y, con
-            // CARTON_ID_REQUIRED, la identidad física también (SI-04). Va antes que cualquier otra
-            // clasificación terminal: una detección sin orden solo puede quedar BLOCKED
-            // (CK_CartonDetection_WorkOrder), salvo que la secuencia ya la bloqueara por otra causa.
+            // Registro sin orden de trabajo (obligatoria en el contrato con el PLC): datos incoherentes.
+            // Va antes que cualquier otra clasificación terminal porque una detección sin orden solo puede
+            // quedar BLOCKED (CK_CartonDetection_WorkOrder), salvo que la secuencia ya la bloqueara.
             if (terminalStatus != DetectionStatus.Blocked)
             {
                 (terminalStatus, terminalReason) = (DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot);
@@ -83,6 +82,12 @@ public sealed class RegistrationService(
             (terminalStatus, terminalReason) = revision.DeadlineReference == DeadlineReference.PlcTimestamp
                 ? (DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot)
                 : (DetectionStatus.Expired, DetectionReason.LateArrival);
+        }
+        else if (terminalStatus is null && revision.RequiresCartonId && record.CartonId is null)
+        {
+            // SI-04 (vacío, clase B): CARTON_ID_REQUIRED sin CartonId. Interino de falla cerrada, solo para
+            // un registro que de otro modo sería candidato; no pasa por encima de D04 ni de la secuencia.
+            (terminalStatus, terminalReason) = (DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot);
         }
 
         var detection = new DetectionInsert

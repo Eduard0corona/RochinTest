@@ -173,8 +173,10 @@ public sealed class ReferenceStatementTests(SqlServerFixture sql) : IAsyncLifeti
         var late = await s.RegisterAsync(s.Cycle(42, workOrder: "WO-OTRA-2"));
         s.AdvanceMs(3000);
         await s.AddSnapshotAsync("R1", "SKU-3", "LOT-3", Ct, "WO-OTRA-2");
-        var d07 = await s.Txe.ExecuteAsync(await ErpPlanAsync(s, late.DetectionId, (await s.Erp.FindValidAsync("WO-OTRA-2", s.Clock.UtcNow, Ct))!, 42), Ct);
-        Assert.Equal((DetectionStatus.Expired, DetectionReason.ErpUnavailable), (d07.FinalStatus, d07.FinalReason));      // D07
+        var tooLate = await s.Txe.ExecuteAsync(await ErpPlanAsync(s, late.DetectionId, (await s.Erp.FindValidAsync("WO-OTRA-2", s.Clock.UtcNow, Ct))!, 42), Ct);
+        Assert.Equal((DetectionStatus.WaitingErp, (Guid?)null), (tooLate.FinalStatus, tooLate.PrintJobId));              // 0 filas: sin job
+        Assert.Single(await s.Txs.ExpireWaitingErpAsync(StationScenario.SiteId, s.StationId, 100, s.Clock.UtcNow, Ct));    // D07 en TX-S
+        Assert.Equal((DetectionStatus.Expired, DetectionReason.ErpUnavailable), ((await s.DetectionAsync(42))!.Status, (await s.DetectionAsync(42))!.Reason));
     }
 
     [Fact]

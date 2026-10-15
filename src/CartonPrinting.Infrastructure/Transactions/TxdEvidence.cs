@@ -106,12 +106,20 @@ public sealed class TxdEvidence(SqlDb db)
 
             var attempts = await JobQueries.GetAttemptsAsync(conn, tx, job.PrintJobId, ct);
 
+            // Una observación que referencia un intento de otro job es incoherente: registrada, sin efecto.
+            if (o.AttemptId is { } referenced && !attempts.Any(a => a.AttemptId == referenced))
+            {
+                return new EvidenceOutcome(EvidenceAction.Recorded, job.PrintJobId, null, job.Status, null);
+            }
+
+            var minimum = await FrozenMinimumLevelAsync(conn, tx, job.ConfigRevisionId, ct);
+
             // Una lectura VERIFIED del ciclo con otro serial contradice al job, haya o no intento ordinario.
             var contradicts = o.EvidenceLevel == EvidenceLevel.Verified
                 && !string.Equals(o.ReadSerial, job.LabelSerial, StringComparison.Ordinal);
             if (contradicts)
             {
-                return await ApplyContradictionAsync(conn, tx, o, job, attempts, edgeNowUtc, ct);
+                return await ApplyContradictionAsync(conn, tx, o, job, attempts, minimum, edgeNowUtc, ct);
             }
 
             var attempt = o.AttemptId is { } aid
@@ -122,7 +130,6 @@ public sealed class TxdEvidence(SqlDb db)
                 return new EvidenceOutcome(EvidenceAction.Recorded, job.PrintJobId, null, job.Status, null);
             }
 
-            var minimum = await FrozenMinimumLevelAsync(conn, tx, job.ConfigRevisionId, ct);
             if (!IsSufficient(o, job, attempt, minimum))
             {
                 return new EvidenceOutcome(EvidenceAction.Recorded, job.PrintJobId, attempt.AttemptId, job.Status, null);
@@ -174,6 +181,23 @@ public sealed class TxdEvidence(SqlDb db)
     public Task<EvidenceOutcome> DeviceNotPrintedAsync(Guid attemptId, string deviceReport, DateTime edgeNowUtc, CancellationToken ct) =>
         db.InTransactionAsync(async (conn, tx) =>
         {
+            // A07 y J12 exigen nivel congelado distinto de NONE: con NONE, TRANSMITTED es terminal.
+            await using (var level = conn.Command(tx, """
+                SELECT pa.Kind, fr.MinConfirmationLevel
+                FROM dbo.PrintAttempt AS pa
+                INNER JOIN dbo.PrintJob AS pj ON pj.PrintJobId = pa.PrintJobId
+                INNER JOIN dbo.StationConfigRevision AS fr ON fr.ConfigRevisionId = pj.ConfigRevisionId
+                WHERE pa.AttemptId = @AttemptId
+                """))
+            {
+                level.Guid("@AttemptId", attemptId);
+                await using var r = await level.ExecuteReaderAsync(ct);
+                if (!await r.ReadAsync(ct) || (r.GetString(0) == AttemptKind.Ordinary && r.GetString(1) == EvidenceLevel.None))
+                {
+                    return new EvidenceOutcome(EvidenceAction.Recorded, null, attemptId, null, null);
+                }
+            }
+
             var attempt = await TxcWriteResult.UpdateAttemptAsync(conn, tx, """
                 UPDATE dbo.PrintAttempt
                 SET Outcome = 'NOT_PRINTED', FailureDetail = @DeviceReport
@@ -201,8 +225,8 @@ public sealed class TxdEvidence(SqlDb db)
         }, ct);
 
     private static async Task<EvidenceOutcome> ApplyContradictionAsync(
-        SqlConnection conn, SqlTransaction tx, ObservationRecord o, JobRecord job, IReadOnlyList<AttemptRecord> attempts, DateTime edgeNowUtc,
-        CancellationToken ct)
+        SqlConnection conn, SqlTransaction tx, ObservationRecord o, JobRecord job, IReadOnlyList<AttemptRecord> attempts, string frozenMinimum,
+        DateTime edgeNowUtc, CancellationToken ct)
     {
         // Lectura contradictoria que referencia la reimpresión en curso (la más reciente): A06 y X03 juntos.
         var exceptional = o.AttemptId is { } aid
@@ -221,9 +245,11 @@ public sealed class TxdEvidence(SqlDb db)
             return new EvidenceOutcome(EvidenceAction.ExceptionalUnresolved, job.PrintJobId, exceptional.AttemptId, job.Status, x03);
         }
 
-        // 2b. Serial distinto con el job en TRANSMITTED: A06 y J11 con SERIAL_MISMATCH.
+        // 2b. Serial distinto con el job en TRANSMITTED: A06 y J11 con SERIAL_MISMATCH. Con nivel congelado
+        // NONE, TRANSMITTED es terminal: la lectura queda registrada sin transición (guardas de A06 y J11).
         var ordinary = attempts.SingleOrDefault(a => a.Kind == AttemptKind.Ordinary && a.MayHaveSent);
-        if (job.Status == JobStatus.Transmitted && ordinary is { Outcome: AttemptOutcome.Transmitted } && o.ReceivedAt >= ordinary.ClaimedAt)
+        if (job.Status == JobStatus.Transmitted && frozenMinimum != EvidenceLevel.None
+            && ordinary is { Outcome: AttemptOutcome.Transmitted } && o.ReceivedAt >= ordinary.ClaimedAt)
         {
             await RequireAttemptAsync(conn, tx, """
                 UPDATE dbo.PrintAttempt SET Outcome = 'UNKNOWN', FailureDetail = N'Evidencia contradictoria'
@@ -241,13 +267,12 @@ public sealed class TxdEvidence(SqlDb db)
             return new EvidenceOutcome(EvidenceAction.SerialMismatch, job.PrintJobId, ordinary.AttemptId, job.Status, mismatch);
         }
 
-        // 2c. J18: el job ya confirmado (por un intento ordinario o por una reimpresión, X01) o en UNKNOWN
-        // por otra causa. Un UNKNOWN que ya es SERIAL_MISMATCH no se vuelve a corregir. La lectura tiene
-        // que ser posterior al primer claim del job: antes no había etiqueta suya que leer. El trigger no
-        // lo exige para CORRECTION (SI-07); la regla vive aquí.
-        var firstClaim = attempts.Count == 0 ? (DateTime?)null : attempts.Min(a => a.ClaimedAt);
-        if (firstClaim is { } claimedAt && o.ReceivedAt >= claimedAt
-            && (job.Status == JobStatus.Confirmed || (job.Status == JobStatus.Unknown && job.Reason != JobReason.SerialMismatch)))
+        // 2c. J18 ("llega una lectura"): el job ya confirmado (por un intento ordinario o por una
+        // reimpresión, X01) o en UNKNOWN por otra causa. Un UNKNOWN que ya es SERIAL_MISMATCH no se vuelve a
+        // corregir. La observación se aplica en cuanto se registra; aplicar más tarde una observación
+        // anterior al estado actual (por ejemplo, al reanudar tras una caída) es un vacío de la
+        // especificación (SI-07) y queda detenido hasta la decisión de la persona.
+        if (job.Status == JobStatus.Confirmed || (job.Status == JobStatus.Unknown && job.Reason != JobReason.SerialMismatch))
         {
             await TxcWriteResult.RunWithTransitionKindAsync(conn, tx, "CORRECTION", """
                 DECLARE @j TABLE (PrintJobId UNIQUEIDENTIFIER NOT NULL);

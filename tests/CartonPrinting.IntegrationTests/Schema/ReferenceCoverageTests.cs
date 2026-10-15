@@ -72,8 +72,13 @@ public sealed class ReferenceCoverageTests(SqlServerFixture sql) : IAsyncLifetim
         var s = await StationScenario.CreateAsync(_db, ct: Ct);
         var (job, run) = await ExceptionalSendingAsync(s, 30);
         await s.TransmitAsync(run.AttemptId, Ct);
+        Assert.NotEqual(s.Revision.EvidenceWindowMs, run.EvidenceWindowMs);
+        Assert.Equal(run.EvidenceWindowMs, await s.ScalarAsync<int>(
+            "SELECT DATEDIFF(MILLISECOND, WriteCompletedAt, EvidenceDeadlineAt) FROM dbo.PrintAttempt WHERE AttemptId = @a",
+            c => c.Parameters.AddWithValue("@a", run.AttemptId), Ct));
+        s.AdvanceMs(s.Revision.EvidenceWindowMs!.Value + 5);                                            // vencida la de la revisión, no la suya
         Assert.Null(await s.Txs.ElapseEvidenceWindowAsync(run.AttemptId, s.Clock.UtcNow, Ct));        // ventana vigente: 0 filas
-        s.AdvanceMs(run.EvidenceWindowMs + 5);
+        s.AdvanceMs(run.EvidenceWindowMs);
         var t = (await s.Txs.ElapseEvidenceWindowAsync(run.AttemptId, s.Clock.UtcNow, Ct))!;
         Assert.Equal((job, JobReason.ExceptionalReprintUnresolved), (t.Id, t.Reason));
     }
@@ -240,21 +245,94 @@ public sealed class ReferenceCoverageTests(SqlServerFixture sql) : IAsyncLifetim
     }
 
     [Fact]
-    public async Task Si_07_a_contradicting_read_recorded_before_the_claim_does_not_correct()
+    public async Task Review_alta_1_j18_after_x01_also_when_the_read_references_the_confirmed_reprint()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        var (job, run) = await ExceptionalSendingAsync(s, 95);
+        await s.TransmitAsync(run.AttemptId, Ct);
+        var serial = (await s.JobAsync(job)).LabelSerial;
+        await s.EvidenceAsync(s.Verified(95, serial, run.AttemptId, EvidenceType.ManualInspection, "inspector.diaz"));
+
+        var corrected = await s.EvidenceAsync(s.Verified(95, "P01LZZ-000000000078", run.AttemptId, EvidenceType.ManualInspection, "inspector.diaz"));
+        Assert.Equal(EvidenceAction.Corrected, corrected.Action);
+        Assert.Equal((JobStatus.Unknown, JobReason.SerialMismatch), ((await s.JobAsync(job)).Status, (await s.JobAsync(job)).Reason));
+    }
+
+    /// <summary>
+    /// Documenta el vacío SI-07: el subcriterio de T47 "corrección con un respaldo anterior falla" no se
+    /// cumple, porque la rama CORRECTION de TR_PrintJob_StateMachine acepta una lectura registrada antes del
+    /// claim. Esta prueba fija el comportamiento actual del DDL para que un cambio de la especificación se
+    /// note; no es el criterio de T47 (que en docs/TEST_STATUS.md figura como FALLA en ese punto).
+    /// </summary>
+    [Fact]
+    public async Task Si_07_documents_that_the_trigger_accepts_a_correction_backed_by_a_read_older_than_the_claim()
     {
         var s = await StationScenario.CreateAsync(_db, r => r with { MinConfirmationLevel = EvidenceLevel.Verified }, Ct);
         var job = await s.ReadyJobAsync(160);
-        var early = await s.ObserveAsync(s.Verified(160, "P01LZZ-000000000066"));   // registrada, todavía sin etiqueta del job
+        await s.ObserveAsync(s.Verified(160, "P01LZZ-000000000066"));   // registrada antes de que existiera una etiqueta del job
         s.AdvanceMs(5);
         var claim = (await s.Claims.TryClaimAsync(job, s.Lease, Ct))!;
         await s.TransmitAsync(claim.AttemptId, Ct);
         Assert.Equal(EvidenceAction.Confirmed, (await s.EvidenceAsync(s.Verified(160, (await s.JobAsync(job)).LabelSerial))).Action);
 
-        // Reaplicar la lectura anterior al claim (por ejemplo, al reanudar tras una caída) no corrige el job.
-        var version = (await s.JobAsync(job)).ResultVersion;
-        Assert.Equal(EvidenceAction.Recorded, (await s.Txd.ApplyAsync(early, s.Clock.UtcNow, Ct)).Action);
-        var row = await s.JobAsync(job);
-        Assert.Equal((JobStatus.Confirmed, version), (row.Status, row.ResultVersion));
+        await s.ExecAsync("UPDATE dbo.PrintJob SET Status = 'UNKNOWN', Reason = 'SERIAL_MISMATCH', ResultVersion = ResultVersion + 1 WHERE PrintJobId = @id",
+            c => c.Parameters.AddWithValue("@id", job), "CORRECTION", Ct);
+        Assert.Equal((JobStatus.Unknown, JobReason.SerialMismatch), ((await s.JobAsync(job)).Status, (await s.JobAsync(job)).Reason));
+    }
+
+    [Fact]
+    public async Task Review2_m3_with_frozen_level_none_a_contradiction_or_a_not_printed_report_is_recorded_without_transition()
+    {
+        var s = await StationScenario.CreateAsync(_db, r => r with { MinConfirmationLevel = EvidenceLevel.None, EvidenceWindowMs = null }, Ct);
+        var (job, attempt) = await s.TransmittedJobAsync(170);
+        Assert.Equal(JobStatus.Transmitted, (await s.JobAsync(job)).Status);   // terminal con NONE
+
+        Assert.Equal(EvidenceAction.Recorded, (await s.EvidenceAsync(s.Verified(170, "P01LZZ-000000000170"))).Action);
+        Assert.Equal(EvidenceAction.Recorded, (await s.Txd.DeviceNotPrintedAsync(attempt, "Cancelado por el operador", s.Clock.UtcNow, Ct)).Action);
+        Assert.Equal(JobStatus.Transmitted, (await s.JobAsync(job)).Status);
+        Assert.Equal(AttemptOutcome.Transmitted, (await s.AttemptsAsync(job)).Single().Outcome);
+    }
+
+    [Fact]
+    public async Task Review2_b7_a_contradicting_read_that_references_another_jobs_attempt_has_no_effect()
+    {
+        var s = await StationScenario.CreateAsync(_db, r => r with { MinConfirmationLevel = EvidenceLevel.Verified }, Ct);
+        var (x, _) = await s.TransmittedJobAsync(180);
+        var (_, otherAttempt) = await s.TransmittedJobAsync(181);
+        var outcome = await s.EvidenceAsync(s.Verified(180, "P01LZZ-000000000180", otherAttempt));
+        Assert.Equal(EvidenceAction.Recorded, outcome.Action);
+        Assert.Equal(JobStatus.Transmitted, (await s.JobAsync(x)).Status);
+    }
+
+    [Fact]
+    public async Task Review2_b5_cart_id_required_interim_does_not_override_late_arrival()
+    {
+        var s = await StationScenario.CreateAsync(_db, r => r with
+        {
+            DeadlineReference = DeadlineReference.GatewayReceipt, ClockSkewToleranceMs = null, MaxUpstreamLatencyMs = 40,
+            CartonIdentityMode = "CARTON_ID_REQUIRED",
+        }, Ct);
+        var recovered = await s.RegisterAsync(s.Cycle(190, Transport.Read));      // con orden, sin CartonId, no en vivo
+        Assert.Equal((DetectionStatus.Expired, DetectionReason.LateArrival), (recovered.FinalStatus, recovered.FinalReason));
+        var live = await s.RegisterAsync(s.Cycle(191));                           // candidato sin CartonId: interino de SI-04
+        Assert.Equal((DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot), (live.FinalStatus, live.FinalReason));
+    }
+
+    [Fact]
+    public async Task Review2_b1_racing_claims_of_two_jobs_on_one_printer_never_throw()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        for (ulong round = 0; round < 8; round++)
+        {
+            var a = await s.ReadyJobAsync(200 + (round * 2));
+            var b = await s.ReadyJobAsync(201 + (round * 2));
+            var outcomes = await Task.WhenAll(
+                Task.Run(() => s.Claims.TryClaimAsync(a, s.Lease, Ct), Ct), Task.Run(() => s.Claims.TryClaimAsync(b, s.Lease, Ct), Ct));
+            var won = Assert.Single(outcomes, o => o!.Claimed);
+            Assert.Equal(1, await s.CountAsync("FROM dbo.PrintAttempt WHERE PrinterId = @p AND Outcome = 'SENDING'",
+                c => c.Parameters.AddWithValue("@p", s.PrinterId), Ct));
+            await s.TransmitAsync(won!.AttemptId, Ct);   // libera la impresora para la ronda siguiente
+        }
     }
 
     [Fact]

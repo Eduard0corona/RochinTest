@@ -19,8 +19,9 @@ public sealed record ErpArrivalResult(string? FinalStatus, string? FinalReason, 
 /// <summary>
 /// TX-E: llega un snapshot ERP válido para una detección en WAITING_ERP. Repite la validación de
 /// TX-A (plazo efectivo con margen, estación habilitada, recirculación con bloqueo de rango):
-/// D06 crea el job; D08 bloquea con el motivo real (STATION_DISABLED o RECIRCULATED_CARTON); un
-/// snapshot que llega con el plazo vencido no crea job y la detección vence con ERP_UNAVAILABLE (D07).
+/// D06 crea el job; D08 bloquea con el motivo real (STATION_DISABLED o RECIRCULATED_CARTON). Un
+/// snapshot que llega con el plazo vencido no crea job ni cambia la detección: sigue en WAITING_ERP y
+/// el barrido (TX-S) aplica D07 con ERP_UNAVAILABLE, la transacción que le asigna la máquina de estados.
 /// </summary>
 public sealed class TxeErpArrival(SqlDb db)
 {
@@ -36,10 +37,8 @@ public sealed class TxeErpArrival(SqlDb db)
             var deadline = d.DeadlineAt < plan.EffectiveDeadlineUtc ? d.DeadlineAt : plan.EffectiveDeadlineUtc;
             if (plan.EdgeNowUtc >= deadline.AddMilliseconds(-plan.EffectiveSendMarginMs))
             {
-                // D07 ("snapshot que llega tarde") dentro de TX-E: state-machine.json asigna D07 a TX-S, pero
-                // su disparador incluye el snapshot tardío. Aplicarlo aquí evita crear un job ya vencido y
-                // deja la detección en el mismo estado que dejaría el barrido (SI-06).
-                return await FinishAsync(conn, tx, d, DetectionStatus.Expired, DetectionReason.ErpUnavailable, plan, ct);
+                // Snapshot tardío: 0 filas. D07 lo aplica TX-S.
+                return new ErpArrivalResult(d.Status, d.Reason, null, null);
             }
 
             var station = await StationConfigStore.GetActiveAsync(conn, tx, d.SiteId, d.StationId, ct)

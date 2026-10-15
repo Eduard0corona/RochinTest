@@ -9,7 +9,6 @@ namespace CartonPrinting.UnitTests.Contracts;
 /// de negocio del verificador exigiría un plazo posterior a ReceivedAt. El OutboxWriter tolera esa única
 /// regla en ese único caso; cualquier otra combinación se sigue rechazando.
 /// </summary>
-[Trait("Spec", "T45")]
 public sealed class GapToleranceTests
 {
     private static CartonDetectedEvent LiveGatewayWithoutDeadline()
