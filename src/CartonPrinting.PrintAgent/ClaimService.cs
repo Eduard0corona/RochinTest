@@ -62,7 +62,7 @@ public sealed class ClaimService(SqlDb db, TxbClaim txb, CartonMetrics metrics, 
         activity?.SetTag(CartonTelemetry.Tags.IdempotencyKey, context.Job.Identity.IdempotencyKey);
         activity?.SetTag(CartonTelemetry.Tags.LabelSerial, context.Job.LabelSerial);
 
-        var check = await StationSweepService.ClockJumpedAsync(new StationConfigStore(db),
+        var check = await StationSweepService.ClockJumpedAsync(new TxsSweep(db),
             new StationSettings(context.Job.SiteId, context.Job.StationId, string.Empty, string.Empty), clockGuard, context.Active, clock, metrics,
             Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, ct);
         if (check.Jumped)

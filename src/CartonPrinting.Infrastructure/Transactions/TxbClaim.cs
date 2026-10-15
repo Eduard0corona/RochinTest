@@ -6,8 +6,8 @@ namespace CartonPrinting.Infrastructure.Transactions;
 
 /// <summary>
 /// Entrada del claim. Plazo y margen efectivos los calcula el EdgeHost con su reloj y con la revisión activa
-/// <c>ActiveConfigRevisionId</c>; si se indica, TX-B exige que siga siendo la activa (una activación entre la
-/// lectura y el claim invalida el plazo calculado).
+/// <c>ActiveConfigRevisionId</c>; TX-B exige que siga siendo la activa (una activación entre la lectura y el claim
+/// invalida el plazo calculado).
 /// </summary>
 public sealed record ClaimRequest(
     Guid PrintJobId,
@@ -17,7 +17,7 @@ public sealed record ClaimRequest(
     DateTime EdgeNowUtc,
     DateTime EffectiveDeadlineUtc,
     int EffectiveSendMarginMs,
-    long? ActiveConfigRevisionId = null);
+    long ActiveConfigRevisionId);
 
 public sealed record ClaimResult(bool Claimed, Guid AttemptId, int AttemptNumber, byte AutoAttemptCount);
 
@@ -91,7 +91,7 @@ public sealed class TxbClaim(SqlDb db)
                   AND pj.DeadlineAt > DATEADD(MILLISECOND, @EffectiveSendMarginMs, @EdgeNowUtc)
                   AND @EffectiveDeadlineUtc > DATEADD(MILLISECOND, @EffectiveSendMarginMs, @EdgeNowUtc)
                   AND sc.LabelingEnabled = 1
-                  AND (@ActiveConfigRevisionId IS NULL OR sc.ActiveConfigRevisionId = @ActiveConfigRevisionId)
+                  AND sc.ActiveConfigRevisionId = @ActiveConfigRevisionId
                   AND ar.PrinterId = pj.PrinterId
                   AND (   so.LastPrintJobId IS NULL
                        OR so.LastPrintJobId = pj.PrintJobId
@@ -132,7 +132,7 @@ public sealed class TxbClaim(SqlDb db)
             cmd.DateTime2("@EdgeNowUtc", req.EdgeNowUtc).Guid("@PrintJobId", req.PrintJobId).Int("@EffectiveSendMarginMs", req.EffectiveSendMarginMs)
                 .DateTime2("@EffectiveDeadlineUtc", req.EffectiveDeadlineUtc).NVarChar("@OwnerInstanceId", req.OwnerInstanceId, 128)
                 .BigInt("@LeaseToken", req.LeaseToken).Guid("@AttemptId", req.AttemptId);
-            cmd.Parameters.Add(new SqlParameter("@ActiveConfigRevisionId", System.Data.SqlDbType.BigInt) { Value = (object?)req.ActiveConfigRevisionId ?? DBNull.Value });
+            cmd.BigInt("@ActiveConfigRevisionId", req.ActiveConfigRevisionId);
             await using var r = await cmd.ExecuteReaderAsync(ct);
             return await r.ReadAsync(ct)
                 ? new ClaimResult(true, req.AttemptId, r.GetInt32(1), r.GetByte(0))
@@ -156,7 +156,7 @@ public sealed class TxbClaim(SqlDb db)
                                  AND pl.OwnerInstanceId = @owner AND pl.FencingToken = @token AND pl.LeaseUntil > @now) THEN 1 ELSE 0 END,
                        CASE WHEN EXISTS (SELECT 1 FROM dbo.PrintAttempt AS pa WHERE pa.PrinterId = pj.PrinterId AND pa.Outcome = 'SENDING')
                             THEN 1 ELSE 0 END,
-                       CASE WHEN @rev IS NULL OR sc.ActiveConfigRevisionId = @rev THEN 1 ELSE 0 END
+                       CASE WHEN sc.ActiveConfigRevisionId = @rev THEN 1 ELSE 0 END
                 FROM dbo.PrintJob AS pj
                 INNER JOIN dbo.StationConfig AS sc ON sc.SiteId = pj.SiteId AND sc.StationId = pj.StationId
                 INNER JOIN dbo.StationConfigRevision AS ar ON ar.ConfigRevisionId = sc.ActiveConfigRevisionId
@@ -166,7 +166,7 @@ public sealed class TxbClaim(SqlDb db)
                 """);
             cmd.Int("@margin", req.EffectiveSendMarginMs).DateTime2("@now", req.EdgeNowUtc).DateTime2("@effective", req.EffectiveDeadlineUtc)
                 .NVarChar("@owner", req.OwnerInstanceId, 128).BigInt("@token", req.LeaseToken).Guid("@id", req.PrintJobId);
-            cmd.Parameters.Add(new SqlParameter("@rev", System.Data.SqlDbType.BigInt) { Value = (object?)req.ActiveConfigRevisionId ?? DBNull.Value });
+            cmd.BigInt("@rev", req.ActiveConfigRevisionId);
             await using var r = await cmd.ExecuteReaderAsync(ct);
             if (!await r.ReadAsync(ct))
             {
