@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>CartonPrinting.ErpSync</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CartonPrinting.Infrastructure\CartonPrinting.Infrastructure.csproj" />
+    <ProjectReference Include="..\CartonPrinting.Orchestration\CartonPrinting.Orchestration.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Polly.Core" />
+  </ItemGroup>
+
+</Project>

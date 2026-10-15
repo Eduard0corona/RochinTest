@@ -1,0 +1,17 @@
+# Compilación
+bin/
+obj/
+*.user
+.vs/
+.idea/
+TestResults/
+*.trx
+coverage*/
+
+# Secretos locales
+.env
+appsettings.*.local.json
+
+# Python
+__pycache__/
+*.pyc

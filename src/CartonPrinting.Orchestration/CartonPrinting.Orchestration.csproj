@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>CartonPrinting.Orchestration</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CartonPrinting.Contracts\CartonPrinting.Contracts.csproj" />
+    <ProjectReference Include="..\CartonPrinting.Infrastructure\CartonPrinting.Infrastructure.csproj" />
+  </ItemGroup>
+
+</Project>

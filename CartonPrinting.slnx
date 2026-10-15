@@ -1,0 +1,21 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CartonPrinting.Contracts/CartonPrinting.Contracts.csproj" />
+    <Project Path="src/CartonPrinting.ErpSync/CartonPrinting.ErpSync.csproj" />
+    <Project Path="src/CartonPrinting.Infrastructure/CartonPrinting.Infrastructure.csproj" />
+    <Project Path="src/CartonPrinting.OpcIngest/CartonPrinting.OpcIngest.csproj" />
+    <Project Path="src/CartonPrinting.Operations/CartonPrinting.Operations.csproj" />
+    <Project Path="src/CartonPrinting.Orchestration/CartonPrinting.Orchestration.csproj" />
+    <Project Path="src/CartonPrinting.Outbox/CartonPrinting.Outbox.csproj" />
+    <Project Path="src/CartonPrinting.PrintAgent/CartonPrinting.PrintAgent.csproj" />
+    <Project Path="src/CartonPrinting.Recovery/CartonPrinting.Recovery.csproj" />
+    <Project Path="src/CartonPrinting.Simulators/CartonPrinting.Simulators.csproj" />
+    <Project Path="src/EdgeHost/CartonPrinting.EdgeHost.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CartonPrinting.FaultTests/CartonPrinting.FaultTests.csproj" />
+    <Project Path="tests/CartonPrinting.IntegrationTests/CartonPrinting.IntegrationTests.csproj" />
+    <Project Path="tests/CartonPrinting.LoadTests/CartonPrinting.LoadTests.csproj" />
+    <Project Path="tests/CartonPrinting.UnitTests/CartonPrinting.UnitTests.csproj" />
+  </Folder>
+</Solution>

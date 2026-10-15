@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>CartonPrinting.Simulators</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CartonPrinting.Contracts\CartonPrinting.Contracts.csproj" />
+    <ProjectReference Include="..\CartonPrinting.Infrastructure\CartonPrinting.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="OPCFoundation.NetStandard.Opc.Ua.Server" />
+    <PackageReference Include="OPCFoundation.NetStandard.Opc.Ua.Configuration" />
+  </ItemGroup>
+
+</Project>

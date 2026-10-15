@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>CartonPrinting.PrintAgent</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CartonPrinting.Infrastructure\CartonPrinting.Infrastructure.csproj" />
+  </ItemGroup>
+
+</Project>

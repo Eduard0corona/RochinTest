@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>CartonPrinting.FaultTests</RootNamespace>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="xunit.runner.visualstudio" />
+    <PackageReference Include="Testcontainers.MsSql" />
+    <PackageReference Include="Testcontainers.RabbitMq" />
+    <PackageReference Include="Microsoft.Extensions.TimeProvider.Testing" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\CartonPrinting.Contracts\CartonPrinting.Contracts.csproj" />
+    <ProjectReference Include="..\..\src\CartonPrinting.Infrastructure\CartonPrinting.Infrastructure.csproj" />
+    <ProjectReference Include="..\..\src\CartonPrinting.Simulators\CartonPrinting.Simulators.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\Shared\*.cs" LinkBase="Shared" />
+    <Compile Include="..\Shared\Integration\*.cs" LinkBase="Shared\Integration" />
+  </ItemGroup>
+
+</Project>
