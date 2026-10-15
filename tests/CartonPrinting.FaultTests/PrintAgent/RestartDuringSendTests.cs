@@ -39,11 +39,18 @@ public sealed class RestartDuringSendTests(SqlServerFixture sql) : IAsyncLifetim
 
         using (var host = StartHost(s, printer.Port, job, point))
         {
-            var marker = await WaitForLineAsync(host, $"AT {point}");
-            Assert.True(marker, $"El host no llegó a {point}.");
-            Assert.Equal(0, await OpenTransactionsAsync(s));   // ninguna transacción abierta durante el I/O (I20)
-            host.Kill(entireProcessTree: true);
-            await host.WaitForExitAsync(Ct);
+            try
+            {
+                var marker = await WaitForLineAsync(host, $"AT {point}");
+                Assert.True(marker, $"El host no llegó a {point}.");
+                Assert.Equal(0, await OpenTransactionsAsync(s));   // ninguna transacción abierta durante el I/O (I20)
+            }
+            finally
+            {
+                // Si una aserción falla, el host no queda huérfano.
+                host.Kill(entireProcessTree: true);
+                await host.WaitForExitAsync(Ct);
+            }
         }
 
         Assert.Equal(JobStatus.Sending, (await s.JobAsync(job, Ct)).Status);
@@ -128,8 +135,9 @@ public sealed class RestartDuringSendTests(SqlServerFixture sql) : IAsyncLifetim
         await using var cmd = new SqlCommand("""
             SELECT COUNT(*) FROM sys.dm_exec_sessions AS es
             INNER JOIN sys.dm_tran_session_transactions AS st ON st.session_id = es.session_id
-            WHERE es.program_name = N'CartonPrinting.FaultHost';
+            WHERE es.program_name = N'CartonPrinting.FaultHost' AND es.database_id = DB_ID(@db);
             """, conn);
+        cmd.Parameters.AddWithValue("@db", s.Db.Name);
         return (int)(await cmd.ExecuteScalarAsync(Ct))!;
     }
 

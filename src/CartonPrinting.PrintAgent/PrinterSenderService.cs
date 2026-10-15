@@ -35,6 +35,9 @@ public interface IPhysicalGate
 
 public sealed record SendResult(Guid PrintJobId, ClaimOutcome Claim, WriteOutcome? Write, bool WriteInvoked);
 
+/// <summary>El sender se detuvo porque no pudo registrar el resultado de un envío (TX-C); el arranque siguiente ejecuta TX-R0.</summary>
+public sealed class SenderHaltedException(string message, Exception inner) : Exception(message, inner);
+
 /// <summary>
 /// Sender único de una impresora (I11): toma el siguiente job READY en orden de envío (época por
 /// AcceptedAt, después CycleId), lo reclama con TX-B (que confirma antes de cualquier I/O, I19), hace la
@@ -100,33 +103,26 @@ public sealed class PrinterSenderService(
             await faults.OnPointAsync(SenderPoint.AfterClaimCommit, attemptId, ct);
         }
 
-        // Segunda comprobación, justo antes de escribir: plazo con el reloj monotónico, estación y compuerta.
-        var preSendCheckAt = clock.UtcNow;
-        var checkTs = clock.GetTimestamp();
-        if (checkTs >= deadlineTs)
-        {
-            metrics.Increment(MetricNames.PresendCheckRejected, ("cause", "deadline"));
-            return await NotSentAsync(printJobId, claim, attemptId, preSendCheckAt, "Segunda comprobación: plazo vencido", NotSentCause.DeadlinePassed,
-                backoff, maxAttempts, ct);
-        }
-
+        // Lo que necesita I/O va antes de la comprobación final (DOCUMENTO_PRINCIPAL §10.2, paso 2): la estación
+        // (leída ahora, en memoria al escribir), la compuerta física y el canal.
         var station = await stations.GetActiveAsync(context.Job.SiteId, context.Job.StationId, ct);
         if (station is not { State.LabelingEnabled: true })
         {
             metrics.Increment(MetricNames.PresendCheckRejected, ("cause", "station"));
-            return await NotSentAsync(printJobId, claim, attemptId, preSendCheckAt, "Segunda comprobación: estación bloqueada", NotSentCause.GateOrStation,
-                backoff, maxAttempts, ct);
+            return await NotSentAsync(printJobId, claim, attemptId, clock.UtcNow, "Segunda comprobación: estación bloqueada", NotSentCause.GateOrStation,
+                backoff, maxAttempts);
         }
 
         if (context.EffectiveGateFreshnessMs is { } freshness
             && (gate is null || !await gate.IsOpenForAsync(context.Job.Identity, freshness, ct)))
         {
             metrics.Increment(MetricNames.PresendCheckRejected, ("cause", "gate"));
-            return await NotSentAsync(printJobId, claim, attemptId, preSendCheckAt, "Segunda comprobación: compuerta física cerrada", NotSentCause.GateOrStation,
-                backoff, maxAttempts, ct);
+            return await NotSentAsync(printJobId, claim, attemptId, clock.UtcNow, "Segunda comprobación: compuerta física cerrada", NotSentCause.GateOrStation,
+                backoff, maxAttempts);
         }
 
-        // Abrir el canal no es escribir: si falla, la escritura nunca se invocó.
+        // Abrir el canal no es escribir: si falla (o se cancela), la escritura nunca se invocó. Una conexión ociosa que
+        // la impresora cerró no cuenta como abierta y se reabre. Si el plazo venció mientras tanto, es J08.
         try
         {
             if (!transport.Connected)
@@ -134,11 +130,22 @@ public sealed class PrinterSenderService(
                 await transport.ConnectAsync(ct);
             }
         }
-        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        catch (Exception ex)
         {
             transport.Reset();
-            return await NotSentAsync(printJobId, claim, attemptId, preSendCheckAt, $"Conexión fallida: {ex.Message}", NotSentCause.ConnectionFailed,
-                backoff, maxAttempts, ct);
+            var expired = clock.GetTimestamp() >= deadlineTs;
+            return await NotSentAsync(printJobId, claim, attemptId, clock.UtcNow, $"Conexión fallida: {ex.Message}",
+                expired ? NotSentCause.DeadlinePassed : NotSentCause.ConnectionFailed, backoff, maxAttempts);
+        }
+
+        // Segunda comprobación: la última instrucción antes de escribir, sin I/O. Plazo con el reloj monotónico.
+        var preSendCheckAt = clock.UtcNow;
+        var checkTs = clock.GetTimestamp();
+        if (checkTs >= deadlineTs)
+        {
+            metrics.Increment(MetricNames.PresendCheckRejected, ("cause", "deadline"));
+            return await NotSentAsync(printJobId, claim, attemptId, preSendCheckAt, "Segunda comprobación: plazo vencido", NotSentCause.DeadlinePassed,
+                backoff, maxAttempts);
         }
 
         // Desde aquí la escritura está invocada: cualquier error es UNKNOWN.
@@ -158,7 +165,8 @@ public sealed class PrinterSenderService(
             metrics.Increment(MetricNames.PrintAttempts, ("outcome", AttemptOutcome.Unknown));
             _logger.LogWarning("Escritura interrumpida en {Printer} para {Job}: {Error}. Intento UNKNOWN, sin reintento automático.",
                 printerId, printJobId, ex.Message);
-            var unknown = await txc.UnknownAsync(attemptId, writeStartedAt, $"Escritura interrumpida: {ex.Message}", clock.UtcNow, CancellationToken.None);
+            var unknown = await RecordResultAsync(attemptId,
+                () => txc.UnknownAsync(attemptId, writeStartedAt, $"Escritura interrumpida: {ex.Message}", clock.UtcNow, CancellationToken.None));
             await ReapplyEvidenceAsync(context, claim.ClaimedAtUtc);
             return new SendResult(printJobId, claim, unknown, true);
         }
@@ -174,8 +182,8 @@ public sealed class PrinterSenderService(
             await faults.OnPointAsync(SenderPoint.AfterWriteBeforeResult, attemptId, ct);
         }
 
-        var transmitted = await txc.TransmittedAsync(attemptId, writeStartedAt, writeCompletedAt, preSendCheckAt,
-            deviceAcceptedAt is { } accepted ? CanonicalTimestamp.Truncate(accepted) : null, clock.UtcNow, CancellationToken.None);
+        var transmitted = await RecordResultAsync(attemptId, () => txc.TransmittedAsync(attemptId, writeStartedAt, writeCompletedAt, preSendCheckAt,
+            deviceAcceptedAt is { } accepted ? CanonicalTimestamp.Truncate(accepted) : null, clock.UtcNow, CancellationToken.None));
         metrics.Increment(MetricNames.PrintAttempts, ("outcome", AttemptOutcome.Transmitted));
         await ReapplyEvidenceAsync(context, claim.ClaimedAtUtc);
         return new SendResult(printJobId, claim, transmitted, true);
@@ -195,17 +203,49 @@ public sealed class PrinterSenderService(
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "No se pudo reaplicar la evidencia del job {Job}; se reaplicará al arrancar", context.Job.PrintJobId);
+            _logger.LogWarning(ex, "No se pudo reaplicar la evidencia del job {Job}; la aplica la próxima observación del job o el arranque",
+                context.Job.PrintJobId);
         }
     }
 
+    /// <summary>
+    /// NOT_SENT (la escritura nunca se invocó), también al detener el servicio: sin el token de la operación, para que un
+    /// apagado no deje el intento en SENDING y lo vuelva UNKNOWN al arrancar.
+    /// </summary>
     private async Task<SendResult> NotSentAsync(
-        Guid printJobId, ClaimOutcome claim, Guid attemptId, DateTime preSendCheckAt, string detail, NotSentCause cause, int backoffMs, byte maxAttempts,
-        CancellationToken ct)
+        Guid printJobId, ClaimOutcome claim, Guid attemptId, DateTime preSendCheckAt, string detail, NotSentCause cause, int backoffMs, byte maxAttempts)
     {
         metrics.Increment(MetricNames.PrintAttempts, ("outcome", AttemptOutcome.NotSent));
-        var outcome = await txc.NotSentAsync(attemptId, preSendCheckAt, detail, cause, backoffMs, maxAttempts, clock.UtcNow, ct);
+        var outcome = await RecordResultAsync(attemptId,
+            () => txc.NotSentAsync(attemptId, preSendCheckAt, detail, cause, backoffMs, maxAttempts, clock.UtcNow, CancellationToken.None));
         return new SendResult(printJobId, claim, outcome, false);
+    }
+
+    /// <summary>
+    /// TX-C con dos reintentos cortos (es idempotente: solo actúa sobre el intento en SENDING). Si SQL sigue sin responder,
+    /// el sender se detiene (<see cref="SenderHaltedException"/>): el intento queda en SENDING, la impresora no se usa y el
+    /// arranque siguiente ejecuta TX-R0 (ESTRATEGIA_RECUPERACION §3, SQL Server).
+    /// </summary>
+    private async Task<WriteOutcome> RecordResultAsync(Guid attemptId, Func<Task<WriteOutcome>> txcCall)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return await txcCall();
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                if (attempt >= 3)
+                {
+                    _logger.LogCritical(ex, "Sender de {Printer}: TX-C del intento {Attempt} falló tres veces; el sender se detiene", printerId, attemptId);
+                    throw new SenderHaltedException($"TX-C del intento {attemptId} no se pudo registrar.", ex);
+                }
+
+                _logger.LogWarning(ex, "Sender de {Printer}: TX-C del intento {Attempt} falló; reintento {Retry}", printerId, attemptId, attempt);
+                await Task.Delay(TimeSpan.FromMilliseconds(200 * attempt));
+            }
+        }
     }
 
     /// <summary>Bucle del sender: envía mientras haya jobs READY; si no, espera una señal o el intervalo de sondeo.</summary>
@@ -215,12 +255,14 @@ public sealed class PrinterSenderService(
         {
             try
             {
-                if (await SendNextAsync(ct) is not null)
+                // Solo un claim obtenido sigue de inmediato; un rechazo (estación bloqueada, lease, orden, etc.) espera el
+                // intervalo de sondeo en lugar de volver a reclamar el mismo job en bucle.
+                if (await SendNextAsync(ct) is { Claim.Claimed: true })
                 {
                     continue;
                 }
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (Exception ex) when (ex is not OperationCanceledException and not SenderHaltedException)
             {
                 _logger.LogError(ex, "Sender de {Printer}: error fuera de la escritura; se reintenta", printerId);
             }

@@ -89,8 +89,19 @@ public sealed class PrinterHostedService : BackgroundService
 
     private async Task RunSenderAsync(LeaseGrant lease, CancellationToken ct)
     {
-        await using var transport = new TcpPrinterTransport(_options.Transport, _clock.TimeProvider);
+        // Se ejecuta después de tomar la impresora y de TX-R0. Sin su fila de PrinterSendOrder, el sender de línea no
+        // arranca (regla 13): se alerta y el ciclo de propiedad lo vuelve a intentar después de la duración del lease.
+        if (_role == PrinterRole.Line && await new PrinterSendOrderStore(_db).GetAsync(_options.PrinterId, ct) is null)
+        {
+            _logger.LogCritical("La impresora {Printer} no tiene fila en PrinterSendOrder: su sender no arranca", _options.PrinterId);
+            return;
+        }
+
+        // La evidencia que quedó registrada sin aplicar (por ejemplo, durante un SENDING que TX-R0 acaba de cerrar) se
+        // aplica ahora, en orden.
         var evidence = new EvidenceService(new TxdEvidence(_db), _db, _clock, _metrics);
+        await evidence.ReapplyOpenAsync(_options.PrinterId, ct);
+        await using var transport = new TcpPrinterTransport(_options.Transport, _clock.TimeProvider);
         var poll = TimeSpan.FromMilliseconds(_options.PollIntervalMs);
         if (_role == PrinterRole.Line)
         {

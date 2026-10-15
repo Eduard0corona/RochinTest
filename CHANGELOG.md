@@ -9,6 +9,7 @@ Cambios de la implementación. Los de la especificación están en `spec/CHANGEL
 - `CartonPrinting.FaultHost`: el sender real en un proceso aparte para matarlo en tres puntos (T07).
 - EdgeHost: sender de la impresora de línea con lease, recuperación de arranque y la guarda del reloj de la estación.
 - Pruebas: T05, T06, T07, T15, T22, T29, T31, T38, T39, T42 y T44 en verde contra SQL Server real y la impresora simulada.
+- Correcciones de la revisión independiente: la comprobación monotónica es lo último antes de escribir; la evidencia se aplica en orden desde el último claim y se reaplica al arrancar; TX-C con reintentos y detención del sender; sin bucle con el claim rechazado; conexión cerrada reabierta y escritura con tiempo máximo; sender sin `PrinterSendOrder` no arranca.
 
 ## Fase 3 · ERP y plazo (2026-10-14)
 

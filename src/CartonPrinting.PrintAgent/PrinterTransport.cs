@@ -9,6 +9,7 @@ namespace CartonPrinting.PrintAgent;
 /// </summary>
 public interface IPrinterTransport : IAsyncDisposable
 {
+    /// <summary>Hay una conexión abierta y la impresora no la cerró (una conexión ociosa cortada no cuenta).</summary>
     bool Connected { get; }
 
     Task ConnectAsync(CancellationToken ct);
@@ -37,6 +38,9 @@ public sealed class PrinterTransportOptions
     public bool ExpectsAcceptance { get; set; } = true;
 
     public int AcceptanceTimeoutMs { get; set; } = 1_000;
+
+    /// <summary>Tiempo máximo de cada mitad de la escritura: una ventana TCP llena no deja el intento en SENDING sin fin.</summary>
+    public int WriteTimeoutMs { get; set; } = 5_000;
 }
 
 /// <summary>Una sola conexión TCP por impresora, usada por su único sender.</summary>
@@ -45,7 +49,21 @@ public sealed class TcpPrinterTransport(PrinterTransportOptions options, TimePro
     private TcpClient? _client;
     private StreamReader? _reader;
 
-    public bool Connected => _client is { Connected: true };
+    public bool Connected => _client is { Connected: true } && Alive(_client);
+
+    /// <summary>Una conexión que la impresora cerró se lee como "legible sin datos" (segunda revisión de la Fase 4, M2).</summary>
+    private static bool Alive(TcpClient client)
+    {
+        try
+        {
+            var socket = client.Client;
+            return !(socket.Poll(0, SelectMode.SelectRead) && socket.Available == 0);
+        }
+        catch (Exception ex) when (ex is SocketException or ObjectDisposedException)
+        {
+            return false;
+        }
+    }
 
     public async Task ConnectAsync(CancellationToken ct)
     {
@@ -72,15 +90,13 @@ public sealed class TcpPrinterTransport(PrinterTransportOptions options, TimePro
         var stream = (_client ?? throw new InvalidOperationException("Sin conexión con la impresora.")).GetStream();
         var bytes = Encoding.UTF8.GetBytes(payload);
         var half = bytes.Length / 2;
-        await stream.WriteAsync(bytes.AsMemory(0, half), ct);
-        await stream.FlushAsync(ct);
+        await WriteAsync(stream, bytes.AsMemory(0, half), ct);
         if (midWrite is not null)
         {
             await midWrite();
         }
 
-        await stream.WriteAsync(bytes.AsMemory(half), ct);
-        await stream.FlushAsync(ct);
+        await WriteAsync(stream, bytes.AsMemory(half), ct);
         if (!options.ExpectsAcceptance)
         {
             return null;
@@ -96,6 +112,14 @@ public sealed class TcpPrinterTransport(PrinterTransportOptions options, TimePro
         }
 
         return time.GetUtcNow().UtcDateTime;
+    }
+
+    private async Task WriteAsync(NetworkStream stream, ReadOnlyMemory<byte> bytes, CancellationToken ct)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(TimeSpan.FromMilliseconds(options.WriteTimeoutMs));
+        await stream.WriteAsync(bytes, timeout.Token);
+        await stream.FlushAsync(timeout.Token);
     }
 
     public void Reset()

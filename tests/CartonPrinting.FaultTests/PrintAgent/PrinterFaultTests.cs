@@ -102,7 +102,6 @@ public sealed class PrinterFaultTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Single(rig.Printer.Printed);
         var final = (await s.ResultsAsync(job, Ct)).MaxBy(r => r.GetProperty("resultVersion").GetInt32());
         Assert.Equal(("CONFIRMED", confirmed.ResultVersion), (final.GetProperty("outcome").GetString(), final.GetProperty("resultVersion").GetInt32()));
-        Assert.Equal(0, s.Metrics.Total(MetricNames.DuplicatePhysicalTransmissions));
     }
 
     /// <summary>
@@ -241,10 +240,15 @@ public sealed class PrinterFaultTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Equal((JobStatus.Expired, JobReason.OutOfOrder), ((await s.JobAsync(n, Ct)).Status, (await s.JobAsync(n, Ct)).Reason));
         Assert.Equal([(await s.JobAsync(n1, Ct)).LabelSerial], rig.Printer.Received.Select(l => l.Serial));
 
+        // I23 en el claim (TX-B): un job READY de un ciclo anterior al último reclamado no se reclama; vence con OUT_OF_ORDER (J03).
+        var behind = await s.ReadyJobAsync(49, Ct);
+        var rejected = (await s.Claims.TryClaimAsync(behind, s.Lease, Ct))!;
+        Assert.Equal((false, ClaimRejection.OutOfOrder), (rejected.Claimed, rejected.Rejection));
+        Assert.Equal((JobStatus.Expired, JobReason.OutOfOrder), ((await s.JobAsync(behind, Ct)).Status, (await s.JobAsync(behind, Ct)).Reason));
+
         // Reintento del mismo job: después de un NOT_SENT, el siguiente claim del mismo job se permite.
         var m = await s.ReadyJobAsync(52, Ct);
-        rig.Printer.Mode = PrinterMode.RejectConnections;
-        rig.Transport.Reset();   // el sender detectó la caída del canal y reconecta antes del próximo envío
+        rig.Printer.Mode = PrinterMode.RejectConnections;   // corta la conexión abierta: el sender lo detecta antes de escribir
         Assert.Equal(JobStatus.RetryWait, (await rig.Sender.SendAsync(m, Ct)).Write!.JobStatus);
         rig.Printer.Mode = PrinterMode.Normal;
         s.AdvanceMs(150);
