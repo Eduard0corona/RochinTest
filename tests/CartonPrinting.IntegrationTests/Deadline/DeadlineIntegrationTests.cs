@@ -37,7 +37,7 @@ public sealed class DeadlineIntegrationTests(SqlServerFixture sql) : IAsyncLifet
         var now = s.Clock.UtcNow;
 
         var claim = await s.Txb.ExecuteAsync(new ClaimRequest(job, Guid.NewGuid(), s.OwnerInstanceId, s.Lease.FencingToken, now, row.DeadlineAt,
-            s.Revision.SendMarginMs), Ct);
+            s.Revision.SendMarginMs, s.Revision.ConfigRevisionId), Ct);
         Assert.False(claim.Claimed);
         Assert.Empty(await s.AttemptsAsync(job, Ct));
         Assert.Equal(JobStatus.Ready, (await s.JobAsync(job, Ct)).Status);

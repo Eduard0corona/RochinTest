@@ -8,6 +8,9 @@ public sealed record SweepTransition(string Kind, Guid Id, string From, string T
 
 public sealed record GapClosure(long GapId, string Status, ulong UnrecoveredCount);
 
+/// <summary>Resultado de confirmar un salto del reloj del EdgeHost en SQL.</summary>
+public sealed record ClockJumpBlock(bool Blocked, string? BlockReason, IReadOnlyList<SweepTransition> Expired, IReadOnlyList<SweepTransition> DetectionsBlocked);
+
 /// <summary>Job pendiente (READY o RETRY_WAIT) con su detección, para que el EdgeHost calcule su plazo efectivo.</summary>
 public sealed record PendingJob(Guid PrintJobId, string Status, DateTime DeadlineAt, DateTime? NextAttemptAt, long ConfigRevisionId, DetectionRecord Detection);
 
@@ -18,6 +21,79 @@ public sealed record PendingJob(Guid PrintJobId, string Status, DateTime Deadlin
 /// </summary>
 public sealed class TxsSweep(SqlDb db)
 {
+    /// <summary>
+    /// Salto del reloj del EdgeHost (sección 10.2, SI-16), en una sola transacción:
+    /// <list type="bullet">
+    /// <item>Bloquea la estación con CLOCK_JUMP si estaba habilitada; si ya estaba bloqueada, conserva el primer motivo.</item>
+    /// <item>Vence con DEADLINE_PASSED los jobs READY y RETRY_WAIT (J03, J14) y pasa a BLOCKED con STATION_DISABLED las
+    /// detecciones WAITING_ERP (D08). Sus plazos se calcularon con un reloj que ya no es confiable, y la persona decidió
+    /// (SI-16) que nada anterior al salto se imprima.</item>
+    /// </list>
+    /// Devuelve el motivo de bloqueo vigente, para que la guarda solo dé el salto por confirmado si quedó registrado como
+    /// CLOCK_JUMP.
+    /// </summary>
+    public Task<ClockJumpBlock> ClockJumpAsync(string siteId, string stationId, DateTime edgeNowUtc, CancellationToken ct) =>
+        db.InTransactionAsync(async (conn, tx) =>
+        {
+            var blocked = await StationConfigStore.BlockAsync(conn, tx, siteId, stationId, Contracts.BlockReason.ClockJump, "SYSTEM", null, edgeNowUtc, ct);
+
+            var jobs = new List<(Guid Id, string From)>();
+            await using (var cmd = conn.Command(tx, """
+                DECLARE @expired TABLE (PrintJobId UNIQUEIDENTIFIER NOT NULL, FromStatus VARCHAR(20) NOT NULL);
+                UPDATE dbo.PrintJob
+                SET Status = 'EXPIRED', Reason = 'DEADLINE_PASSED', NextAttemptAt = NULL, ResultVersion = ResultVersion + 1, UpdatedAt = @EdgeNowUtc
+                OUTPUT inserted.PrintJobId, deleted.Status INTO @expired (PrintJobId, FromStatus)
+                WHERE SiteId = @SiteId AND StationId = @StationId AND Status IN ('READY', 'RETRY_WAIT');
+                SELECT PrintJobId, FromStatus FROM @expired;
+                """))
+            {
+                cmd.DateTime2("@EdgeNowUtc", edgeNowUtc).NVarChar("@SiteId", siteId, 64).NVarChar("@StationId", stationId, 64);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                while (await r.ReadAsync(ct))
+                {
+                    jobs.Add((r.GetGuid(0), r.GetString(1)));
+                }
+            }
+
+            var expired = new List<SweepTransition>();
+            foreach (var (id, from) in jobs)
+            {
+                var evt = await ResultPublisher.PublishJobAsync(conn, tx, id, edgeNowUtc, ResultExtras.None, ct);
+                expired.Add(new SweepTransition("PrintJob", id, from, JobStatus.Expired, JobReason.DeadlinePassed, evt));
+            }
+
+            var detections = new List<(Guid Id, string LabelType)>();
+            await using (var cmd = conn.Command(tx, """
+                DECLARE @blocked TABLE (DetectionId UNIQUEIDENTIFIER NOT NULL, ConfigRevisionId BIGINT NOT NULL);
+                UPDATE dbo.CartonDetection
+                SET Status = 'BLOCKED', Reason = 'STATION_DISABLED', UpdatedAt = @EdgeNowUtc
+                OUTPUT inserted.DetectionId, inserted.ConfigRevisionId INTO @blocked (DetectionId, ConfigRevisionId)
+                WHERE SiteId = @SiteId AND StationId = @StationId AND Status = 'WAITING_ERP';
+                SELECT b.DetectionId, r.LabelType FROM @blocked AS b
+                INNER JOIN dbo.StationConfigRevision AS r ON r.ConfigRevisionId = b.ConfigRevisionId;
+                """))
+            {
+                cmd.DateTime2("@EdgeNowUtc", edgeNowUtc).NVarChar("@SiteId", siteId, 64).NVarChar("@StationId", stationId, 64);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                while (await r.ReadAsync(ct))
+                {
+                    detections.Add((r.GetGuid(0), r.GetString(1)));
+                }
+            }
+
+            var blockedDetections = new List<SweepTransition>();
+            foreach (var (id, labelType) in detections)
+            {
+                var detection = (await DetectionQueries.GetAsync(conn, tx, id, ct))!;
+                var evt = await ResultPublisher.PublishDetectionAsync(conn, tx, detection, labelType, edgeNowUtc, ct);
+                blockedDetections.Add(new SweepTransition("CartonDetection", id, DetectionStatus.WaitingErp, DetectionStatus.Blocked,
+                    DetectionReason.StationDisabled, evt));
+            }
+
+            var state = await StationConfigStore.GetActiveAsync(conn, tx, siteId, stationId, ct);
+            return new ClockJumpBlock(blocked, state?.State.BlockReason, expired, blockedDetections);
+        }, ct);
+
     /// <summary>
     /// Jobs READY o RETRY_WAIT de la estación con su detección, en orden de plazo. El barrido calcula con ellos el
     /// plazo efectivo (DeadlinePolicy.Effective) y lo aplica por job con las guardas de SQL.
