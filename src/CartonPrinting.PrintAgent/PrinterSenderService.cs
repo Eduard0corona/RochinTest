@@ -393,6 +393,7 @@ public sealed class PrinterSenderService(
             catch (Exception ex) when (ex is not OperationCanceledException and not SenderHaltedException)
             {
                 _recoverBeforeClaim = true;
+                metrics.Increment(MetricNames.SenderErrors, ("printer", printerId));
                 _logger.LogError(ex, "Sender de {Printer}: error fuera de la escritura; TX-R0 de la impresora antes del próximo claim", printerId);
                 if (SqlAvailability.IsUnavailable(ex) && sqlOutage?.Declare() == true)
                 {

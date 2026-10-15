@@ -68,6 +68,20 @@ public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rab
 
         var report = new Dictionary<string, object?>();
         var phaseReports = new List<Dictionary<string, object?>>();
+        var startedAt = DateTime.UtcNow;
+        var backlogPeaks = new List<string>();
+        var backlogFailures = new List<string>();
+        var watch = StallWatch.Start(_db, startedAt, () => new Dictionary<string, long>
+        {
+            ["1205 reintentados"] = s.Sql.DeadlockRetries,
+            ["presend_check_rejected"] = s.Metrics.Total(MetricNames.PresendCheckRejected),
+            ["intentos NOT_SENT"] = s.Metrics.Total(MetricNames.PrintAttempts, ("outcome", AttemptOutcome.NotSent)),
+            ["intentos UNKNOWN"] = s.Metrics.Total(MetricNames.PrintAttempts, ("outcome", AttemptOutcome.Unknown)),
+            ["errores del sender"] = s.Metrics.Total(MetricNames.SenderErrors),
+            ["pausas del sender"] = s.Metrics.Total(MetricNames.PrinterSenderPauses),
+            ["reintentos de la ingesta"] = s.Metrics.Total(MetricNames.IngestSqlRetries),
+            ["caídas de SQL Server"] = p.Ingest.Service.Outage.Declarations,
+        });
         foreach (var (name, rate, duration) in Phases)
         {
             var firstCycle = cycle;
@@ -86,6 +100,10 @@ public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rab
                     var (pending, oldest) = await BacklogAsync(s);
                     backlog.Add(pending);
                     oldestReadyMs.Add(oldest);
+                    if (pending > (int)Math.Ceiling(rate) && backlogPeaks.Count < 50)
+                    {
+                        backlogPeaks.Add($"{name} a {(DateTime.UtcNow - startedAt).TotalSeconds:F0} s: {pending} pendientes, el más antiguo de {oldest:F0} ms");
+                    }
                     sampleAt = DateTime.UtcNow.AddSeconds(1);
                 }
 
@@ -106,10 +124,14 @@ public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rab
                 ["backlogLastMinuteMax"] = backlog.TakeLast(60).Max(), ["oldestPendingMsMax"] = oldestReadyMs.Max(), ["segments"] = segments,
             });
 
-            // Backlog estable: a la tasa pactada no crece (nunca más de unas pocas cajas en curso).
-            Assert.True(backlog.Max() <= 3 * (int)Math.Ceiling(rate), $"{name}: backlog máximo {backlog.Max()}");
-            Assert.True(backlog.TakeLast(60).Max() <= 3 * (int)Math.Ceiling(rate), $"{name}: backlog del último minuto {backlog.TakeLast(60).Max()}");
+            // Backlog estable: a la tasa pactada no crece (nunca más de unas pocas cajas en curso). Se afirma al final, con el reporte escrito.
+            if (backlog.Max() > 3 * (int)Math.Ceiling(rate) || backlog.TakeLast(60).Max() > 3 * (int)Math.Ceiling(rate))
+            {
+                backlogFailures.Add($"{name}: backlog máximo {backlog.Max()}, en el último minuto {backlog.TakeLast(60).Max()}");
+            }
         }
+
+        await watch.DisposeAsync();
 
         // El Outbox se publica entero: cada caja deja su CartonDetected y su PrintJobResult.
         var outboxDeadline = DateTime.UtcNow.AddSeconds(60);
@@ -126,8 +148,34 @@ public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rab
         var outboxEvents = await s.CountAsync("FROM dbo.OutboxEvent", null, Ct);
         var outboxPending = await s.CountAsync("FROM dbo.OutboxEvent WHERE PublishedAt IS NULL", null, Ct);
         var faults = p.Faults();
+        var notConfirmed = await s.QueryAsync("""
+            SELECT pj.CycleId, pj.Status, ISNULL(pj.Reason, '-'),
+                ISNULL((SELECT STRING_AGG(CONCAT(pa.Outcome, ': ', ISNULL(pa.FailureDetail, '-')), ' | ') FROM dbo.PrintAttempt AS pa
+                        WHERE pa.PrintJobId = pj.PrintJobId), '-')
+            FROM dbo.PrintJob AS pj WHERE pj.Status <> 'CONFIRMED' ORDER BY pj.CycleId
+            """, null, r => $"ciclo {r.GetDecimal(0)} {r.GetString(1)}/{r.GetString(2)}; intentos: {r.GetString(3)}", Ct);
+        // Las cajas más lentas de notificación a escritura, con su momento (marcas del EdgeHost), para ubicar una pausa.
+        var slowest = await s.QueryAsync("""
+            SELECT TOP (10) pj.CycleId, DATEDIFF_BIG(MILLISECOND, cd.ReceivedAt, pa.WriteStartedAt), DATEDIFF_BIG(SECOND, @started, cd.ReceivedAt)
+            FROM dbo.PrintJob AS pj INNER JOIN dbo.CartonDetection AS cd ON cd.DetectionId = pj.DetectionId
+            INNER JOIN dbo.PrintAttempt AS pa ON pa.PrintJobId = pj.PrintJobId AND pa.WriteStartedAt IS NOT NULL
+            ORDER BY DATEDIFF_BIG(MILLISECOND, cd.ReceivedAt, pa.WriteStartedAt) DESC
+            """, c => c.Parameters.Add("@started", System.Data.SqlDbType.DateTime2).Value = startedAt,
+            r => $"ciclo {r.GetDecimal(0)}: {r.GetInt64(1)} ms a los {r.GetInt64(2)} s", Ct);
         report["errors"] = new Dictionary<string, object?>
         {
+            ["notConfirmed"] = notConfirmed,
+            ["backlogPeaks"] = backlogPeaks,
+            ["slowestToWrite"] = slowest,
+            ["stalls"] = watch.Report(),
+            ["sqlOutageDeclarations"] = p.Ingest.Service.Outage.Declarations,
+            ["deadlockRetries"] = s.Sql.DeadlockRetries,
+            ["deadlocks"] = await DeadlocksAsync(s).ContinueWith(d => d.IsCompletedSuccessfully ? d.Result : [$"no se pudo leer system_health: {d.Exception?.GetBaseException().Message}"], TaskScheduler.Default),
+            ["senderErrors"] = s.Metrics.Total(MetricNames.SenderErrors),
+            ["recoveredSending"] = s.Metrics.Total(MetricNames.RestartRecoveredSending),
+            ["senderPauses"] = s.Metrics.Total(MetricNames.PrinterSenderPauses),
+            ["ingestSqlRetries"] = s.Metrics.Total(MetricNames.IngestSqlRetries),
+            ["sqlOutageRelapses"] = p.Ingest.Service.Outage.Relapses,
             ["jobsByStatus"] = jobsByStatus, ["detectionsByStatus"] = detectionsByStatus,
             ["opcRecordsRejected"] = s.Metrics.Series(MetricNames.OpcRecordsRejected),
             ["opcChannelFull"] = s.Metrics.Total("opc_ingest_channel_full_total"),
@@ -138,12 +186,7 @@ public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rab
             ["serviceFaults"] = faults,
         };
 
-        // Todas las cajas (también las de calentamiento) tienen su job CONFIRMED con VERIFIED y una sola etiqueta.
         var boxes = (int)(cycle - 1);
-        Assert.Equal(boxes, await s.CountAsync("FROM dbo.PrintJob WHERE Status = 'CONFIRMED'", null, Ct));
-        Assert.Equal(0, await s.CountAsync("FROM dbo.PrintJob WHERE Status <> 'CONFIRMED'", null, Ct));
-        Assert.Equal(boxes, p.Rig.Printer.Received.Select(r => r.Serial).Distinct().Count());
-        Assert.Equal(boxes, p.Rig.Printer.Received.Count);
 
         // Desigualdad de factibilidad (PLC_TIMESTAMP, sección 17): con los p99 medidos de toda la corrida y DeviceLeadTimeMs
         // como p99 medido de send_start_to_applied_ms.
@@ -192,6 +235,13 @@ public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rab
         await File.WriteAllTextAsync(path, json, Ct);
         TestContext.Current.TestOutputHelper?.WriteLine(json);
 
+        // Primero el reporte, después las aserciones: una corrida que falla deja su diagnóstico.
+        Assert.True(backlogFailures.Count == 0, string.Join("; ", backlogFailures) + $". Picos: {string.Join(" | ", backlogPeaks.Take(10))}");
+        // Todas las cajas (también las de calentamiento) tienen su job CONFIRMED con VERIFIED y una sola etiqueta.
+        Assert.True(notConfirmed.Count == 0, $"{notConfirmed.Count} jobs sin CONFIRMED: {string.Join(" || ", notConfirmed.Take(20))}");
+        Assert.Equal(boxes, await s.CountAsync("FROM dbo.PrintJob WHERE Status = 'CONFIRMED'", null, Ct));
+        Assert.Equal(boxes, p.Rig.Printer.Received.Select(r => r.Serial).Distinct().Count());
+        Assert.Equal(boxes, p.Rig.Printer.Received.Count);
         Assert.Empty(faults);
         Assert.Equal(0, outboxPending);
         Assert.Equal(2 * boxes, outboxEvents);
@@ -200,6 +250,49 @@ public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rab
         Assert.True(revision.SendMarginMs >= presendP99 + revision.ClockJumpToleranceMs,
             $"SendMarginMs {revision.SendMarginMs} no cubre p99(presend_check_to_write_ms) {presendP99} + ClockJumpToleranceMs {revision.ClockJumpToleranceMs}");
         Assert.True(revision.DeviceLeadTimeMs >= deviceLead, $"DeviceLeadTimeMs {revision.DeviceLeadTimeMs} menor que el p99 medido {deviceLead}");
+    }
+
+    /// <summary>
+    /// Los interbloqueos que registró SQL Server (sesión system_health), resumidos: la víctima, y por proceso su espera y el comienzo
+    /// de su lote. Un interbloqueo en la ruta crítica detiene al sender hasta que el monitor de SQL Server lo detecta (hasta 5 s).
+    /// </summary>
+    private static async Task<List<string>> DeadlocksAsync(StationScenario s)
+    {
+        await using var admin = new Microsoft.Data.SqlClient.SqlConnection(s.Db.AdminConnectionString);
+        await admin.OpenAsync(Ct);
+        await using var cmd = new Microsoft.Data.SqlClient.SqlCommand("""
+            SELECT CONVERT(NVARCHAR(MAX), xed.query('.'))
+            FROM (SELECT CAST(st.target_data AS XML) AS t FROM sys.dm_xe_session_targets AS st
+                  JOIN sys.dm_xe_sessions AS se ON se.address = st.event_session_address
+                  WHERE se.name = 'system_health' AND st.target_name = 'ring_buffer') AS d
+            CROSS APPLY t.nodes('RingBufferTarget/event[@name="xml_deadlock_report"]') AS x(xed)
+            """, admin);
+        var summaries = new List<string>();
+        await using var r = await cmd.ExecuteReaderAsync(Ct);
+        while (await r.ReadAsync(Ct))
+        {
+            var raw = r.GetString(0);
+            System.Xml.Linq.XDocument xml;
+            try
+            {
+                xml = System.Xml.Linq.XDocument.Parse(raw);
+            }
+            catch (System.Xml.XmlException)
+            {
+                summaries.Add(raw.Length <= 2_000 ? raw : raw[..2_000]);
+                continue;
+            }
+
+            var victim = xml.Descendants("victimProcess").FirstOrDefault()?.Attribute("id")?.Value;
+            var processes = xml.Descendants("process").Select(pr =>
+                $"{(pr.Attribute("id")?.Value == victim ? "VÍCTIMA " : string.Empty)}espera {pr.Attribute("waitresource")?.Value} ({pr.Attribute("lockMode")?.Value}): " +
+                string.Join(' ', (pr.Element("inputbuf")?.Value ?? string.Empty).Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries)).Take(160).Aggregate(string.Empty, (a, c) => a + c));
+            var resources = xml.Descendants("resource-list").SelectMany(list => list.Elements()).Select(res =>
+                $"{res.Name.LocalName} {res.Attribute("objectname")?.Value} {res.Attribute("indexname")?.Value} {res.Attribute("mode")?.Value}");
+            summaries.Add($"[{string.Join(" | ", processes)}] recursos: {string.Join("; ", resources)}");
+        }
+
+        return summaries;
     }
 
     private async Task<string> RabbitMqVersionAsync()

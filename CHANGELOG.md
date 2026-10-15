@@ -45,6 +45,8 @@ Cambios de la implementación. Los de la especificación están en `spec/CHANGEL
   - marcas de escritura de las reimpresiones;
   - ventanas de T08 acotadas;
   - contraseñas en cadenas de conexión dentro de código.
+- Los barridos de `OUT_OF_ORDER` y `CLOCK_JUMP` bloquean cada job por su clave primaria, en el mismo orden que el claim: la sentencia de referencia se interbloqueaba con él y la caja vencía (SI-21, `SweepLockOrderTests`).
+- Diagnóstico de T12 en el reporte: jobs sin confirmar, picos de backlog, interbloqueos y esperas largas de SQL Server con su momento.
 - Pruebas: T08, T12, T16, T19 y T32 en verde contra SQL Server y RabbitMQ reales y simuladores.
 
 ## Fase 6 · Perfil extendido (2026-10-15)

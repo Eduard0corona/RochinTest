@@ -29,6 +29,7 @@ public sealed class SqlOutage(EdgeClock clock)
     private long _lastFailureAt = long.MinValue;
     private int _abandoned;
     private int _relapses;
+    private int _declarations;
 
     public bool Declared => _declared;
 
@@ -37,6 +38,9 @@ public sealed class SqlOutage(EdgeClock clock)
 
     /// <summary>Operaciones abandonadas que todavía no terminaron.</summary>
     public int AbandonedOperations => Volatile.Read(ref _abandoned);
+
+    /// <summary>Cuántas veces se declaró la caída desde que arrancó el proceso (diagnóstico).</summary>
+    public int Declarations => Volatile.Read(ref _declarations);
 
     /// <summary>Recaídas seguidas dentro de <see cref="RelapseWindow"/> desde la última recuperación.</summary>
     public int Relapses => Volatile.Read(ref _relapses);
@@ -65,6 +69,7 @@ public sealed class SqlOutage(EdgeClock clock)
             var recovered = RecoveredAt;
             _relapses = recovered != long.MinValue && clock.GetElapsedTime(recovered, now) < RelapseWindow ? Math.Min(_relapses + 1, 6) : 0;
             Interlocked.Exchange(ref _declaredAt, now);
+            Interlocked.Increment(ref _declarations);
             _declared = true;
             return true;
         }

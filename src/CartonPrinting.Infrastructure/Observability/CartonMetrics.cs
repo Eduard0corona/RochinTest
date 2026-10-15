@@ -163,6 +163,9 @@ public static class MetricNames
 
     public const string PrinterSenderPauses = "printer_sender_pauses_total";
 
+    /// <summary>Errores del sender fuera de la escritura (claim, lectura del siguiente job); después de cada uno, TX-R0 antes del claim.</summary>
+    public const string SenderErrors = "printer_sender_errors_total";
+
     /// <summary>Reintentos cortos de TX-A con SQL Server sin responder (ESTRATEGIA_RECUPERACION §3).</summary>
     public const string IngestSqlRetries = "ingest_sql_retries_total";
     public const string RestartRecoveredSending = "restart_recovered_sending_total";

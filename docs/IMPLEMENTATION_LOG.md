@@ -1262,6 +1262,17 @@ Compuerta en verde.
     - **Qué busca.** Valores literales en cualquier clave que nombre una contraseña, una frase de paso o un secreto, con `=` o `:` y también entre comillas JSON, en todos los archivos de texto salvo `spec/` y `tests/`.
     - **Qué no cuenta.** En código solo cuenta una cadena literal. Las variables y los marcadores (`<...>`) no cuentan.
     - **`.env.example`.** Tenía contraseñas de ejemplo; ahora van vacías, y `docker compose` no arranca hasta completarlas.
+16. **El barrido bloquea los jobs en el mismo orden que el claim** (SI-21). Los barridos que recorren los pendientes de la estación (`OUT_OF_ORDER` y `CLOCK_JUMP`) leen los candidatos sin locks y los actualizan por `PK_PrintJob`, con el predicado completo bajo el lock de cada fila. La sentencia de referencia recorría `IX_PrintJob_Sweep` con U antes de la clave primaria, al revés que el claim J02, y se interbloqueaban: el sender quedaba detenido hasta 5 s y la caja vencía. Ver "Interbloqueo del barrido con el claim".
+17. **Diagnóstico de T12.** El reporte se escribe antes de las aserciones. Incluye:
+    - los jobs sin `CONFIRMED` con sus intentos;
+    - los picos de backlog con su momento;
+    - las cajas más lentas;
+    - los interbloqueos de `system_health`;
+    - las esperas largas de SQL Server muestreadas cada 200 ms (`StallWatch`): sentencia, recurso y quién bloquea;
+    - las pausas del propio proceso;
+    - el momento de cada falla contada.
+
+    `docs/BENCHMARK.md` lo resume en "Errores y escenarios excluidos".
 
 ### Comandos y resultados
 
@@ -1519,7 +1530,34 @@ Comandos, con la máquina en reposo, 2026-10-15:
   ```
   Correctas! - Con error: 0, Superado: 25, Omitido: 0, Total: 25, Duración: 4 m 11 s - CartonPrinting.FaultTests.dll (net10.0)
   ```
-- La compuerta completa, con `--carga`, se ejecuta después, con la máquina en reposo.
+- **Compuerta de `4e4dff8`** (`build/ci.ps1 --fase 7 --carga`, 2026-10-15 de 10:41 a 11:44, en reposo). Falló en T12:
+  - UnitTests 176 de 176, IntegrationTests 105 de 105 y FaultTests 117 de 117, con T08;
+  - T12: `Expected: 3010, Actual: 3000`, 10 jobs sin `CONFIRMED`.
+
+### Interbloqueo del barrido con el claim
+
+T12 vencía unas pocas cajas en cada corrida de 40 minutos, siempre juntas, en una pausa de unos 2 s del sender. Tres corridas más de T12, solas, con diagnóstico agregado al reporte (decisión 17):
+
+- **"b"**, de 11:46 a 12:16: falló por backlog 4 en la tasa pactada (máximo 3), antes de escribir el reporte. Desde entonces el reporte va antes de las aserciones.
+- **"c"**, de 12:18 a 12:59: 3008 `CONFIRMED` y 2 `EXPIRED` con `DEADLINE_PASSED`, a los 1487 s. El ciclo 1496 quedó `NOT_SENT` en la segunda comprobación y el 1497 venció sin intento. Hubo 1 transacción reintentada por un 1205, sin caídas de SQL, pausas del sender ni errores.
+- **"d"**, a las 13:05: Docker Desktop se detuvo durante la corrida (código de salida 4, contenedores con 255) y no dejó resultados.
+
+Una sonda temporal en `CartonPrinting.LoadTests` reprodujo la composición de T12 a 10 cajas por segundo durante 2 minutos, con el muestreo de esperas de SQL Server. Se borró antes de la compuerta. Terminada a las 14:07, 1200 cajas: 23 `EXPIRED` y 1 interbloqueo. El muestreo lo ubicó a los 93 s:
+
+```
+93.0 s: sesión 65 suspended 1905 ms, espera LCK_M_X 1904 ms en KEY: …: UPDATE pj SET Status = 'SENDING', … | bloqueada por la sesión 77 (…): … UPDATE pj SET Status = 'EXPIRED', Reason = 'OUT_OF_ORDER', …
+93.0 s: sesión 77 suspended 1905 ms, espera LCK_M_U 1904 ms en KEY: …: UPDATE pj SET Status = 'EXPIRED', Reason = 'OUT_OF_ORDER', … | bloqueada por la sesión 65 (…): … DECLARE @claimed …
+94.8 s: 1205 0 → 1
+```
+
+Según el grafo de `system_health`, el claim tenía X en `PK_PrintJob` y esperaba X en `IX_PrintJob_Sweep`; el barrido tenía U en `IX_PrintJob_Sweep` y esperaba U en `PK_PrintJob`. Es SI-21. Corrección: decisión 16.
+
+- Sonda a 10 cajas por segundo con la corrección, terminadas a las 14:14 y a las 14:17: 1200 `CONFIRMED`, ningún 1205 y ninguna espera larga, las dos veces.
+- `SweepLockOrderTests` (dos casos: `OUT_OF_ORDER` y `CLOCK_JUMP`): correctos cuatro veces seguidas con la corrección. Con el `TxsSweep.cs` anterior fallan siempre (mutación, dos veces): `OUT_OF_ORDER: 1 transacciones reintentadas por un 1205 con el claim`, y en `CLOCK_JUMP` la sesión del claim fue la víctima.
+  - Las dos primeras versiones de la prueba no servían. Una reclamaba con todos los jobs `READY`, y SQL Server recorría la clave primaria en lugar del índice. La otra dependía de la carrera y detectó la mutación en 3 de 7 corridas. La versión final fija el orden de los locks.
+- Pruebas del barrido, del salto del reloj y de las sentencias de referencia, con la corrección (`--filter` con `ClockAndRetryTests`, `ClockGuardTests`, `ReferenceStatementTests`, `LateEventTests`, `PrinterFaultTests`, `ErpReviewTests` y `DeadlinePolicyTests`): IntegrationTests 10 de 10, FaultTests 21 de 21 y UnitTests 4 de 4.
+
+La compuerta completa, con `--carga`, se ejecuta después, con la máquina en reposo.
 
 ### Lo que no se verificó
 
@@ -1540,6 +1578,6 @@ Comandos, con la máquina en reposo, 2026-10-15:
 
 - Las pruebas que comparan latencias (T08 y `LatencySegmentsTests`) dependen de que la máquina no esté cargada. T08 corre sola; las demás tienen calentamiento y márgenes amplios.
 - La compuerta completa con `--carga` tarda más de una hora.
-- **Falla cerrada.** Una lectura lenta del latido (más de `SqlAttemptTimeoutMs`) declara la caída. Hasta que la vigilancia la levanta, los ciclos que llegan son hueco: al menos 1 s, más con una conexión colgada o con recaídas. Es una falla cerrada más sensible que la de antes.
+- **Falla cerrada.** Una lectura lenta del latido (más de `SqlAttemptTimeoutMs`) baja `LabelingReady` en ese latido. La caída se declara si la lectura sigue sin respuesta en el latido siguiente o si SQL no está disponible. Hasta que la vigilancia la levanta, los ciclos que llegan son hueco: al menos 1 s, más con una conexión colgada o con recaídas.
 - **Login fallido.** Un 18456 cuenta como SQL no disponible: una contraseña mal configurada deja la estación en falla cerrada, con el error en el log, en lugar de detener el proceso.
 - **Caída de SQL Server y reinicio del PLC a la vez.** Si el ciclo siguiente a la caída llega con una época nueva, los ciclos descartados no quedan como hueco de la época anterior. Solo los cuenta `opc_records_rejected_total{cause=SQL_UNAVAILABLE}` (revisión, BAJA-6; en `docs/FAT_CHECKLIST.md`).

@@ -161,6 +161,23 @@ def main() -> int:
         w(f"| Intentos UNKNOWN | {errors['attemptsUnknown']} |")
         w(f"| Eventos del Outbox: escritos, publicados, pendientes al final | {errors['outboxEvents']}, {errors['outboxPublished']}, {errors['outboxPendingAtEnd']} |")
         w(f"| Servicios de fondo que fallaron (sender, barrido) | {faults} |")
+        if "senderPauses" in errors:
+            w(f"| Pausas del sender (tres fallos seguidos del dispositivo) | {errors['senderPauses']} |")
+            w(f"| Reintentos de TX-A con SQL Server sin responder | {errors['ingestSqlRetries']} |")
+        if "sqlOutageDeclarations" in errors:
+            w(f"| Caídas de SQL Server declaradas | {errors['sqlOutageDeclarations']} |")
+            w(f"| Transacciones reintentadas por un 1205 | {errors['deadlockRetries']} |")
+            w(f"| Errores del sender fuera de la escritura; intentos SENDING cerrados por TX-R0 | {errors['senderErrors']}; {errors['recoveredSending']} |")
+        for item in errors.get("notConfirmed", []):
+            w(f"| Job sin CONFIRMED | {item} |")
+        for item in errors.get("deadlocks", []):
+            w(f"| Interbloqueo (system_health) | {item.replace('|', '/')} |")
+        for item in errors.get("backlogPeaks", []):
+            w(f"| Pico de backlog | {item} |")
+        if errors.get("slowestToWrite"):
+            w(f"| Cajas más lentas (notificación a escritura) | {'; '.join(errors['slowestToWrite'][:5])} |")
+        for item in errors.get("stalls", [])[:30]:
+            w(f"| Espera larga o pausa observada | {item.replace('|', '/')} |")
         w("")
     w("Escenarios excluidos de esta medición:")
     w("")

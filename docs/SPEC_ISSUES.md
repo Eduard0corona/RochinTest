@@ -27,6 +27,7 @@ Clasificación de `CLAUDE.md`:
 | SI-18 | B (vacío) | 4 | `contracts/state-machine.json` (J06: un error o un apagado entre el claim y la escritura) | Resuelto por decisión de la persona: NOT_SENT sin consumir intento |
 | SI-19 | Observación (la clase A se retiró) | 7 | `spec/tests/test-catalog.json` (T16, variante) | Cerrado sin cambio en `spec/`: la variante es alcanzable tal como está escrita y una prueba la ejercita |
 | SI-20 | B (vacío) | 7 | `docs/ESTRATEGIA_RECUPERACION.md` §3 ("Al volver: arranque completo") y `DOCUMENTO_PRINCIPAL.md` §15 (SQL caído, TX-A o TX-B) | Interino recomendado aplicado con la autorización general de la persona; pendiente de su confirmación |
+| SI-21 | Observación (concurrencia) | 7 | `spec/database/sqlserver_operations_reference.sql` (J03 y J14 con `OUT_OF_ORDER`) frente al claim J02 | Abierto: la implementación ejecuta la sentencia en dos pasos con el mismo predicado; sin cambio de comportamiento |
 
 ## SI-01 · Rango de códigos de error en el criterio de T47
 
@@ -226,3 +227,16 @@ Clasificación de `CLAUDE.md`:
   - La prueba del camino de TX-A no comprueba un commit (no escribe): un commit síncrono detenido se descubre en el primer TX-A después de levantar la caída. Las recaídas seguidas alargan la espera.
   - Si la pausa del sender o la caída se declaran a mitad de una caja, esa caja ya pasó con `LabelingReady` en verdadero: la señal avisa al PLC para las siguientes.
 - **Alternativa.** Reiniciar el proceso al volver SQL, con el arranque ordenado completo. Es más simple de razonar, pero corta la sesión OPC UA y el sender en cada caída.
+
+## SI-21 · El barrido de `OUT_OF_ORDER` de referencia se interbloquea con el claim
+
+- **Evidencia (T12 y una sonda de 10 cajas por segundo, 2026-10-15).** La sentencia de referencia de J03 y J14 con `OUT_OF_ORDER` actualiza los jobs pendientes de la estación recorriendo `IX_PrintJob_Sweep` (`SiteId, StationId, Status, DeadlineAt`, filtrado por `READY` y `RETRY_WAIT`). Toma U en la entrada del índice y después busca la fila en `PK_PrintJob`. El claim J02 actualiza el job por su clave primaria: X en `PK_PrintJob` y después X en `IX_PrintJob_Sweep`, porque el job sale de `READY`. Cuando el barrido pasa por el job que se está reclamando, cada uno espera lo que tiene el otro. `system_health` registró el ciclo: el claim con X en `PK_PrintJob` esperando X en `IX_PrintJob_Sweep`, y el barrido con U en `IX_PrintJob_Sweep` esperando U en `PK_PrintJob`.
+- **Impacto.** No hay un estado incorrecto: la víctima se reintenta (1205). Pero el sender queda detenido hasta que el monitor de interbloqueos de SQL Server detecta el ciclo, hasta 5 s, y con `TransitBudgetMs` de 1500 ms la caja vence (`DEADLINE_PASSED` en el claim o en la segunda comprobación). En T12 fueron de 1 a 10 cajas por corrida de 40 minutos; en la sonda a 10 cajas por segundo, 10 y 23 de 1200.
+- **Por qué observación.** No impide ejecutar nada (clase A) ni cambia una regla (clase B): el predicado es el mismo y la sentencia de referencia, ejecutada sola, es correcta. Es su forma frente a la concurrencia del claim.
+- **Qué se hace.** `TxsSweep.ExpireOutOfOrderAsync` ejecuta la misma sentencia en dos pasos, en una transacción:
+  1. lee sin locks (RCSI) los jobs `READY` y `RETRY_WAIT` de la estación;
+  2. actualiza cada uno buscándolo por `PK_PrintJob` (`FORCESEEK`), con el predicado completo evaluado otra vez bajo su lock.
+
+  Así el barrido bloquea el job primero en la clave primaria y después en el índice, en el mismo orden que el claim y que toda transición por job. `ClockJumpAsync` (SI-16), que también recorría los pendientes de la estación, sigue el mismo orden. El barrido de plazos ya actualizaba por job (`ExpireEffectiveDeadlineAsync`, SI-14).
+- **Pruebas.** `SweepLockOrderTests` fija el orden: una sesión toma el job como el claim (primero la clave primaria), el barrido real queda esperando y la sesión pide el job en `IX_PrintJob_Sweep`. Con la sentencia de referencia es un interbloqueo seguro (mutación detectada en `OUT_OF_ORDER` y en `CLOCK_JUMP`). La sonda a 10 cajas por segundo pasó de 10 y 23 cajas vencidas a ninguna, dos veces.
+- **Propuesta para la especificación.** Una nota en la sentencia de referencia sobre el orden de locks frente a J02, o la forma en dos pasos. Pendiente de la persona; no bloquea nada.
