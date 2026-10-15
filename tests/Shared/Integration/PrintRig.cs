@@ -39,7 +39,7 @@ public sealed class PrintRig : IAsyncDisposable
             Port = printer.Port, ExpectsAcceptance = printer.Capabilities.ReportsAcceptance, AcceptanceTimeoutMs = acceptanceTimeoutMs,
         }, s.Provider);
         var c = clock ?? s.Clock;
-        var claims = clock is null ? s.Claims : new ClaimService(s.Sql, s.Txb, s.Metrics, c);
+        var claims = clock is null ? s.Claims : new ClaimService(s.Sql, s.Txb, s.Metrics, c, new ClockGuard(c));
         var evidence = new EvidenceService(s.Txd, s.Sql, c, s.Metrics);
         var sender = new PrinterSenderService(s.PrinterId, s.Sql, claims, s.Txc, s.Stations, s.Lease, transport, c, s.Metrics, faults, evidence: evidence);
         var evidenceSim = new EvidenceSimulator(printer, StationScenario.SiteId, s.StationId, sources ?? new EvidenceSources(), (serial, ct) => JobBySerialAsync(s, serial, ct),
