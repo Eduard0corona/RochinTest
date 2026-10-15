@@ -267,12 +267,15 @@ public sealed class TxdEvidence(SqlDb db)
             return new EvidenceOutcome(EvidenceAction.SerialMismatch, job.PrintJobId, ordinary.AttemptId, job.Status, mismatch);
         }
 
-        // 2c. J18 ("llega una lectura"): el job ya confirmado (por un intento ordinario o por una
-        // reimpresión, X01) o en UNKNOWN por otra causa. Un UNKNOWN que ya es SERIAL_MISMATCH no se vuelve a
-        // corregir. La observación se aplica en cuanto se registra; aplicar más tarde una observación
-        // anterior al estado actual (por ejemplo, al reanudar tras una caída) es un vacío de la
-        // especificación (SI-07) y queda detenido hasta la decisión de la persona.
-        if (job.Status == JobStatus.Confirmed || (job.Status == JobStatus.Unknown && job.Reason != JobReason.SerialMismatch))
+        // 2c. J18: el job ya confirmado (por un intento ordinario o por una reimpresión, X01) o en UNKNOWN
+        // por otra causa. Un UNKNOWN que ya es SERIAL_MISMATCH no se vuelve a corregir. La lectura tiene que
+        // ser posterior a la etiqueta vigente (ADR 0016, lo exige también el trigger): recibida en o después
+        // del último claim y registrada después de cualquier observación que confirmó un intento del job.
+        // Una lectura anterior queda registrada sin efecto.
+        var lastClaim = attempts.Count == 0 ? (DateTime?)null : attempts.Max(a => a.ClaimedAt);
+        var lastConfirming = attempts.Max(a => a.ConfirmingObservationId);
+        var current = lastClaim is { } claimedAt && o.ReceivedAt >= claimedAt && (lastConfirming is null || o.ObservationId > lastConfirming);
+        if (current && (job.Status == JobStatus.Confirmed || (job.Status == JobStatus.Unknown && job.Reason != JobReason.SerialMismatch)))
         {
             await TxcWriteResult.RunWithTransitionKindAsync(conn, tx, "CORRECTION", """
                 DECLARE @j TABLE (PrintJobId UNIQUEIDENTIFIER NOT NULL);

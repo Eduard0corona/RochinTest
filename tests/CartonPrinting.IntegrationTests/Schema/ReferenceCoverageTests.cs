@@ -258,26 +258,58 @@ public sealed class ReferenceCoverageTests(SqlServerFixture sql) : IAsyncLifetim
         Assert.Equal((JobStatus.Unknown, JobReason.SerialMismatch), ((await s.JobAsync(job)).Status, (await s.JobAsync(job)).Reason));
     }
 
+    private const string Correction =
+        "UPDATE dbo.PrintJob SET Status = 'UNKNOWN', Reason = 'SERIAL_MISMATCH', ResultVersion = ResultVersion + 1 WHERE PrintJobId = @id";
+
     /// <summary>
-    /// Documenta el vacío SI-07: el subcriterio de T47 "corrección con un respaldo anterior falla" no se
-    /// cumple, porque la rama CORRECTION de TR_PrintJob_StateMachine acepta una lectura registrada antes del
-    /// claim. Esta prueba fija el comportamiento actual del DDL para que un cambio de la especificación se
-    /// note; no es el criterio de T47 (que en docs/TEST_STATUS.md figura como FALLA en ese punto).
+    /// T47 · corrección con un respaldo anterior (SI-07, ADR 0016): una lectura contradictoria registrada antes
+    /// del claim no respalda J18, ni en el trigger ni en TX-D.
     /// </summary>
     [Fact]
-    public async Task Si_07_documents_that_the_trigger_accepts_a_correction_backed_by_a_read_older_than_the_claim()
+    public async Task Correction_backed_by_a_read_older_than_the_claim_is_rejected()
     {
         var s = await StationScenario.CreateAsync(_db, r => r with { MinConfirmationLevel = EvidenceLevel.Verified }, Ct);
         var job = await s.ReadyJobAsync(160);
-        await s.ObserveAsync(s.Verified(160, "P01LZZ-000000000066"));   // registrada antes de que existiera una etiqueta del job
+        var early = await s.ObserveAsync(s.Verified(160, "P01LZZ-000000000066"));   // antes de que existiera una etiqueta del job
         s.AdvanceMs(5);
         var claim = (await s.Claims.TryClaimAsync(job, s.Lease, Ct))!;
         await s.TransmitAsync(claim.AttemptId, Ct);
         Assert.Equal(EvidenceAction.Confirmed, (await s.EvidenceAsync(s.Verified(160, (await s.JobAsync(job)).LabelSerial))).Action);
 
-        await s.ExecAsync("UPDATE dbo.PrintJob SET Status = 'UNKNOWN', Reason = 'SERIAL_MISMATCH', ResultVersion = ResultVersion + 1 WHERE PrintJobId = @id",
+        var ex = await s.FailsAsync(Correction, c => c.Parameters.AddWithValue("@id", job), "CORRECTION", Ct);
+        Assert.Equal(51012, ex.Number);
+        Assert.Equal(EvidenceAction.Recorded, (await s.Txd.ApplyAsync(early, s.Clock.UtcNow, Ct)).Action);   // reaplicada tras una caída
+        Assert.Equal(JobStatus.Confirmed, (await s.JobAsync(job)).Status);
+    }
+
+    /// <summary>
+    /// T47 · corrección con un respaldo anterior (ADR 0016, hallazgo M1 de la segunda revisión): una lectura
+    /// de la etiqueta original registrada antes de que una reimpresión confirmada la reemplazara no deshace
+    /// la confirmación; una lectura posterior sí corrige.
+    /// </summary>
+    [Fact]
+    public async Task Correction_backed_by_a_read_older_than_the_confirming_observation_is_rejected()
+    {
+        var s = await StationScenario.CreateAsync(_db, r => r with { MinConfirmationLevel = EvidenceLevel.Verified }, Ct);
+        var (job, attempt) = await s.TransmittedJobAsync(165);
+        var stale = await s.ObserveAsync(s.Verified(165, "P01LZZ-000000000067"));   // registrada; el proceso cae antes de aplicarla
+        s.AdvanceMs(s.Revision.EvidenceWindowMs!.Value + 5);
+        await s.Txs.ElapseEvidenceWindowAsync(attempt, s.Clock.UtcNow, Ct);         // A06 + J13: UNKNOWN EVIDENCE_WINDOW_ELAPSED
+        var auth = await s.ApproveReprintAsync(job, JobStatus.Unknown, "UNKNOWN_NOT_RESOLVED", "ACCEPTED");
+        var run = await s.ExecuteReprintAsync(auth);
+        await s.TransmitAsync(run.AttemptId, Ct);
+        var serial = (await s.JobAsync(job)).LabelSerial;
+        Assert.Equal(EvidenceAction.ExceptionalConfirmed,
+            (await s.EvidenceAsync(s.Verified(165, serial, run.AttemptId, EvidenceType.ManualInspection, "inspector.diaz"))).Action);
+
+        Assert.Equal(EvidenceAction.Recorded, (await s.Txd.ApplyAsync(stale, s.Clock.UtcNow, Ct)).Action);
+        var ex = await s.FailsAsync(Correction.Replace("ResultVersion + 1", "ResultVersion + 1, ConfirmedByExceptionalReprint = 0", StringComparison.Ordinal),
             c => c.Parameters.AddWithValue("@id", job), "CORRECTION", Ct);
-        Assert.Equal((JobStatus.Unknown, JobReason.SerialMismatch), ((await s.JobAsync(job)).Status, (await s.JobAsync(job)).Reason));
+        Assert.Equal(51012, ex.Number);
+        Assert.Equal((JobStatus.Confirmed, true), ((await s.JobAsync(job)).Status, (await s.JobAsync(job)).ConfirmedByExceptionalReprint));
+
+        var fresh = await s.EvidenceAsync(s.Verified(165, "P01LZZ-000000000068"));
+        Assert.Equal(EvidenceAction.Corrected, fresh.Action);
     }
 
     [Fact]
