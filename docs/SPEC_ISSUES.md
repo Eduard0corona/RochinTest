@@ -7,13 +7,13 @@ Clasificación de `CLAUDE.md`:
 
 | ID | Clase | Fase | Archivo | Estado |
 | --- | --- | --- | --- | --- |
-| SI-01 | A | 1 | `spec/tests/test-catalog.json` (T47) y `spec/tests/MATRIZ_PRUEBAS.md` | Abierto: pendiente de aprobación de la edición |
+| SI-01 | A | 1 | `spec/tests/test-catalog.json` (T47) y `spec/tests/MATRIZ_PRUEBAS.md` | Resuelto: edición aprobada y aplicada en `82b1e5b` (spec 1.1.3) |
 | SI-02 | B (observación) | 0 | `spec/contracts/*.schema.json` y `spec/tools/verify_package.py` | Abierto: ningún trabajo afectado |
 | SI-03 | Vacío de herramientas | 0 | `spec/tools/verify_package.py` (requisito "Python 3.10+") | Abierto: CI fijada en Python 3.14 |
 | SI-04 | B (vacío) | 1 | `docs/ADR 0013`, sección 12 del documento principal | Abierto: camino detenido en falla cerrada hasta la decisión |
 | SI-05 | B (contradicción entre fuentes) | 1 | `spec/tools/verify_package.py` frente a `contracts/state-machine.json` (D04) | Abierto: gana la máquina de estados |
 | SI-06 | Observación | 1 | `spec/contracts/state-machine.json` (G02 en TX-A) | Abierto: rama defensiva en el barrido, sin cambio de comportamiento |
-| SI-07 | B (vacío de guarda) | 1 | `spec/database/sqlserver_schema.sql` (`TR_PrintJob_StateMachine`, rama CORRECTION) | Abierto: subcriterio de T47 sin cumplir; reaplicación diferida de evidencia detenida |
+| SI-07 | B (vacío de guarda) | 1 | `spec/database/sqlserver_schema.sql` (`TR_PrintJob_StateMachine`, rama CORRECTION) | Resuelto: la persona eligió endurecer el trigger; ADR 0016 en `5eb9695` (spec 1.1.3) |
 | SI-08 | B (vacío de guarda) | 1 | `spec/database/sqlserver_schema.sql` (`TR_PlcEpochHistory_Guard`) | Abierto: el código inserta una acción por confirmación |
 | SI-09 | B (vacío) | 1 | `docs/ARQUITECTURA_TECNICA.md` (plazo efectivo tras cambiar la revisión) | Abierto: comportamiento interino de falla cerrada |
 
@@ -22,7 +22,8 @@ Clasificación de `CLAUDE.md`:
 - **Evidencia.** `spec/tests/test-catalog.json`, T47, `expectedStates`: "todo intento indebido falla con su error (51010 a 51032)". `spec/database/sqlserver_schema.sql` define `THROW` con los códigos 51001 a 51032 (por ejemplo 51001 en `TR_StationConfigRevision_Immutable`, 51004 y 51005 en `TR_PrintJob_Immutable`), y `spec/database/sqlserver_operations_reference.sql` usa 52001 en TX-X cuando la autorización no es ejecutable.
 - **Impacto.** Ninguno sobre el comportamiento: el texto del criterio es más estrecho que el DDL. No impide ejecutar T47.
 - **Qué se hace mientras tanto.** Las pruebas de T47 comprueban el código exacto que cada `THROW` del DDL asigna (51001 a 51032) y 52001 en TX-X, sin cambiar ninguna regla.
-- **Parche mínimo propuesto.** En `spec/tests/test-catalog.json`, T47, `expectedStates`: "(51010 a 51032)" → "(51001 a 51032, o 52001 en TX-X)". Después, `py spec/tools/generate_artifacts.py` (regenera `tests/MATRIZ_PRUEBAS.md`), `py spec/tools/update_checksums.py` y `py spec/tools/verify_package.py`.
+- **Resolución (2026-10-14).** La persona aprobó la edición; se aplicó en el commit `82b1e5b` (`spec: SI-01 …`) con los artefactos regenerados y el verificador en verde.
+- **Parche aplicado.** En `spec/tests/test-catalog.json`, T47, `expectedStates`: "(51010 a 51032)" → "(51001 a 51032, o 52001 en TX-X)". Después, `py spec/tools/generate_artifacts.py` (regenera `tests/MATRIZ_PRUEBAS.md`), `py spec/tools/update_checksums.py` y `py spec/tools/verify_package.py`.
 
 ## SI-02 · Los `pattern` con `$` aceptan un salto de línea final
 
@@ -63,7 +64,7 @@ Clasificación de `CLAUDE.md`:
 - **Efecto en T47.** El criterio de T47 pide que toda corrección "con un respaldo anterior" falle con su error. Una corrección respaldada por una lectura registrada antes del claim no falla: el subcriterio no se cumple y T47 figura como `FALLA` en ese punto (`ReferenceCoverageTests.Si_07_documents_that_the_trigger_accepts_…` fija el comportamiento actual del DDL).
 - **Qué hace la implementación.** Aplica J18 tal como lo define la máquina de estados: la observación se aplica en cuanto se registra ("llega una lectura"), con el job `CONFIRMED` o en `UNKNOWN` por otra causa. Una primera versión agregó en el código la condición "lectura posterior al primer claim"; la segunda revisión mostró que no protegía el caso que la motivaba (una lectura vieja aplicada después de una reimpresión confirmada) y que, al comparar relojes de pared, podía descartar una contradicción real tras un salto del reloj hacia atrás. Se retiró: rodear un defecto de clase B en el código no corresponde.
 - **Trabajo detenido.** La reaplicación diferida de observaciones (por ejemplo, reaplicar al arrancar las que quedaron registradas sin aplicar porque el proceso cayó entre las dos transacciones de TX-D) depende de esta decisión y no se implementa hasta que la persona decida.
-- **Parche propuesto (clase B, porque endurece una guarda).** Que la rama `CORRECTION` exija una observación posterior a lo que respalda el estado actual: para `CONFIRMED`, `eo.ObservationId > ConfirmingObservationId` del intento que confirmó; para `UNKNOWN`, una observación posterior al último claim. Alternativa más simple: `eo.ReceivedAt >= MIN(ClaimedAt)` del job, con la limitación de comparar relojes de pared. Pendiente de la persona.
+- **Resolución (2026-10-14).** La persona eligió endurecer el trigger. ADR 0016 (`spec/docs/adr/0016-correccion-con-lectura-posterior.md`, commit `5eb9695`): la rama `CORRECTION` exige una lectura recibida en o después del último `ClaimedAt` del job y con `ObservationId` mayor que cualquier `ConfirmingObservationId` del job; cambian la guarda de J18, el mecanismo de I25 y la sección 11. TX-D aplica la misma regla. Pruebas: `ReferenceCoverageTests.Correction_backed_by_a_read_older_than_the_claim_is_rejected` y `…_older_than_the_confirming_observation_is_rejected` (fallan con el DDL anterior). La reaplicación diferida de observaciones deja de estar detenida.
 
 ## SI-08 · `TR_PlcEpochHistory_Guard` acepta una `OperatorAction` `CONFIRM_EPOCH` reutilizada
 

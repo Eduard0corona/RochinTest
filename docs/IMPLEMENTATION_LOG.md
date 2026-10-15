@@ -185,7 +185,7 @@ El revisor notó archivos sin seguimiento que aparecían en el árbol durante su
 4. **Validación de contratos antes del Outbox.** Un evento que no cumple su schema o sus reglas de negocio revierte la transacción: emitir un contrato inválido es un defecto. Única tolerancia: SI-05.
 5. **SI-04 y SI-05** (ver `docs/SPEC_ISSUES.md`): `CARTON_ID_REQUIRED` sin `CartonId` queda `BLOCKED` con `INCOHERENT_SNAPSHOT` (falla cerrada, pendiente de la persona); un registro `GATEWAY_RECEIPT` en vivo que abre un hueco se registra sin plazo según la máquina de estados, aunque la regla del verificador no vea el hueco.
 6. **Plazo efectivo sin referencia activa.** Si la revisión activa no puede dar un plazo confiable para un registro (por ejemplo, cambió a `PLC_TIMESTAMP` y el registro no trae `DetectionTimestamp`), el plazo efectivo es su recepción: el job ya no se envía. Es la lectura más restrictiva de "nunca más permisivo que el congelado". Registrado como SI-09.
-7. **J18 como lo define la máquina de estados.** La observación se aplica en cuanto se registra. La condición propia "lectura posterior al primer claim" que agregó la primera corrección se retiró en la segunda revisión: rodeaba un defecto de clase B (SI-07). La reaplicación diferida de observaciones queda detenida hasta la decisión.
+7. **J18 con la regla del ADR 0016.** La condición propia "lectura posterior al primer claim" que agregó la primera corrección se retiró en la segunda revisión (rodeaba un defecto de clase B). La persona decidió endurecer el trigger (SI-07, spec 1.1.3): la lectura que corrige tiene que ser posterior al último claim y a la observación que confirmó; TX-D aplica la misma regla.
 8. **El claim no termina en excepción con otro intento en vuelo.** La guarda de TX-B excluye, sin bloqueo de rango, una impresora con otro intento `SENDING` ya confirmado; si dos claims de la misma impresora se cruzan, el 2601 de `UX_PrintAttempt_PrinterInFlight` (la barrera) revierte la transacción y el resultado es "sin claim". Así un claim de una impresora no bloquea el de otra.
 9. **TX-C lee el nivel mínimo y la ventana de evidencia congelados dentro de la transacción** (del job para un intento ordinario, de la autorización para uno excepcional); el sender no los pasa.
 10. **Payload de la reimpresión.** Es el del job (mismo `LabelSerial`) y, con `ReprintMarker`, una marca visible antes del cierre de la etiqueta; el intento registra el SHA-256 de ese payload en `AttemptPayloadHash` (I09).
@@ -214,7 +214,7 @@ Durante el desarrollo, dos pruebas fallaron por errores de la prueba que el sist
 
 ### Pruebas de la fase
 
-- **T01, T02, T10 y T14: PASA. T47: FALLA en un subcriterio** (corrección respaldada por una lectura anterior al claim, SI-07); el resto de su criterio se cumple (detalle en `docs/TEST_STATUS.md`).
+- **T01, T02, T10, T14 y T47: PASA** (detalle en `docs/TEST_STATUS.md`). T47 pasó a cumplirse por completo después del ADR 0016 (SI-07).
 - T47 ejecuta, además del criterio del catálogo, una prueba que lee el DDL y la referencia, extrae los 33 códigos `THROW` y exige que cada uno tenga su prueba negativa.
 
 ### Revisión independiente
@@ -289,9 +289,32 @@ Resultado: trazabilidad OK, 0 errores
 Compuerta en verde.
 ```
 
-### Estado del cierre
+### Decisiones de la persona (2026-10-14)
 
-La compuerta técnica está en verde, pero la fase no se cierra: el criterio de T47 no se cumple por completo por un defecto de clase B de la especificación (SI-07) y hay decisiones pendientes de la persona (SI-01, clase A, aprobación de la edición; SI-04, SI-05, SI-07, SI-08 y SI-09, clase B). Según la sección 6 del prompt, el trabajo se detiene aquí y se pregunta.
+Con la compuerta en verde, la fase se detuvo (sección 6 del prompt) porque T47 no se cumplía por completo (SI-07, clase B) y había decisiones pendientes. Respuestas:
+
+1. **SI-07:** endurecer el trigger. ADR 0016 y commit `spec: SI-07 …` (`5eb9695`): guarda de J18, mecanismo de I25, `TR_PrintJob_StateMachine` y sección 11; artefactos regenerados y `verify_package.py` en verde. TX-D aplica la misma regla (`e012c23`). Dos pruebas negativas de T47 que fallan con el DDL anterior.
+2. **SI-01:** edición aprobada; commit `spec: SI-01 …` (`82b1e5b`).
+3. **SI-04, SI-05, SI-08 y SI-09:** se mantienen los interinos de falla cerrada y se sigue con la Fase 2.
+
+`build_examples.py` regenera `result-eventid-not-deterministic.json` con un UUID aleatorio en cada corrida; ese cambio sin contenido se descartó (`git checkout`) antes de recalcular los checksums.
+
+Compuerta de cierre, 2026-10-14 21:48 (`powershell -File build/ci.ps1`), con la especificación 1.1.3:
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   128, Omitido:     0, Total:   128, Duración: 18 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    80, Omitido:     0, Total:    80, Duración: 1 m 29 s - CartonPrinting.IntegrationTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 62 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
+Las correcciones posteriores a la segunda revisión fueron el cambio de especificación decidido por la persona y sus pruebas; ninguna corrigió un hallazgo ALTA, así que no se pidió una tercera revisión. La base de datos local de Docker Compose tiene aplicado el DDL anterior: el registro de migraciones (`migrations.AppliedScript`) rechaza el nuevo `sqlserver_schema.sql` y hay que recrearla (`docker compose down -v`). Las pruebas usan bases nuevas y no se ven afectadas.
 
 ### Lo que no se verificó
 
@@ -303,6 +326,6 @@ La compuerta técnica está en verde, pero la fase no se cierra: el criterio de 
 
 ### Riesgos
 
-- **Evidencia registrada y no aplicada.** TX-D registra la observación en su propia transacción y la aplica en otra. Si el proceso muere entre las dos, la observación queda sin aplicar. Reaplicarla después puede deshacer un estado posterior (una lectura vieja aplicada sobre una reimpresión confirmada): ese trabajo de la Fase 4 queda detenido hasta la decisión sobre SI-07.
+- **Evidencia registrada y no aplicada.** TX-D registra la observación en su propia transacción y la aplica en otra. Si el proceso muere entre las dos, la observación queda sin aplicar. La Fase 4 la reaplica al arrancar; con el ADR 0016, una lectura anterior al estado vigente queda sin efecto en el trigger y en TX-D.
 - Las pruebas de concurrencia dependen del planificador de SQL Server; T02 se repite en cinco rondas y con un bloqueo retenido explícito.
-- SI-04, SI-07, SI-08 y SI-09 esperan una decisión de la persona; mientras tanto, cada camino queda en su variante más restrictiva.
+- SI-04, SI-05, SI-08 y SI-09 quedan con su interino de falla cerrada, por decisión de la persona (2026-10-14).

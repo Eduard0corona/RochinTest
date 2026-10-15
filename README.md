@@ -1,6 +1,6 @@
 # CartonPrinting
 
-Implementación en .NET 10 del MVP de etiquetado industrial idempotente especificado en [`spec/`](spec/README.md) (paquete 1.1.2): ciclo OPC UA → `CartonDetected` → `PrintJob` → `PrintJobResult`, sin imprimir dos etiquetas por un evento duplicado.
+Implementación en .NET 10 del MVP de etiquetado industrial idempotente especificado en [`spec/`](spec/README.md) (paquete 1.1.3): ciclo OPC UA → `CartonDetected` → `PrintJob` → `PrintJobResult`, sin imprimir dos etiquetas por un evento duplicado.
 
 En el MVP, simuladores reemplazan al PLC, la impresora, el aplicador, el escáner y el ERP. **Nunca se conecta equipo real**: cualquier conexión con equipos de planta requiere autorización explícita de OT. Ninguna garantía física (etiqueta aplicada, ventana física, etiqueta en la caja correcta) se da por demostrada con simuladores.
 
@@ -12,7 +12,7 @@ El estado real de cada prueba T01 a T47, con su evidencia, está en [`docs/TEST_
 
 | Ruta | Contenido |
 | --- | --- |
-| `spec/` | Especificación 1.1.2, de solo lectura |
+| `spec/` | Especificación 1.1.3, de solo lectura |
 | `src/CartonPrinting.Contracts` | Tipos de `CartonDetected` y `PrintJobResult`, UUIDv5, huella JCS, validación JSON Schema y reglas de negocio |
 | `src/CartonPrinting.Infrastructure` | SQL Server, migraciones, reloj, telemetría |
 | `src/CartonPrinting.{OpcIngest,Orchestration,ErpSync,PrintAgent,Outbox,Recovery,Operations}` | Módulos de `spec/docs/ARQUITECTURA_TECNICA.md` |

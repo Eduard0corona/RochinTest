@@ -9,7 +9,8 @@ Cambios de la implementación. Los de la especificación están en `spec/CHANGEL
 - `CartonPrinting.PrintAgent`: `ClaimService` (TX-B con diagnóstico del rechazo y J03 por plazo u orden).
 - `CartonPrinting.Outbox`: `OutboxRelay` con publisher confirms y `mandatory`, `RabbitMqPublisher`, `InboxConsumer` con cola quorum; el EdgeHost aloja el relay.
 - Métricas de la sección 19 y trazas `carton.register`, `carton.claim` y `outbox.publish` con `idempotencyKey` y `correlationId`.
-- Pruebas: T01, T02, T10 y T14 en verde contra SQL Server 2022 y RabbitMQ reales; T47 en verde salvo un subcriterio que el DDL no cumple (SI-07, decisión pendiente).
+- Pruebas: T01, T02, T10, T14 y T47 en verde contra SQL Server 2022 y RabbitMQ reales.
+- Especificación 1.1.3 (aprobada por la persona): SI-01 (texto del criterio de T47) y SI-07 (ADR 0016: J18 solo con una lectura posterior al estado que corrige).
 - Correcciones de la revisión independiente: J18 después de una reimpresión confirmada, evidencia resuelta por el ciclo, registro sin orden de trabajo bloqueado en lugar de error 547, marca de reimpresión con su propio hash, claim sin 2601 con otro intento en vuelo, nivel y ventana de evidencia leídos dentro de TX-C.
 - Defectos de la especificación registrados: SI-04 a SI-09.
 
