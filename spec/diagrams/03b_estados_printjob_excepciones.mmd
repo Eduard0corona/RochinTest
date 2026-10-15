@@ -1,0 +1,23 @@
+%% GENERADO por tools/generate_artifacts.py desde contracts/state-machine.json. No editar.
+%% Máquina PrintJob; modos incluidos: exception.
+stateDiagram-v2
+    direction TB
+    state "CONFIRMED" as CONFIRMED
+    state "UNKNOWN" as UNKNOWN
+    state "FAILED" as FAILED
+    state "EXPIRED" as EXPIRED
+    state "CLOSED_UNRESOLVED" as CLOSED_UNRESOLVED
+    UNKNOWN --> CONFIRMED: X01 confirmada
+    FAILED --> CONFIRMED: X01 confirmada
+    EXPIRED --> CONFIRMED: X01 confirmada
+    CLOSED_UNRESOLVED --> CONFIRMED: X01 confirmada
+    CONFIRMED --> CONFIRMED: X02 reemplazo
+    UNKNOWN --> UNKNOWN: X03 sin confirmar
+    FAILED --> UNKNOWN: X03 sin confirmar
+    EXPIRED --> UNKNOWN: X03 sin confirmar
+    CLOSED_UNRESOLVED --> UNKNOWN: X03 sin confirmar
+    CONFIRMED --> UNKNOWN: X03 sin confirmar
+    classDef terminal fill:#eef1f4,stroke:#5d636b,color:#1a1c1f
+    classDef warning fill:#fff4dc,stroke:#d98a00,color:#1a1c1f,stroke-width:2px
+    class CONFIRMED,FAILED,EXPIRED,CLOSED_UNRESOLVED terminal
+    class UNKNOWN warning

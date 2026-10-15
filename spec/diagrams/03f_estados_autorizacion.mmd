@@ -1,0 +1,15 @@
+%% GENERADO por tools/generate_artifacts.py desde contracts/state-machine.json. No editar.
+%% Máquina ReprintAuthorization; modos incluidos: auto, manual, exception, correction.
+stateDiagram-v2
+    direction LR
+    state "APPROVED" as APPROVED
+    state "EXECUTED" as EXECUTED
+    state "REVOKED" as REVOKED
+    state "EXPIRED" as EXPIRED
+    [*] --> APPROVED: R01 [manual] aprobación por 2 personas
+    APPROVED --> EXECUTED: R02 [excepción] ejecución
+    APPROVED --> REVOKED: R03 [manual] revocación
+    APPROVED --> EXPIRED: R04 vencimiento
+    classDef terminal fill:#eef1f4,stroke:#5d636b,color:#1a1c1f
+    classDef warning fill:#fff4dc,stroke:#d98a00,color:#1a1c1f,stroke-width:2px
+    class EXECUTED,REVOKED,EXPIRED terminal

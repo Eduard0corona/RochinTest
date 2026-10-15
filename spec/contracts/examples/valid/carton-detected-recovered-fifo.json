@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "eventType": "CartonDetected",
+  "eventId": "67dd254c-d2ac-51ce-9fc8-6a2511794f44",
+  "correlationId": "67dd254c-d2ac-51ce-9fc8-6a2511794f44",
+  "occurredAt": "2026-10-12T18:03:55.010Z",
+  "siteId": "PLANT-01",
+  "stationId": "LINE-01",
+  "plcEpoch": 42,
+  "cycleId": "918260",
+  "idempotencyKey": "PLANT-01:LINE-01:42:918260",
+  "detectionOrigin": "RECOVERED",
+  "transport": "PLC_FIFO",
+  "queueOverflow": false,
+  "detectionTimestamp": "2026-10-12T18:03:55.010Z",
+  "receivedAt": "2026-10-12T18:04:40.502Z",
+  "deadlineReference": "PLC_TIMESTAMP",
+  "deadlineAt": "2026-10-12T18:03:56.060Z",
+  "configRevision": 7,
+  "workOrderId": "WO-2026-4815",
+  "sourceFingerprint": "696d011130b54791d497d1aedd9a59a31dafd6dedb825c398bb908e166375f25",
+  "opc": {
+    "nodeId": "ns=2;s=LINE-01.CartonCycleRecord",
+    "statusCode": "Good",
+    "sourceTimestamp": "2026-10-12T18:03:55.010Z"
+  }
+}

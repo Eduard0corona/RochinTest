@@ -1,0 +1,29 @@
+flowchart TD
+    A["Registro Good<br/>clave K, huella H, transporte<br/>(primera notificación = READ)"] --> B{"Época del registro"}
+    B -- "la actual" --> C{"¿K existe?"}
+    B -- "anterior, ya aceptada" --> BA{"¿CycleId ≤ marca alta<br/>de esa época?"}
+    BA -- "sí" --> C
+    BA -- "no" --> B3
+    B -- "actual + 1" --> B1{"EpochChangePolicy"}
+    B1 -- "AUTO_INCREMENT_BY_ONE" --> B2["Nueva fila en PlcEpochHistory<br/>marca alta reiniciada"]
+    B2 --> C
+    B1 -- "REQUIRE_CONFIRMATION" --> B3["EPOCH_UNEXPECTED<br/>registro retenido y estación bloqueada<br/>reingreso como ANOMALY_REINGEST"]
+    B -- "cualquier otra" --> B3
+    C -- "sí" --> D{"¿Misma huella?"}
+    D -- "sí" --> D1["Duplicado auténtico<br/>sin efecto"]
+    D -- "no" --> D2["IDENTITY_COLLISION<br/>anomalía sin detección<br/>estación bloqueada"]
+    C -- "no" --> E{"CycleId frente a la marca alta M<br/>de la época del registro"}
+    E -- "M + 1" --> E1["En orden"]
+    E -- "mayor que M + 1" --> E2["Abrir SequenceGap"]
+    E -- "menor que M" --> F{"DetectionTimestamp frente al de M"}
+    F -- "anterior" --> F1["Tardío legítimo<br/>decide su propio plazo<br/>y el orden de la impresora"]
+    F -- "posterior" --> F2["RESET_SUSPECTED<br/>BLOCKED · SEQUENCE_ANOMALY"]
+    F -- "sin timestamp" --> F3["AMBIGUOUS_DECREASE<br/>BLOCKED · SEQUENCE_ANOMALY<br/>estación bloqueada si se repite"]
+    E1 --> G{"¿Avance más rápido que<br/>MinCycleIntervalMs?"}
+    E2 --> G
+    E2 -. "GATEWAY_RECEIPT" .-> P1
+    F1 --> P
+    G -- "sí" --> G1["BLOCKED · IMPLAUSIBLE_RATE"]
+    G -- "no" --> P{"¿Plazo confiable?<br/>GATEWAY_RECEIPT: SUBSCRIPTION en vivo,<br/>sin overflow ni hueco"}
+    P -- "no" --> P1["EXPIRED · LATE_ARRIVAL<br/>DeadlineAt = ReceivedAt"]
+    P -- "sí" --> G2["Plazo, ERP, estación y recirculación<br/>en TX-A"]

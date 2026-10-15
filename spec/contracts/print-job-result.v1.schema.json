@@ -1,0 +1,1090 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/schemas/print-job-result.v1.schema.json",
+  "title": "PrintJobResult v1 (revisión 1.1 del paquete)",
+  "description": "Resultado publicable de una detección o de su PrintJob. Se publica una versión por transición publicable (contracts/state-machine.json, resultOutcome). final = true significa que no se espera ninguna transición ordinaria; una versión posterior solo puede llegar por corrección (J18) o por procedimiento excepcional (X01, X02, X03) y el consumidor aplica siempre la resultVersion mayor. El schema valida forma y combinaciones; no puede demostrar que la evidencia física sea verdadera ni comparar readSerial con labelSerial: esas reglas viven en SQL (TR_PrintAttempt_Guard), en el código y en tools/verify_package.py.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "eventType",
+    "eventId",
+    "correlationId",
+    "occurredAt",
+    "siteId",
+    "stationId",
+    "plcEpoch",
+    "cycleId",
+    "idempotencyKey",
+    "labelType",
+    "resultVersion",
+    "outcome",
+    "final",
+    "configRevision"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "eventType": {
+      "const": "PrintJobResult"
+    },
+    "eventId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUIDv5(namespace, 'PrintJobResult|' + idempotencyKey + '|' + labelType + '|' + resultVersion)."
+    },
+    "correlationId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "eventId del CartonDetected (DetectionId)."
+    },
+    "occurredAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "siteId": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^:|]+$"
+    },
+    "stationId": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^:|]+$"
+    },
+    "plcEpoch": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "cycleId": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "maxLength": 20
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "pattern": "^[^:|]+:[^:|]+:(0|[1-9][0-9]*):(0|[1-9][0-9]*)$"
+    },
+    "labelType": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^|]+$"
+    },
+    "resultVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Monótona por (idempotencyKey, labelType). El consumidor aplica la mayor."
+    },
+    "outcome": {
+      "enum": [
+        "CONFIRMED",
+        "TRANSMITTED",
+        "UNKNOWN",
+        "FAILED",
+        "EXPIRED",
+        "CANCELLED",
+        "CLOSED_UNRESOLVED",
+        "BLOCKED"
+      ]
+    },
+    "final": {
+      "type": "boolean",
+      "description": "true: no se espera ninguna transición ordinaria. No impide una versión posterior por corrección o procedimiento excepcional."
+    },
+    "reason": {
+      "enum": [
+        "WRITE_INTERRUPTED",
+        "RESTART_DURING_SEND",
+        "EVIDENCE_WINDOW_ELAPSED",
+        "SERIAL_MISMATCH",
+        "EXCEPTIONAL_REPRINT_UNRESOLVED",
+        "PRINTER_UNAVAILABLE",
+        "DEVICE_REPORTED_NOT_PRINTED",
+        "RECONCILED_NOT_PRINTED",
+        "DEADLINE_PASSED",
+        "OUT_OF_ORDER",
+        "LATE_ARRIVAL",
+        "ERP_UNAVAILABLE",
+        "CANCELLED_BY_OPERATOR",
+        "CLOSED_CARTON_REJECTED",
+        "CLOSED_CARTON_QUARANTINED",
+        "INCOHERENT_SNAPSHOT",
+        "IMPLAUSIBLE_RATE",
+        "SEQUENCE_ANOMALY",
+        "STATION_DISABLED",
+        "RECIRCULATED_CARTON"
+      ]
+    },
+    "configRevision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "ConfigRevisionId congelado en el job (o capturado por la detección si no hay job)."
+    },
+    "printJobId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "attemptId": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "labelSerial": {
+      "type": "string",
+      "minLength": 6,
+      "maxLength": 40
+    },
+    "workOrderId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "productId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "lotId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "printerId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "cartonId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "level",
+        "correlatedTo",
+        "verified",
+        "reference",
+        "observedAt"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "PRINTER_JOB_COMPLETION",
+            "PLC_APPLICATOR_CONFIRMATION",
+            "BARCODE_VERIFICATION",
+            "MANUAL_INSPECTION"
+          ]
+        },
+        "level": {
+          "enum": [
+            "PRINTED",
+            "APPLIED",
+            "VERIFIED"
+          ]
+        },
+        "correlatedTo": {
+          "enum": [
+            "JOB",
+            "CYCLE"
+          ]
+        },
+        "verified": {
+          "type": "boolean"
+        },
+        "readSerial": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 40
+        },
+        "reference": {
+          "type": "string",
+          "minLength": 1
+        },
+        "observedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "PRINTER_JOB_COMPLETION"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "level": {
+                "const": "PRINTED"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "PLC_APPLICATOR_CONFIRMATION"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "level": {
+                "const": "APPLIED"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "BARCODE_VERIFICATION"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "level": {
+                "const": "VERIFIED"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "level": {
+                "const": "PRINTED"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "correlatedTo": {
+                "const": "JOB"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "level": {
+                "const": "APPLIED"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "correlatedTo": {
+                "const": "CYCLE"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "level": {
+                "const": "VERIFIED"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "readSerial"
+            ],
+            "properties": {
+              "correlatedTo": {
+                "const": "CYCLE"
+              }
+            }
+          }
+        }
+      ],
+      "description": "Evidencia que decidió el resultado (CONFIRMED) o que lo contradice (UNKNOWN con SERIAL_MISMATCH). Solo con CONFIRMED o UNKNOWN."
+    },
+    "exceptionalReprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "authorizationId",
+        "duplicateRisk",
+        "reason",
+        "approvedBy"
+      ],
+      "properties": {
+        "authorizationId": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "duplicateRisk": {
+          "enum": [
+            "NONE_PROVEN",
+            "ACCEPTED",
+            "REPLACES_EXISTING_LABEL"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "UNKNOWN_NOT_RESOLVED",
+            "PROVEN_NOT_PRINTED",
+            "EXPIRED_CARTON_HELD",
+            "CLOSED_CARTON_RECOVERED",
+            "LABEL_DAMAGED"
+          ]
+        },
+        "approvedBy": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "UNKNOWN_NOT_RESOLVED",
+                  "CLOSED_CARTON_RECOVERED"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "duplicateRisk": {
+                "const": "ACCEPTED"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "const": "LABEL_DAMAGED"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "duplicateRisk": {
+                "const": "REPLACES_EXISTING_LABEL"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "reason": {
+                "enum": [
+                  "PROVEN_NOT_PRINTED",
+                  "EXPIRED_CARTON_HELD"
+                ]
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "duplicateRisk": {
+                "enum": [
+                  "NONE_PROVEN",
+                  "ACCEPTED"
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "description": "Reimpresión excepcional que produjo esta versión: X01 o X02 (CONFIRMED) o X03 (UNKNOWN con EXCEPTIONAL_REPRINT_UNRESOLVED)."
+    },
+    "operatorAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Acción manual auditada (OperatorAction) que produjo esta versión: J04, J16 o J17.",
+      "required": [
+        "operatorActionId",
+        "type",
+        "performedBy",
+        "performedAt"
+      ],
+      "properties": {
+        "operatorActionId": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "type": {
+          "enum": [
+            "CANCEL_JOB",
+            "RECONCILE_NEGATIVE",
+            "CLOSE_UNRESOLVED"
+          ]
+        },
+        "performedBy": {
+          "type": "string",
+          "minLength": 1
+        },
+        "performedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "timings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "detectionTimestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "receivedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "jobReadyAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "sendStartAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "writeCompletedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "evidenceAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "$comment": "Solo UNKNOWN es no final.",
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "UNKNOWN"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "final": {
+            "const": false
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "final": {
+            "const": true
+          }
+        }
+      }
+    },
+    {
+      "$comment": "Resultados de un job existente.",
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "CONFIRMED",
+              "TRANSMITTED",
+              "UNKNOWN",
+              "FAILED",
+              "CANCELLED",
+              "CLOSED_UNRESOLVED"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "printJobId",
+          "labelSerial",
+          "workOrderId",
+          "productId",
+          "lotId",
+          "printerId"
+        ]
+      }
+    },
+    {
+      "$comment": "Resultados con un intento que pudo transmitir.",
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "CONFIRMED",
+              "TRANSMITTED",
+              "UNKNOWN"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "attemptId"
+        ]
+      }
+    },
+    {
+      "$comment": "CONFIRMED exige la evidencia que lo decidió, verificada.",
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "CONFIRMED"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "evidence"
+        ],
+        "properties": {
+          "evidence": {
+            "properties": {
+              "verified": {
+                "const": true
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "TRANSMITTED solo se publica en estaciones sin evidencia (MinConfirmationLevel NONE): no lleva reason.",
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "TRANSMITTED"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "reason"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "CONFIRMED"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "reason"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "UNKNOWN"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "enum": [
+              "WRITE_INTERRUPTED",
+              "RESTART_DURING_SEND",
+              "EVIDENCE_WINDOW_ELAPSED",
+              "SERIAL_MISMATCH",
+              "EXCEPTIONAL_REPRINT_UNRESOLVED"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "FAILED"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "enum": [
+              "PRINTER_UNAVAILABLE",
+              "DEVICE_REPORTED_NOT_PRINTED",
+              "RECONCILED_NOT_PRINTED"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "CANCELLED"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "const": "CANCELLED_BY_OPERATOR"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "CLOSED_UNRESOLVED"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "enum": [
+              "CLOSED_CARTON_REJECTED",
+              "CLOSED_CARTON_QUARANTINED"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "EXPIRED"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "enum": [
+              "DEADLINE_PASSED",
+              "OUT_OF_ORDER",
+              "LATE_ARRIVAL",
+              "ERP_UNAVAILABLE"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "EXPIRED con job (DEADLINE_PASSED, OUT_OF_ORDER) frente a EXPIRED sin job (LATE_ARRIVAL, ERP_UNAVAILABLE).",
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "EXPIRED"
+          },
+          "reason": {
+            "enum": [
+              "DEADLINE_PASSED",
+              "OUT_OF_ORDER"
+            ]
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "then": {
+        "required": [
+          "printJobId",
+          "labelSerial",
+          "workOrderId",
+          "productId",
+          "lotId",
+          "printerId"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "EXPIRED"
+          },
+          "reason": {
+            "enum": [
+              "LATE_ARRIVAL",
+              "ERP_UNAVAILABLE"
+            ]
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "printJobId"
+              ]
+            },
+            {
+              "required": [
+                "attemptId"
+              ]
+            },
+            {
+              "required": [
+                "labelSerial"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "$comment": "BLOCKED nunca tiene job.",
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "BLOCKED"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "enum": [
+              "INCOHERENT_SNAPSHOT",
+              "IMPLAUSIBLE_RATE",
+              "SEQUENCE_ANOMALY",
+              "STATION_DISABLED",
+              "RECIRCULATED_CARTON"
+            ]
+          }
+        },
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "printJobId"
+              ]
+            },
+            {
+              "required": [
+                "attemptId"
+              ]
+            },
+            {
+              "required": [
+                "labelSerial"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "$comment": "Una reimpresión excepcional se publica cuando su intento queda CONFIRMED (X01, X02) o UNKNOWN (X03).",
+      "if": {
+        "required": [
+          "exceptionalReprint"
+        ]
+      },
+      "then": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "CONFIRMED",
+              "UNKNOWN"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "La evidencia solo acompaña a CONFIRMED (la que decidió) o a UNKNOWN (la que contradice).",
+      "if": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "TRANSMITTED",
+              "FAILED",
+              "EXPIRED",
+              "CANCELLED",
+              "CLOSED_UNRESOLVED",
+              "BLOCKED"
+            ]
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "evidence"
+          ]
+        }
+      }
+    },
+    {
+      "$comment": "SERIAL_MISMATCH publica la lectura contradictoria (J11, J18).",
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "UNKNOWN"
+          },
+          "reason": {
+            "const": "SERIAL_MISMATCH"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "then": {
+        "required": [
+          "evidence"
+        ],
+        "properties": {
+          "evidence": {
+            "properties": {
+              "verified": {
+                "const": false
+              },
+              "level": {
+                "const": "VERIFIED"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "X03: el UNKNOWN de una reimpresión excepcional sin confirmar declara la reimpresión.",
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "UNKNOWN"
+          },
+          "reason": {
+            "const": "EXCEPTIONAL_REPRINT_UNRESOLVED"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "then": {
+        "required": [
+          "exceptionalReprint"
+        ]
+      }
+    },
+    {
+      "$comment": "Con UNKNOWN, exceptionalReprint solo aparece por X03.",
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "UNKNOWN"
+          }
+        },
+        "required": [
+          "exceptionalReprint"
+        ]
+      },
+      "then": {
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "const": "EXCEPTIONAL_REPRINT_UNRESOLVED"
+          }
+        }
+      }
+    },
+    {
+      "$comment": "J04: la cancelación declara su OperatorAction.",
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "CANCELLED"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "operatorAction"
+        ],
+        "properties": {
+          "operatorAction": {
+            "properties": {
+              "type": {
+                "const": "CANCEL_JOB"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "J17: el cierre sin resolver declara su OperatorAction.",
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "CLOSED_UNRESOLVED"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "operatorAction"
+        ],
+        "properties": {
+          "operatorAction": {
+            "properties": {
+              "type": {
+                "const": "CLOSE_UNRESOLVED"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "J16: la reconciliación negativa declara su OperatorAction con las tres pruebas registradas.",
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "FAILED"
+          },
+          "reason": {
+            "const": "RECONCILED_NOT_PRINTED"
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "then": {
+        "required": [
+          "operatorAction"
+        ],
+        "properties": {
+          "operatorAction": {
+            "properties": {
+              "type": {
+                "const": "RECONCILE_NEGATIVE"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "$comment": "operatorAction solo con resultados de transiciones manuales.",
+      "if": {
+        "required": [
+          "operatorAction"
+        ]
+      },
+      "then": {
+        "properties": {
+          "outcome": {
+            "enum": [
+              "CANCELLED",
+              "CLOSED_UNRESOLVED",
+              "FAILED"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "$comment": "Con FAILED, operatorAction solo por reconciliación negativa.",
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "FAILED"
+          }
+        },
+        "required": [
+          "operatorAction"
+        ]
+      },
+      "then": {
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "const": "RECONCILED_NOT_PRINTED"
+          }
+        }
+      }
+    },
+    {
+      "$comment": "Con UNKNOWN, evidence solo acompaña a SERIAL_MISMATCH (la lectura contradictoria).",
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "UNKNOWN"
+          },
+          "reason": {
+            "not": {
+              "const": "SERIAL_MISMATCH"
+            }
+          }
+        },
+        "required": [
+          "reason"
+        ]
+      },
+      "then": {
+        "not": {
+          "required": [
+            "evidence"
+          ]
+        }
+      }
+    }
+  ]
+}

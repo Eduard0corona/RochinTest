@@ -1,0 +1,18 @@
+flowchart TD
+    A["PrintJob UNKNOWN<br/>reenvío ordinario bloqueado"] --> B["Retener la caja si el PLC puede<br/>localizar job, intento y LabelSerial"]
+    B --> C{"¿Evidencia del intento ordinario<br/>y UNKNOWN por escritura, reinicio<br/>o ventana vencida?"}
+    C -- "sí" --> D["J15 · CONFIRMED"]
+    C -- "no" --> E{"¿OperatorAction con las tres pruebas?<br/>dispositivo, cola vacía e inspección"}
+    E -- "sí" --> F["J16 · FAILED<br/>RECONCILED_NOT_PRINTED"]
+    E -- "no" --> G["J17 · CLOSED_UNRESOLVED<br/>OperatorAction · caja rechazada o en cuarentena"]
+    B -. "caja retenida necesita etiqueta" .-> H
+    F --> H{"¿La caja retenida<br/>necesita etiqueta?"}
+    G --> H
+    H -- "sí" --> I["ReprintAuthorization<br/>dos personas y riesgo declarado<br/>solo impresora fuera de línea"]
+    I --> J["TX-X en el sender de la impresora destino<br/>intento EXCEPTIONAL_REPRINT<br/>mismo PrintJob y mismo LabelSerial"]
+    J --> K{"¿Evidencia que referencia la reimpresión<br/>dentro de EvidenceWindowMs?"}
+    K -- "sí" --> L["X01 · CONFIRMED<br/>exceptionalReprint publicado"]
+    K -- "no, pudo imprimir" --> M["X03 · UNKNOWN<br/>EXCEPTIONAL_REPRINT_UNRESOLVED<br/>riesgo ACCEPTED en adelante"]
+    M -- "evidencia tardía de la reimpresión" --> L
+    K -- "no se envió o no imprimió" --> N["El job no cambia<br/>otra autorización si procede"]
+    M -- "sin evidencia" --> E

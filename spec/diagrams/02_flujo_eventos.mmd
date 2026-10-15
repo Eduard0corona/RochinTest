@@ -1,0 +1,39 @@
+flowchart TD
+    A["Notificación OPC UA<br/>registro latched del ciclo"] --> B{"¿StatusCode Good?"}
+    B -- "no" --> B1["Se cuenta y se espera el siguiente valor<br/>posible hueco"]
+    B -- "sí" --> C["Huella de origen, época y plazo"]
+    C --> D{"¿Época aceptada?"}
+    D -- "no" --> D1["SequenceAnomaly EPOCH_UNEXPECTED<br/>registro retenido"]
+    D -- "sí" --> E["TX-A · INSERT CartonDetection RECEIVED"]
+    E --> F{"¿La clave ya existía?"}
+    F -- "sí, misma huella" --> F1["Duplicado auténtico: sin efecto"]
+    F -- "sí, otra huella" --> F2["IDENTITY_COLLISION<br/>estación bloqueada"]
+    F -- "no" --> G{"Clasificación en TX-A"}
+    G -- "plazo vencido o sin plazo confiable" --> G1["EXPIRED · LATE_ARRIVAL"]
+    G -- "impedimento" --> G2["BLOCKED"]
+    G -- "sin snapshot ERP" --> G3["WAITING_ERP"]
+    G -- "todo válido" --> H["PrintJob READY<br/>LabelSerial, payload, plazo y revisión congelados<br/>Outbox CartonDetected"]
+    G3 -- "snapshot a tiempo" --> H
+    G3 -- "plazo vencido" --> G4["EXPIRED · ERP_UNAVAILABLE"]
+    G3 -- "estación bloqueada o caja recirculada" --> G2
+    H --> I{"TX-B · claim<br/>plazo, estación, impresora, lease<br/>y ciclo posterior al último enviado"}
+    I -- "rechazado por plazo u orden" --> I1["EXPIRED · DEADLINE_PASSED u OUT_OF_ORDER"]
+    I -- "aceptado" --> I2["PrintAttempt SENDING, MayHaveSent = 1<br/>PrinterSendOrder avanza"]
+    I2 --> J
+    J{"Segunda comprobación<br/>con reloj monotónico"}
+    J -- "falla" --> J1["Intento NOT_SENT<br/>job EXPIRED"]
+    J -- "pasa" --> K["Escritura al dispositivo"]
+    K -- "nunca se invocó" --> K1["Intento NOT_SENT<br/>job RETRY_WAIT o FAILED"]
+    K -- "error tras invocarla" --> K2["UNKNOWN<br/>sin reenvío"]
+    K -- "completa" --> L["TRANSMITTED"]
+    L --> M{"Evidencia registrada<br/>en EvidenceObservation"}
+    M -- "nivel, correlación y serial correctos" --> N["CONFIRMED"]
+    M -- "ventana vencida o serial distinto" --> K2
+    N -. "lectura posterior con otro serial (J18)" .-> K2
+    N --> O["Outbox PrintJobResult<br/>RabbitMQ"]
+    K2 --> O
+    G1 --> O
+    G2 --> O
+    G4 --> O
+    J1 --> O
+    I1 --> O

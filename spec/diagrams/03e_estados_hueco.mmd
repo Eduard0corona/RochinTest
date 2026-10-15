@@ -1,0 +1,13 @@
+%% GENERADO por tools/generate_artifacts.py desde contracts/state-machine.json. No editar.
+%% Máquina SequenceGap; modos incluidos: auto, manual, exception, correction.
+stateDiagram-v2
+    direction LR
+    state "OPEN" as OPEN
+    state "RECOVERED" as RECOVERED
+    state "CLOSED_UNRECOVERED" as CLOSED_UNRECOVERED
+    [*] --> OPEN: G01 salto de secuencia
+    OPEN --> RECOVERED: G02 rango completo
+    OPEN --> CLOSED_UNRECOVERED: G03 vence la gracia
+    classDef terminal fill:#eef1f4,stroke:#5d636b,color:#1a1c1f
+    classDef warning fill:#fff4dc,stroke:#d98a00,color:#1a1c1f,stroke-width:2px
+    class RECOVERED,CLOSED_UNRECOVERED terminal

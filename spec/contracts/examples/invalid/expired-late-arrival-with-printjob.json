@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "eventType": "PrintJobResult",
+  "eventId": "e532948b-926a-5778-8733-5091f82d4ab9",
+  "correlationId": "79b0d9cb-76b8-5814-b31d-c96523f306a2",
+  "occurredAt": "2026-10-12T18:04:16.120Z",
+  "siteId": "PLANT-01",
+  "stationId": "LINE-01",
+  "plcEpoch": 42,
+  "cycleId": "918276",
+  "idempotencyKey": "PLANT-01:LINE-01:42:918276",
+  "labelType": "CARTON_GS1",
+  "resultVersion": 1,
+  "outcome": "EXPIRED",
+  "final": true,
+  "configRevision": 7,
+  "reason": "LATE_ARRIVAL",
+  "workOrderId": "WO-2026-4816",
+  "printJobId": "0d7f3c2e-91b4-4a5d-b8e6-2f1a7c9d4e04"
+}

@@ -1,0 +1,29 @@
+sequenceDiagram
+    autonumber
+    participant PLC
+    participant ING as OPC Ingest
+    participant SQL as SQL Server
+    participant SND as Sender de impresora
+    participant PRN as Impresora
+    participant EVD as Escáner o aplicador
+    participant OUT as Outbox Relay
+    participant MQ as RabbitMQ
+    PLC->>ING: Registro latched (CycleId, PlcEpoch, DetectionTimestamp)
+    ING->>ING: StatusCode, huella canónica, época, transporte y plazo
+    ING->>SQL: NEXT VALUE FOR LabelSerialSeq (fuera de TX-A)
+    ING->>ING: Payload con LabelSerial y PayloadHash
+    ING->>SQL: TX-A detección, PrintJob READY, Outbox CartonDetected
+    SQL-->>ING: commit
+    ING->>SND: Channel con PrintJobId
+    SND->>SQL: TX-B claim con plazo, orden y lease · PrinterSendOrder · intento SENDING
+    SQL-->>SND: commit, fila en OUTPUT INTO
+    SND->>SND: Segunda comprobación monotónica
+    SND->>PRN: Escritura del payload con LabelSerial
+    PRN-->>SND: Escritura completa
+    SND->>SQL: TX-C TRANSMITTED
+    EVD-->>SND: Evidencia con ReadSerial y ciclo
+    SND->>SQL: TX-D EvidenceObservation, CONFIRMED, Outbox PrintJobResult
+    OUT->>SQL: Lee filas pendientes
+    OUT->>MQ: Publica con message-id igual a EventId
+    MQ-->>OUT: Publisher confirm
+    OUT->>SQL: Marca PublishedAt

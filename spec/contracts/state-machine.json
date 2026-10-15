@@ -1,0 +1,988 @@
+{
+  "$comment": "Fuente única de verdad de estados y transiciones (v1.1). tools/generate_artifacts.py deriva de aquí los diagramas de estados, las tablas de estados del documento y database/sqlserver_state_transitions.sql. tools/verify_package.py comprueba que el DDL, los schemas, los ejemplos y la matriz de pruebas coinciden.",
+  "version": "1.1",
+  "uuidNamespace": "8c1b1faf-f41b-4fe0-970d-47152b7116d0",
+  "uuidNames": {
+    "CartonDetected": "CartonDetected|{idempotencyKey}",
+    "PrintJobResult": "PrintJobResult|{idempotencyKey}|{labelType}|{resultVersion}"
+  },
+  "modes": {
+    "auto": "La ejecuta el sistema cuando se cumple la guarda. Semilla Kind = AUTO.",
+    "manual": "La ejecuta una persona autorizada por TX-M. El trigger exige una OperatorAction nueva del mismo job con TargetStatus igual al destino (PrintJob) o una OperatorAction RECONCILE_NEGATIVE del job (PrintAttempt). Semilla Kind = MANUAL.",
+    "exception": "Procedimiento excepcional. El trigger exige SESSION_CONTEXT TransitionKind = EXCEPTION y que el mismo UPDATE fije LastExceptionalAttemptId a un intento EXCEPTIONAL_REPRINT nuevo del job cuyo Outcome sea el estado destino; ese intento solo existe con una ReprintAuthorization EXECUTED del mismo job. La marca de sesión declara la intención; la guarda real son los datos. Semilla Kind = EXCEPTION.",
+    "correction": "Corrección automática hacia UNKNOWN cuando una evidencia posterior contradice un resultado confirmado. El trigger exige SESSION_CONTEXT TransitionKind = CORRECTION y una EvidenceObservation del job correlacionada con el ciclo cuyo ReadSerial difiere del LabelSerial. Solo reduce certeza: nunca habilita un envío. Semilla Kind = CORRECTION."
+  },
+  "machines": {
+    "CartonDetection": {
+      "table": "dbo.CartonDetection",
+      "column": "Status",
+      "reasonColumn": "Reason",
+      "initial": "RECEIVED",
+      "states": {
+        "RECEIVED": {
+          "terminal": false,
+          "meaning": "Ciclo observado o recuperado, registrado con su identidad. Aún no se decide si genera job."
+        },
+        "WAITING_ERP": {
+          "terminal": false,
+          "meaning": "No hay snapshot ERP válido para la orden; el plazo de la caja sigue vigente."
+        },
+        "JOB_CREATED": {
+          "terminal": true,
+          "meaning": "Existe el PrintJob ordinario de esta detección."
+        },
+        "BLOCKED": {
+          "terminal": true,
+          "meaning": "No se crea job: datos incoherentes, anomalía de secuencia, estación deshabilitada, rebote o caja recirculada."
+        },
+        "EXPIRED": {
+          "terminal": true,
+          "meaning": "El plazo venció antes de poder crear el job. Nunca se imprime."
+        }
+      },
+      "reasons": {
+        "BLOCKED": [
+          "INCOHERENT_SNAPSHOT",
+          "IMPLAUSIBLE_RATE",
+          "SEQUENCE_ANOMALY",
+          "STATION_DISABLED",
+          "RECIRCULATED_CARTON"
+        ],
+        "EXPIRED": [
+          "LATE_ARRIVAL",
+          "ERP_UNAVAILABLE"
+        ]
+      },
+      "transitions": [
+        {
+          "id": "D01",
+          "label": "registro único",
+          "from": [
+            "(create)"
+          ],
+          "to": "RECEIVED",
+          "mode": "auto",
+          "tx": "TX-A",
+          "trigger": "INSERT de la identidad (SiteId, StationId, PlcEpoch, CycleId) con su huella de origen.",
+          "guard": "Registro OPC con StatusCode Good; PlcEpoch aceptada y CycleId dentro de lo admitido para esa época (ADR 0007); la clave no existía.",
+          "action": "Si la clave ya existía no hay transición: se compara la huella (duplicado auténtico o colisión, ver ADR 0007)."
+        },
+        {
+          "id": "D02",
+          "label": "snapshot válido",
+          "from": [
+            "RECEIVED"
+          ],
+          "to": "JOB_CREATED",
+          "mode": "auto",
+          "tx": "TX-A",
+          "trigger": "Clasificación en la misma transacción del registro.",
+          "guard": "Snapshot ERP válido para WorkOrderId; plazo efectivo vigente con margen; estación habilitada; sin caja recirculada.",
+          "action": "INSERT PrintJob READY con LabelSerial, payload, hash, DeadlineAt y ConfigRevisionId congelados; Outbox CartonDetected."
+        },
+        {
+          "id": "D03",
+          "label": "sin snapshot",
+          "from": [
+            "RECEIVED"
+          ],
+          "to": "WAITING_ERP",
+          "mode": "auto",
+          "tx": "TX-A",
+          "trigger": "Clasificación sin snapshot ERP válido.",
+          "guard": "Plazo vigente; estación habilitada.",
+          "action": "Outbox CartonDetected; ErpSync pide el snapshot de forma asíncrona."
+        },
+        {
+          "id": "D04",
+          "label": "llega vencida",
+          "from": [
+            "RECEIVED"
+          ],
+          "to": "EXPIRED",
+          "mode": "auto",
+          "tx": "TX-A",
+          "trigger": "Clasificación de un registro que llega con el plazo vencido o que no tiene plazo confiable: evento tardío, Republish, FIFO, lectura tras reconexión, replay o reingreso de anomalía.",
+          "guard": "Plazo efectivo vencido al registrar; o referencia GATEWAY_RECEIPT y el registro no llegó en vivo (Transport distinto de SUBSCRIPTION, overflow, primera notificación de un monitored item creado o transferido, que se registra como READ) o abre un hueco de secuencia.",
+          "action": "Reason LATE_ARRIVAL; sin plazo confiable, DeadlineAt = ReceivedAt; Outbox CartonDetected y PrintJobResult EXPIRED sin job."
+        },
+        {
+          "id": "D05",
+          "label": "impedimento",
+          "from": [
+            "RECEIVED"
+          ],
+          "to": "BLOCKED",
+          "mode": "auto",
+          "tx": "TX-A",
+          "trigger": "Clasificación que detecta un impedimento.",
+          "guard": "INCOHERENT_SNAPSHOT (incluido PLC_TIMESTAMP sin DetectionTimestamp, registrado con DeadlineAt = ReceivedAt), IMPLAUSIBLE_RATE, SEQUENCE_ANOMALY (reinicio sospechado o disminución ambigua), STATION_DISABLED o RECIRCULATED_CARTON.",
+          "action": "Outbox CartonDetected y PrintJobResult BLOCKED sin job; alerta."
+        },
+        {
+          "id": "D06",
+          "label": "snapshot a tiempo",
+          "from": [
+            "WAITING_ERP"
+          ],
+          "to": "JOB_CREATED",
+          "mode": "auto",
+          "tx": "TX-E",
+          "trigger": "Llega un snapshot ERP válido.",
+          "guard": "Plazo efectivo vigente con margen; estación habilitada; sin caja recirculada (se repite la validación de TX-A).",
+          "action": "INSERT PrintJob READY con lo congelado."
+        },
+        {
+          "id": "D07",
+          "label": "plazo vencido",
+          "from": [
+            "WAITING_ERP"
+          ],
+          "to": "EXPIRED",
+          "mode": "auto",
+          "tx": "TX-S",
+          "trigger": "Barrido de vencimientos o snapshot que llega tarde.",
+          "guard": "Plazo efectivo vencido.",
+          "action": "Reason ERP_UNAVAILABLE; Outbox PrintJobResult EXPIRED sin job."
+        },
+        {
+          "id": "D08",
+          "label": "bloqueo durante la espera",
+          "from": [
+            "WAITING_ERP"
+          ],
+          "to": "BLOCKED",
+          "mode": "auto",
+          "tx": "TX-E / TX-S",
+          "trigger": "Llega el snapshot con la estación bloqueada, o la revalidación detecta caja recirculada.",
+          "guard": "Plazo vigente; estación deshabilitada o recirculación detectada.",
+          "action": "Reason STATION_DISABLED o RECIRCULATED_CARTON; Outbox PrintJobResult BLOCKED sin job."
+        }
+      ],
+      "forbidden": [
+        {
+          "from": "EXPIRED",
+          "to": "JOB_CREATED",
+          "why": "Un job creado después del plazo imprimiría sobre otra caja."
+        },
+        {
+          "from": "BLOCKED",
+          "to": "JOB_CREATED",
+          "why": "El bloqueo se resuelve en la estación, no reabriendo detecciones; la caja sigue la política de rechazo."
+        }
+      ],
+      "resultOutcome": {
+        "RECEIVED": null,
+        "WAITING_ERP": null,
+        "JOB_CREATED": null,
+        "BLOCKED": "BLOCKED",
+        "EXPIRED": "EXPIRED"
+      }
+    },
+    "PrintJob": {
+      "table": "dbo.PrintJob",
+      "column": "Status",
+      "reasonColumn": "Reason",
+      "initial": "READY",
+      "states": {
+        "READY": {
+          "terminal": false,
+          "meaning": "Job completo y congelado. Ningún intento abierto y ningún intento con MayHaveSent = 1."
+        },
+        "SENDING": {
+          "terminal": false,
+          "meaning": "Intento ordinario reclamado y persistido antes de cualquier I/O. Se asume que pudo empezar a transmitir."
+        },
+        "TRANSMITTED": {
+          "terminal": "conditional",
+          "terminalWhen": "MinConfirmationLevel = NONE en la revisión congelada",
+          "meaning": "La escritura terminó: el transporte aceptó todos los bytes. Puede o no haberse impreso. Espera evidencia durante EvidenceWindowMs."
+        },
+        "RETRY_WAIT": {
+          "terminal": false,
+          "meaning": "El último intento quedó NOT_SENT comprobado; espera el backoff con el plazo vigente."
+        },
+        "CONFIRMED": {
+          "terminal": true,
+          "meaning": "Evidencia que cumple el MinConfirmationLevel congelado y su regla de correlación. Una evidencia posterior contradictoria lo corrige a UNKNOWN (J18)."
+        },
+        "UNKNOWN": {
+          "terminal": false,
+          "meaning": "Pudo haberse impreso y no hay evidencia concluyente. Bloquea todo reenvío ordinario."
+        },
+        "FAILED": {
+          "terminal": true,
+          "meaning": "Se sabe que no existe etiqueta de este job: intentos agotados sin transmisión, cancelación confirmada por el dispositivo o reconciliación negativa con sus tres pruebas."
+        },
+        "EXPIRED": {
+          "terminal": true,
+          "meaning": "Sin ninguna transmisión, venció el plazo o la impresora ya envió un ciclo posterior (OUT_OF_ORDER): todos los intentos quedaron NOT_SENT o no hubo intentos."
+        },
+        "CANCELLED": {
+          "terminal": true,
+          "meaning": "Anulado por una persona autorizada antes de cualquier transmisión."
+        },
+        "CLOSED_UNRESOLVED": {
+          "terminal": true,
+          "meaning": "Cierre operativo de un UNKNOWN sin resolver la incertidumbre; la caja quedó rechazada o en cuarentena."
+        }
+      },
+      "reasons": {
+        "UNKNOWN": [
+          "WRITE_INTERRUPTED",
+          "RESTART_DURING_SEND",
+          "EVIDENCE_WINDOW_ELAPSED",
+          "SERIAL_MISMATCH",
+          "EXCEPTIONAL_REPRINT_UNRESOLVED"
+        ],
+        "FAILED": [
+          "PRINTER_UNAVAILABLE",
+          "DEVICE_REPORTED_NOT_PRINTED",
+          "RECONCILED_NOT_PRINTED"
+        ],
+        "EXPIRED": [
+          "DEADLINE_PASSED",
+          "OUT_OF_ORDER"
+        ],
+        "CANCELLED": [
+          "CANCELLED_BY_OPERATOR"
+        ],
+        "CLOSED_UNRESOLVED": [
+          "CLOSED_CARTON_REJECTED",
+          "CLOSED_CARTON_QUARANTINED"
+        ]
+      },
+      "transitions": [
+        {
+          "id": "J01",
+          "label": "creación",
+          "from": [
+            "(create)"
+          ],
+          "to": "READY",
+          "mode": "auto",
+          "tx": "TX-A / TX-E",
+          "trigger": "Detección D02 o D06.",
+          "guard": "UNIQUE (DetectionId, LabelType); LabelSerial de la SEQUENCE; payload y hash calculados.",
+          "action": "Señal en proceso (Channel) al sender de la impresora."
+        },
+        {
+          "id": "J02",
+          "label": "claim",
+          "from": [
+            "READY"
+          ],
+          "to": "SENDING",
+          "mode": "auto",
+          "tx": "TX-B",
+          "trigger": "Claim del sender único de la impresora.",
+          "guard": "Status = READY; @EdgeNowUtc < plazo efectivo − SendMarginMs efectivo; estación habilitada; PrinterId del job igual al de la revisión activa; lease vigente; ningún otro intento SENDING en la impresora; (PlcEpoch, CycleId) del job mayor que el último enviado por la impresora (PrinterSendOrder).",
+          "action": "Avanza PrinterSendOrder; INSERT PrintAttempt ORDINARY con Outcome SENDING y MayHaveSent = 1; commit antes de cualquier I/O."
+        },
+        {
+          "id": "J03",
+          "label": "plazo vencido",
+          "from": [
+            "READY"
+          ],
+          "to": "EXPIRED",
+          "mode": "auto",
+          "tx": "TX-S",
+          "trigger": "Barrido o claim rechazado por plazo o por orden de envío.",
+          "guard": "@EdgeNowUtc ≥ plazo efectivo − SendMarginMs efectivo (DEADLINE_PASSED), o la impresora ya envió un ciclo posterior (OUT_OF_ORDER).",
+          "action": "Reason DEADLINE_PASSED u OUT_OF_ORDER; Outbox PrintJobResult EXPIRED."
+        },
+        {
+          "id": "J04",
+          "label": "cancelación",
+          "from": [
+            "READY"
+          ],
+          "to": "CANCELLED",
+          "mode": "manual",
+          "tx": "TX-M",
+          "trigger": "Cancelación solicitada por una persona autorizada.",
+          "guard": "Ningún intento del job con MayHaveSent = 1; OperatorAction CANCEL_JOB registrada en la misma transacción.",
+          "action": "Reason CANCELLED_BY_OPERATOR; Outbox PrintJobResult CANCELLED."
+        },
+        {
+          "id": "J05",
+          "label": "escritura completa",
+          "from": [
+            "SENDING"
+          ],
+          "to": "TRANSMITTED",
+          "mode": "auto",
+          "tx": "TX-C",
+          "trigger": "La escritura terminó sin error de transporte.",
+          "guard": "Intento en SENDING del mismo lease.",
+          "action": "Intento TRANSMITTED con EvidenceDeadlineAt = ahora + EvidenceWindowMs (si el nivel no es NONE). Si el nivel es NONE, Outbox PrintJobResult TRANSMITTED final con resultVersion + 1."
+        },
+        {
+          "id": "J06",
+          "label": "NOT_SENT, reintento",
+          "from": [
+            "SENDING"
+          ],
+          "to": "RETRY_WAIT",
+          "mode": "auto",
+          "tx": "TX-C",
+          "trigger": "Intento NOT_SENT comprobado: fallo de conexión antes de escribir, o la segunda comprobación rechazó por compuerta o estación bloqueada con el plazo vigente.",
+          "guard": "AutoAttemptCount < MaxAutoAttempts; plazo efectivo vigente. Un rechazo por compuerta o estación no consume intento (AutoAttemptCount se restituye).",
+          "action": "NextAttemptAt = ahora + RetryBackoffMs."
+        },
+        {
+          "id": "J07",
+          "label": "NOT_SENT, sin intentos",
+          "from": [
+            "SENDING"
+          ],
+          "to": "FAILED",
+          "mode": "auto",
+          "tx": "TX-C",
+          "trigger": "Intento NOT_SENT por fallo de conexión antes de escribir.",
+          "guard": "AutoAttemptCount ≥ MaxAutoAttempts; plazo efectivo vigente.",
+          "action": "Reason PRINTER_UNAVAILABLE; Outbox PrintJobResult FAILED."
+        },
+        {
+          "id": "J08",
+          "label": "NOT_SENT, plazo vencido",
+          "from": [
+            "SENDING"
+          ],
+          "to": "EXPIRED",
+          "mode": "auto",
+          "tx": "TX-C",
+          "trigger": "Intento NOT_SENT con el plazo efectivo vencido, incluida la segunda comprobación previa al envío.",
+          "guard": "Plazo efectivo vencido.",
+          "action": "Reason DEADLINE_PASSED; Outbox PrintJobResult EXPIRED."
+        },
+        {
+          "id": "J09",
+          "label": "interrupción o reinicio",
+          "from": [
+            "SENDING"
+          ],
+          "to": "UNKNOWN",
+          "mode": "auto",
+          "tx": "TX-C / TX-R0",
+          "trigger": "Escritura interrumpida o timeout después de invocarla; o el arranque encuentra el job en SENDING.",
+          "guard": "Ninguna; es la salida conservadora.",
+          "action": "Reason WRITE_INTERRUPTED o RESTART_DURING_SEND; Outbox PrintJobResult UNKNOWN (final false); alerta."
+        },
+        {
+          "id": "J10",
+          "label": "evidencia",
+          "from": [
+            "TRANSMITTED"
+          ],
+          "to": "CONFIRMED",
+          "mode": "auto",
+          "tx": "TX-D",
+          "trigger": "Llega evidencia para el intento.",
+          "guard": "MinConfirmationLevel congelado distinto de NONE (el trigger lo exige); nivel de la evidencia ≥ mínimo; correlación según el nivel; si es VERIFIED, ReadSerial = LabelSerial. El trigger exige un intento ORDINARY del job en CONFIRMED.",
+          "action": "Intento CONFIRMED; Outbox PrintJobResult CONFIRMED."
+        },
+        {
+          "id": "J11",
+          "label": "sin evidencia o serial distinto",
+          "from": [
+            "TRANSMITTED"
+          ],
+          "to": "UNKNOWN",
+          "mode": "auto",
+          "tx": "TX-D / TX-S",
+          "trigger": "Vence EvidenceWindowMs sin evidencia suficiente, o la evidencia contradice al job.",
+          "guard": "MinConfirmationLevel congelado distinto de NONE (el trigger lo exige).",
+          "action": "Reason EVIDENCE_WINDOW_ELAPSED o SERIAL_MISMATCH; Outbox PrintJobResult UNKNOWN; alerta."
+        },
+        {
+          "id": "J12",
+          "label": "dispositivo: no impreso",
+          "from": [
+            "TRANSMITTED"
+          ],
+          "to": "FAILED",
+          "mode": "auto",
+          "tx": "TX-D",
+          "trigger": "El dispositivo reporta que este job específico no se imprimió.",
+          "guard": "MinConfirmationLevel congelado distinto de NONE (el trigger lo exige); el dispositivo confirma, para este job específico, que lo canceló o descartó y que ya no está en su cola (OT-07). Un reporte de 'no impreso' sin esa confirmación no basta.",
+          "action": "Intento NOT_PRINTED; Reason DEVICE_REPORTED_NOT_PRINTED; Outbox PrintJobResult FAILED."
+        },
+        {
+          "id": "J13",
+          "label": "backoff cumplido",
+          "from": [
+            "RETRY_WAIT"
+          ],
+          "to": "READY",
+          "mode": "auto",
+          "tx": "TX-S",
+          "trigger": "Se cumple NextAttemptAt.",
+          "guard": "Plazo efectivo vigente con margen y la impresora no ha enviado un ciclo posterior.",
+          "action": "Señal al sender de la impresora."
+        },
+        {
+          "id": "J14",
+          "label": "plazo vencido",
+          "from": [
+            "RETRY_WAIT"
+          ],
+          "to": "EXPIRED",
+          "mode": "auto",
+          "tx": "TX-S",
+          "trigger": "Barrido, o la impresora envió un ciclo posterior.",
+          "guard": "Plazo efectivo vencido (DEADLINE_PASSED) o ciclo posterior ya enviado (OUT_OF_ORDER).",
+          "action": "Reason DEADLINE_PASSED u OUT_OF_ORDER; Outbox PrintJobResult EXPIRED."
+        },
+        {
+          "id": "J15",
+          "label": "reconciliación positiva",
+          "from": [
+            "UNKNOWN"
+          ],
+          "to": "CONFIRMED",
+          "mode": "auto",
+          "tx": "TX-D",
+          "trigger": "Reconciliación positiva: evidencia tardía del intento original (lectura del serial, inspección con lectura).",
+          "guard": "Misma regla de nivel y correlación que J10; solo si el UNKNOWN vino de WRITE_INTERRUPTED, RESTART_DURING_SEND o EVIDENCE_WINDOW_ELAPSED; el trigger exige un intento ORDINARY del job en CONFIRMED.",
+          "action": "Intento CONFIRMED; Outbox PrintJobResult CONFIRMED con resultVersion mayor."
+        },
+        {
+          "id": "J16",
+          "label": "reconciliación negativa",
+          "from": [
+            "UNKNOWN"
+          ],
+          "to": "FAILED",
+          "mode": "manual",
+          "tx": "TX-M",
+          "trigger": "Reconciliación negativa.",
+          "guard": "OperatorAction RECONCILE_NEGATIVE con las tres pruebas: el dispositivo confirma que el job no se imprimió, su cola quedó vacía o cancelada, y la inspección de la caja retenida no encuentra la etiqueta.",
+          "action": "Intento NOT_PRINTED; Reason RECONCILED_NOT_PRINTED; Outbox PrintJobResult FAILED."
+        },
+        {
+          "id": "J17",
+          "label": "cierre operativo",
+          "from": [
+            "UNKNOWN"
+          ],
+          "to": "CLOSED_UNRESOLVED",
+          "mode": "manual",
+          "tx": "TX-M",
+          "trigger": "Cierre operativo sin resolver la incertidumbre.",
+          "guard": "OperatorAction CLOSE_UNRESOLVED con la caja rechazada o en cuarentena.",
+          "action": "Reason CLOSED_CARTON_REJECTED o CLOSED_CARTON_QUARANTINED; Outbox PrintJobResult CLOSED_UNRESOLVED."
+        },
+        {
+          "id": "J18",
+          "label": "lectura contradictoria",
+          "from": [
+            "CONFIRMED",
+            "UNKNOWN"
+          ],
+          "to": "UNKNOWN",
+          "mode": "correction",
+          "tx": "TX-D",
+          "trigger": "Llega una lectura VERIFIED correlacionada con el ciclo cuyo serial no es el LabelSerial del job, con el job ya confirmado o en UNKNOWN por otra causa.",
+          "guard": "SESSION_CONTEXT TransitionKind = CORRECTION; EvidenceObservation VERIFIED del ciclo del job con ReadSerial distinto de LabelSerial (el trigger lo exige). Desde UNKNOWN cambian Reason y resultVersion, no el estado; después no hay reconciliación automática.",
+          "action": "Reason SERIAL_MISMATCH; Outbox PrintJobResult UNKNOWN con resultVersion mayor; alerta de mal etiquetado."
+        },
+        {
+          "id": "X01",
+          "label": "confirmada",
+          "from": [
+            "UNKNOWN",
+            "FAILED",
+            "EXPIRED",
+            "CLOSED_UNRESOLVED"
+          ],
+          "to": "CONFIRMED",
+          "mode": "exception",
+          "tx": "TX-X",
+          "trigger": "Un intento EXCEPTIONAL_REPRINT quedó CONFIRMED.",
+          "guard": "SESSION_CONTEXT TransitionKind = EXCEPTION; el UPDATE fija LastExceptionalAttemptId al intento EXCEPTIONAL_REPRINT más reciente del job, en CONFIRMED (el trigger lo exige), ligado a una ReprintAuthorization EXECUTED; evidencia de nivel ≥ PRINTED (o el congelado si es mayor) que referencia a ese intento y llegó después de su claim.",
+          "action": "ConfirmedByExceptionalReprint = 1; Outbox PrintJobResult CONFIRMED con exceptionalReprint y duplicateRisk."
+        },
+        {
+          "id": "X02",
+          "label": "reemplazo",
+          "from": [
+            "CONFIRMED"
+          ],
+          "to": "CONFIRMED",
+          "mode": "exception",
+          "tx": "TX-X",
+          "trigger": "Reimpresión por etiqueta dañada quedó CONFIRMED.",
+          "guard": "Igual que X01 con una autorización LABEL_DAMAGED: el retiro de la etiqueta original se registró antes de ejecutar (OriginalLabelRemovedBy, exigido por TR_PrintAttempt_Guard) y la etiqueta de reemplazo quedó confirmada con evidencia de ese intento.",
+          "action": "Sin cambio de estado; Outbox PrintJobResult CONFIRMED con resultVersion mayor y exceptionalReprint."
+        },
+        {
+          "id": "X03",
+          "label": "sin confirmar",
+          "from": [
+            "UNKNOWN",
+            "FAILED",
+            "EXPIRED",
+            "CLOSED_UNRESOLVED",
+            "CONFIRMED"
+          ],
+          "to": "UNKNOWN",
+          "mode": "exception",
+          "tx": "TX-C / TX-D / TX-S / TX-R0",
+          "trigger": "Un intento EXCEPTIONAL_REPRINT que pudo transmitir terminó UNKNOWN: error después de invocar la escritura, reinicio, evidencia contradictoria o ventana de evidencia vencida.",
+          "guard": "SESSION_CONTEXT TransitionKind = EXCEPTION; en la misma transacción que deja el intento en UNKNOWN; el UPDATE fija LastExceptionalAttemptId al intento EXCEPTIONAL_REPRINT más reciente del job, en UNKNOWN (el trigger lo exige). Desde UNKNOWN el estado no cambia, pero sí Reason y resultVersion.",
+          "action": "Reason EXCEPTIONAL_REPRINT_UNRESOLVED; Outbox PrintJobResult UNKNOWN con resultVersion mayor y exceptionalReprint; toda autorización posterior queda con riesgo ACCEPTED (PriorJobStatus UNKNOWN)."
+        }
+      ],
+      "forbidden": [
+        {
+          "from": "SENDING",
+          "to": "READY",
+          "why": "Un intento que pudo transmitir no vuelve a la cola: rompería la garantía de no duplicación."
+        },
+        {
+          "from": "SENDING",
+          "to": "CONFIRMED",
+          "why": "Confirmar exige que la escritura haya terminado (TRANSMITTED) y evidencia."
+        },
+        {
+          "from": "TRANSMITTED",
+          "to": "READY",
+          "why": "Los bytes ya se entregaron al dispositivo."
+        },
+        {
+          "from": "TRANSMITTED",
+          "to": "RETRY_WAIT",
+          "why": "Los bytes ya se entregaron al dispositivo."
+        },
+        {
+          "from": "UNKNOWN",
+          "to": "READY",
+          "why": "UNKNOWN significa que pudo imprimirse."
+        },
+        {
+          "from": "UNKNOWN",
+          "to": "SENDING",
+          "why": "Una autorización no prueba ausencia de impresión; la reimpresión es un intento excepcional, no una transición."
+        },
+        {
+          "from": "UNKNOWN",
+          "to": "RETRY_WAIT",
+          "why": "UNKNOWN significa que pudo imprimirse."
+        },
+        {
+          "from": "EXPIRED",
+          "to": "READY",
+          "why": "La caja ya salió de la ventana física."
+        },
+        {
+          "from": "FAILED",
+          "to": "READY",
+          "why": "Los estados terminales no reabren el flujo ordinario."
+        },
+        {
+          "from": "RETRY_WAIT",
+          "to": "SENDING",
+          "why": "Todo envío pasa por READY y por las guardas del claim."
+        }
+      ],
+      "resultOutcome": {
+        "READY": null,
+        "SENDING": null,
+        "RETRY_WAIT": null,
+        "TRANSMITTED": "TRANSMITTED",
+        "CONFIRMED": "CONFIRMED",
+        "UNKNOWN": "UNKNOWN",
+        "FAILED": "FAILED",
+        "EXPIRED": "EXPIRED",
+        "CANCELLED": "CANCELLED",
+        "CLOSED_UNRESOLVED": "CLOSED_UNRESOLVED"
+      }
+    },
+    "PrintAttempt": {
+      "table": "dbo.PrintAttempt",
+      "column": "Outcome",
+      "initial": "SENDING",
+      "states": {
+        "SENDING": {
+          "terminal": false,
+          "meaning": "Intento abierto con MayHaveSent = 1. Persistido antes de cualquier I/O."
+        },
+        "NOT_SENT": {
+          "terminal": true,
+          "meaning": "Comprobado: nunca se invocó la escritura (fallo de conexión o segunda comprobación previa). MayHaveSent = 0."
+        },
+        "TRANSMITTED": {
+          "terminal": false,
+          "meaning": "La escritura terminó; el transporte aceptó todos los bytes."
+        },
+        "UNKNOWN": {
+          "terminal": false,
+          "mayRemain": true,
+          "meaning": "Escritura interrumpida o resultado indeterminado. Puede quedar así si el job se cierra sin resolver."
+        },
+        "CONFIRMED": {
+          "terminal": true,
+          "meaning": "Evidencia suficiente para este intento."
+        },
+        "NOT_PRINTED": {
+          "terminal": true,
+          "meaning": "El dispositivo o la reconciliación demostró que este intento no imprimió."
+        }
+      },
+      "transitions": [
+        {
+          "id": "A01",
+          "label": "claim o reimpresión",
+          "from": [
+            "(create)"
+          ],
+          "to": "SENDING",
+          "mode": "auto",
+          "tx": "TX-B / TX-X",
+          "trigger": "Claim ordinario (J02) o ejecución de una reimpresión excepcional autorizada.",
+          "guard": "TR_PrintAttempt_Guard: ORDINARY exige el job en SENDING, PrinterId = PrintJob.PrinterId y AttemptPayloadHash = PayloadHash; EXCEPTIONAL_REPRINT exige su ReprintAuthorization del mismo job en EXECUTED, el job en PriorJobStatus, PrinterId = TargetPrinterId y SESSION_CONTEXT EXCEPTION. Además UX_PrintAttempt_PrinterInFlight, UX_PrintAttempt_JobOpen, UX_PrintAttempt_OrdinarySent y lease vigente.",
+          "action": "MayHaveSent = 1."
+        },
+        {
+          "id": "A02",
+          "label": "sin escritura",
+          "from": [
+            "SENDING"
+          ],
+          "to": "NOT_SENT",
+          "mode": "auto",
+          "tx": "TX-C",
+          "trigger": "Fallo de conexión antes de escribir, o la segunda comprobación previa al envío rechaza.",
+          "guard": "Regla de código: el sender nunca invocó la escritura (no llamó a write sobre el socket). SQL no puede comprobarlo: WriteStartedAt solo se persiste después de escribir.",
+          "action": "MayHaveSent = 0."
+        },
+        {
+          "id": "A03",
+          "label": "escritura completa",
+          "from": [
+            "SENDING"
+          ],
+          "to": "TRANSMITTED",
+          "mode": "auto",
+          "tx": "TX-C",
+          "trigger": "La escritura terminó.",
+          "guard": "WriteCompletedAt registrado.",
+          "action": "EvidenceDeadlineAt del intento = ahora + EvidenceWindowMs (si el nivel no es NONE)."
+        },
+        {
+          "id": "A04",
+          "label": "error tras escribir o reinicio",
+          "from": [
+            "SENDING"
+          ],
+          "to": "UNKNOWN",
+          "mode": "auto",
+          "tx": "TX-C / TX-R0",
+          "trigger": "Error o timeout después de invocar la escritura, o arranque que encuentra el intento abierto.",
+          "guard": "Ninguna.",
+          "action": "Si el intento es EXCEPTIONAL_REPRINT, X03 en la misma transacción."
+        },
+        {
+          "id": "A05",
+          "label": "evidencia",
+          "from": [
+            "TRANSMITTED"
+          ],
+          "to": "CONFIRMED",
+          "mode": "auto",
+          "tx": "TX-D",
+          "trigger": "Evidencia suficiente.",
+          "guard": "Regla de nivel y correlación (TR_PrintAttempt_Guard); la EvidenceObservation llegó después del claim del intento, confirma un solo intento y, si el intento es EXCEPTIONAL_REPRINT, lo referencia.",
+          "action": "—"
+        },
+        {
+          "id": "A06",
+          "label": "sin evidencia",
+          "from": [
+            "TRANSMITTED"
+          ],
+          "to": "UNKNOWN",
+          "mode": "auto",
+          "tx": "TX-D / TX-S",
+          "trigger": "Vence EvidenceDeadlineAt del intento (ordinario o excepcional) o la evidencia contradice.",
+          "guard": "Nivel mínimo distinto de NONE; EvidenceDeadlineAt del intento vencida, o EvidenceObservation contradictoria.",
+          "action": "Si el intento es EXCEPTIONAL_REPRINT, X03 en la misma transacción."
+        },
+        {
+          "id": "A07",
+          "label": "dispositivo: no impreso",
+          "from": [
+            "TRANSMITTED"
+          ],
+          "to": "NOT_PRINTED",
+          "mode": "auto",
+          "tx": "TX-D",
+          "trigger": "El dispositivo reporta no impresión del job.",
+          "guard": "Igual que J12: el dispositivo confirma para este job que lo canceló o descartó y que ya no está en su cola (OT-07).",
+          "action": "—"
+        },
+        {
+          "id": "A08",
+          "label": "reconciliación positiva",
+          "from": [
+            "UNKNOWN"
+          ],
+          "to": "CONFIRMED",
+          "mode": "auto",
+          "tx": "TX-D",
+          "trigger": "Reconciliación positiva.",
+          "guard": "Regla de nivel y correlación (TR_PrintAttempt_Guard); la EvidenceObservation llegó después del claim del intento, confirma un solo intento y, si el intento es EXCEPTIONAL_REPRINT, lo referencia.",
+          "action": "—"
+        },
+        {
+          "id": "A09",
+          "label": "reconciliación negativa",
+          "from": [
+            "UNKNOWN"
+          ],
+          "to": "NOT_PRINTED",
+          "mode": "manual",
+          "tx": "TX-M",
+          "trigger": "Reconciliación negativa.",
+          "guard": "OperatorAction RECONCILE_NEGATIVE del mismo job, registrada después del claim del intento, en OperatorActionId (el trigger lo exige; ver J16).",
+          "action": "—"
+        }
+      ],
+      "forbidden": [
+        {
+          "from": "UNKNOWN",
+          "to": "NOT_SENT",
+          "why": "Si la escritura se invocó, no se puede afirmar que no salieron bytes."
+        },
+        {
+          "from": "TRANSMITTED",
+          "to": "NOT_SENT",
+          "why": "Los bytes ya se entregaron."
+        },
+        {
+          "from": "NOT_SENT",
+          "to": "SENDING",
+          "why": "Cada intento es inmutable; un reintento es un intento nuevo."
+        }
+      ],
+      "resultOutcome": {}
+    },
+    "SequenceGap": {
+      "table": "dbo.SequenceGap",
+      "column": "Status",
+      "initial": "OPEN",
+      "states": {
+        "OPEN": {
+          "terminal": false,
+          "meaning": "Rango de CycleId sin detección; dentro de GapGraceMs pueden llegar retransmisiones o registros de la FIFO."
+        },
+        "RECOVERED": {
+          "terminal": true,
+          "meaning": "Todos los ciclos del rango llegaron como detecciones (normalmente RECOVERED y EXPIRED por LATE_ARRIVAL)."
+        },
+        "CLOSED_UNRECOVERED": {
+          "terminal": true,
+          "meaning": "Venció la gracia y quedan ciclos sin datos. Se cuentan, no se inventan detecciones."
+        }
+      },
+      "transitions": [
+        {
+          "id": "G01",
+          "label": "salto de secuencia",
+          "from": [
+            "(create)"
+          ],
+          "to": "OPEN",
+          "mode": "auto",
+          "tx": "TX-A",
+          "trigger": "Se registra una detección con CycleId mayor que la marca alta + 1.",
+          "guard": "Misma época.",
+          "action": "Alerta de hueco abierto."
+        },
+        {
+          "id": "G02",
+          "label": "rango completo",
+          "from": [
+            "OPEN"
+          ],
+          "to": "RECOVERED",
+          "mode": "auto",
+          "tx": "TX-A",
+          "trigger": "La última detección faltante del rango se registra.",
+          "guard": "Ningún ciclo del rango sin detección.",
+          "action": "—"
+        },
+        {
+          "id": "G03",
+          "label": "vence la gracia",
+          "from": [
+            "OPEN"
+          ],
+          "to": "CLOSED_UNRECOVERED",
+          "mode": "auto",
+          "tx": "TX-S",
+          "trigger": "Vence GraceUntil.",
+          "guard": "Quedan ciclos sin detección.",
+          "action": "UnrecoveredCount; métrica cycles_unobserved_total; alerta."
+        }
+      ],
+      "forbidden": [
+        {
+          "from": "CLOSED_UNRECOVERED",
+          "to": "RECOVERED",
+          "why": "Un registro que llegue después se procesa como detección tardía; el hueco cerrado conserva su conteo como hecho auditado."
+        }
+      ],
+      "resultOutcome": {}
+    },
+    "ReprintAuthorization": {
+      "table": "dbo.ReprintAuthorization",
+      "column": "Status",
+      "initial": "APPROVED",
+      "states": {
+        "APPROVED": {
+          "terminal": false,
+          "meaning": "Aprobada por una persona distinta de quien la solicitó; vigente hasta ExpiresAt."
+        },
+        "EXECUTED": {
+          "terminal": true,
+          "meaning": "Se creó el intento EXCEPTIONAL_REPRINT ligado. El resultado físico vive en ese intento."
+        },
+        "REVOKED": {
+          "terminal": true,
+          "meaning": "Anulada antes de ejecutarse."
+        },
+        "EXPIRED": {
+          "terminal": true,
+          "meaning": "Venció sin ejecutarse."
+        }
+      },
+      "transitions": [
+        {
+          "id": "R01",
+          "label": "aprobación por 2 personas",
+          "from": [
+            "(create)"
+          ],
+          "to": "APPROVED",
+          "mode": "manual",
+          "tx": "TX-M",
+          "trigger": "Solicitud aprobada.",
+          "guard": "ApprovedBy distinto de RequestedBy; caja retenida; PriorJobStatus igual al estado real del job (trigger); riesgo coherente con el estado previo (CHECK) y NONE_PROVEN solo si ningún intento del job con MayHaveSent = 1 quedó fuera de NOT_PRINTED (trigger); una sola autorización APPROVED por job; impresora destino = ManualPrinterId de la revisión activa (trigger; la impresora de línea no se admite mientras OT-16 esté abierta, ADR 0012).",
+          "action": "—"
+        },
+        {
+          "id": "R02",
+          "label": "ejecución",
+          "from": [
+            "APPROVED"
+          ],
+          "to": "EXECUTED",
+          "mode": "exception",
+          "tx": "TX-X",
+          "trigger": "Se ejecuta la reimpresión.",
+          "guard": "SESSION_CONTEXT EXCEPTION; antes de ExpiresAt; job todavía en PriorJobStatus; lo ejecuta el sender de TargetPrinterId con su lease vigente; el UPDATE afecta exactamente 1 fila o TX-X se revierte.",
+          "action": "INSERT PrintAttempt EXCEPTIONAL_REPRINT (A01)."
+        },
+        {
+          "id": "R03",
+          "label": "revocación",
+          "from": [
+            "APPROVED"
+          ],
+          "to": "REVOKED",
+          "mode": "manual",
+          "tx": "TX-M",
+          "trigger": "Revocación.",
+          "guard": "Persona autorizada.",
+          "action": "—"
+        },
+        {
+          "id": "R04",
+          "label": "vencimiento",
+          "from": [
+            "APPROVED"
+          ],
+          "to": "EXPIRED",
+          "mode": "auto",
+          "tx": "TX-S",
+          "trigger": "Vence ExpiresAt.",
+          "guard": "No ejecutada.",
+          "action": "—"
+        }
+      ],
+      "forbidden": [
+        {
+          "from": "EXECUTED",
+          "to": "APPROVED",
+          "why": "Cada reimpresión necesita su propia autorización."
+        }
+      ],
+      "resultOutcome": {}
+    }
+  },
+  "contractOutcomes": {
+    "$comment": "Valores de PrintJobResult.outcome y su origen. TRANSMITTED solo se publica cuando es terminal (MinConfirmationLevel = NONE).",
+    "CONFIRMED": {
+      "machine": "PrintJob",
+      "state": "CONFIRMED",
+      "final": true,
+      "jobRequired": true
+    },
+    "TRANSMITTED": {
+      "machine": "PrintJob",
+      "state": "TRANSMITTED",
+      "final": true,
+      "jobRequired": true
+    },
+    "UNKNOWN": {
+      "machine": "PrintJob",
+      "state": "UNKNOWN",
+      "final": false,
+      "jobRequired": true
+    },
+    "FAILED": {
+      "machine": "PrintJob",
+      "state": "FAILED",
+      "final": true,
+      "jobRequired": true
+    },
+    "CANCELLED": {
+      "machine": "PrintJob",
+      "state": "CANCELLED",
+      "final": true,
+      "jobRequired": true
+    },
+    "CLOSED_UNRESOLVED": {
+      "machine": "PrintJob",
+      "state": "CLOSED_UNRESOLVED",
+      "final": true,
+      "jobRequired": true
+    },
+    "EXPIRED": {
+      "machine": [
+        "PrintJob",
+        "CartonDetection"
+      ],
+      "state": "EXPIRED",
+      "final": true,
+      "jobRequired": "segun reason: DEADLINE_PASSED con job; LATE_ARRIVAL y ERP_UNAVAILABLE sin job"
+    },
+    "BLOCKED": {
+      "machine": "CartonDetection",
+      "state": "BLOCKED",
+      "final": true,
+      "jobRequired": false
+    }
+  },
+  "fingerprint": {
+    "algorithm": "SHA-256, hexadecimal en minúsculas",
+    "canonicalForm": "Serialización JCS (RFC 8785) del arreglo [siteId, stationId, plcEpoch, cycleId, detectionTimestamp, workOrderId, cartonId], codificada en UTF-8. Para este arreglo (solo cadenas, enteros y null) JCS escapa únicamente comillas, barra invertida y caracteres de control, y coincide con json.dumps(..., separators=(',', ':'), ensure_ascii=False) de Python. El codificador por defecto de System.Text.Json escapa además caracteres como +, &, <, > y ', así que no sirve tal cual: el EdgeHost necesita una implementación JCS.",
+    "types": "siteId, stationId, workOrderId y cartonId como cadenas; plcEpoch como número entero; cycleId como cadena decimal sin ceros a la izquierda; detectionTimestamp como cadena UTC truncada a milisegundos con formato YYYY-MM-DDTHH:MM:SS.fffZ. Un valor ausente es null, nunca cadena vacía.",
+    "excluded": "ReceivedAt, SourceTimestamp y ServerTimestamp de OPC, bits de información del StatusCode, número de secuencia de notificación, transporte y bandera de overflow: pueden cambiar en una retransmisión legítima.",
+    "reference": "tools/verify_package.py, función source_fingerprint, es la implementación de referencia; la del EdgeHost debe producir los mismos bytes (T25)."
+  },
+  "finalSemantics": "final = true significa que no se espera ninguna transición ordinaria. Una versión posterior solo puede aparecer por corrección (J18) o por procedimiento excepcional (X01, X02, X03); el consumidor aplica siempre la resultVersion mayor."
+}

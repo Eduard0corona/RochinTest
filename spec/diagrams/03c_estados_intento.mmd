@@ -1,0 +1,23 @@
+%% GENERADO por tools/generate_artifacts.py desde contracts/state-machine.json. No editar.
+%% Máquina PrintAttempt; modos incluidos: auto, manual, exception, correction.
+stateDiagram-v2
+    direction LR
+    state "SENDING" as SENDING
+    state "NOT_SENT" as NOT_SENT
+    state "TRANSMITTED" as TRANSMITTED
+    state "UNKNOWN" as UNKNOWN
+    state "CONFIRMED" as CONFIRMED
+    state "NOT_PRINTED" as NOT_PRINTED
+    [*] --> SENDING: A01 claim o reimpresión
+    SENDING --> NOT_SENT: A02 sin escritura
+    SENDING --> TRANSMITTED: A03 escritura completa
+    SENDING --> UNKNOWN: A04 error tras escribir o reinicio
+    TRANSMITTED --> CONFIRMED: A05 evidencia
+    TRANSMITTED --> UNKNOWN: A06 sin evidencia
+    TRANSMITTED --> NOT_PRINTED: A07 dispositivo: no impreso
+    UNKNOWN --> CONFIRMED: A08 reconciliación positiva
+    UNKNOWN --> NOT_PRINTED: A09 [manual] reconciliación negativa
+    classDef terminal fill:#eef1f4,stroke:#5d636b,color:#1a1c1f
+    classDef warning fill:#fff4dc,stroke:#d98a00,color:#1a1c1f,stroke-width:2px
+    class NOT_SENT,CONFIRMED,NOT_PRINTED terminal
+    class UNKNOWN warning

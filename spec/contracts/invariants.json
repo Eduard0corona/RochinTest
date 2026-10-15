@@ -1,0 +1,292 @@
+{
+  "$comment": "Invariantes v1.1. Cada uno se vincula con un mecanismo y con pruebas de tests/test-catalog.json. Las tablas de AI_CONTEXT.md y docs/GUARDRAILS.md se generan desde aquí.",
+  "invariants": [
+    {
+      "id": "I01",
+      "rule": "Nunca crear dos PrintJobs ordinarios para la misma detección y tipo de etiqueta.",
+      "mechanism": "UQ_PrintJob_DetectionLabel; la reimpresión excepcional es un intento del mismo job, no un job nuevo.",
+      "enforcedBy": "SQL",
+      "tests": [
+        "T01",
+        "T02",
+        "T34"
+      ]
+    },
+    {
+      "id": "I02",
+      "rule": "Nunca considerar un timeout como prueba de que la impresión falló.",
+      "mechanism": "NOT_SENT solo si el sender nunca invocó la escritura; cualquier error posterior lleva a UNKNOWN. Es regla de código: SQL no puede comprobarlo porque WriteStartedAt se persiste después de escribir; CK_PrintAttempt_NotSent solo exige coherencia (MayHaveSent = 0, sin marcas de escritura).",
+      "enforcedBy": "código",
+      "tests": [
+        "T05",
+        "T06",
+        "T07"
+      ]
+    },
+    {
+      "id": "I03",
+      "rule": "Nunca reintentar automáticamente un envío potencialmente realizado.",
+      "mechanism": "Transiciones prohibidas aplicadas por TR_PrintJob_StateMachine; claim solo desde READY; TR_PrintAttempt_Guard (un intento ORDINARY exige el job en SENDING); UX_PrintAttempt_OrdinarySent (un solo intento ORDINARY con MayHaveSent = 1 por job); UX_PrintAttempt_JobOpen; estados sin etiqueta rechazados si algún intento pudo imprimir.",
+      "enforcedBy": "SQL",
+      "tests": [
+        "T06",
+        "T07",
+        "T34",
+        "T39",
+        "T47"
+      ]
+    },
+    {
+      "id": "I04",
+      "rule": "Nunca enviar un trabajo vencido como operación ordinaria.",
+      "mechanism": "Guarda de plazo en el claim (J02) con DeviceLeadTimeMs incluido en el plazo, segunda comprobación con reloj monotónico antes de escribir, detección de saltos del reloj de pared (CLOCK_JUMP), barrido de vencimientos y estados EXPIRED.",
+      "enforcedBy": "SQL + código",
+      "tests": [
+        "T11",
+        "T17",
+        "T18",
+        "T19",
+        "T20",
+        "T21",
+        "T29",
+        "T37",
+        "T42"
+      ]
+    },
+    {
+      "id": "I05",
+      "rule": "Nunca considerar un ACK TCP ni una escritura completa como prueba física de aplicación.",
+      "mechanism": "Estado TRANSMITTED distinto de CONFIRMED; tipos de evidencia sin acuses de transporte; regla de nivel y correlación.",
+      "enforcedBy": "SQL + schema + código",
+      "tests": [
+        "T06",
+        "T15",
+        "T31",
+        "T38"
+      ]
+    },
+    {
+      "id": "I06",
+      "rule": "Nunca confirmar una lectura de serial incorrecto.",
+      "mechanism": "TR_PrintAttempt_Guard exige, al confirmar, una EvidenceObservation del job o de su ciclo recibida después del claim, que confirme un solo intento, con nivel ≥ mínimo y ReadSerial = LabelSerial si es VERIFIED (columnas con intercalación binaria); un intento excepcional solo con una observación que lo referencia. Una lectura distinta lleva a UNKNOWN con SERIAL_MISMATCH (J11) o corrige el job (J18). El schema no puede compararlo.",
+      "enforcedBy": "SQL + código",
+      "tests": [
+        "T15",
+        "T22",
+        "T23",
+        "T44"
+      ]
+    },
+    {
+      "id": "I07",
+      "rule": "Nunca inventar una identidad de caja física.",
+      "mechanism": "CartonId solo si lo entrega el PLC o un lector; los huecos son SequenceGap, no detecciones.",
+      "enforcedBy": "SQL + código",
+      "tests": [
+        "T16",
+        "T32",
+        "T35"
+      ]
+    },
+    {
+      "id": "I08",
+      "rule": "Nunca interpretar un contador menor como reinicio sin evaluar retransmisiones.",
+      "mechanism": "Clasificación por huella de origen y DetectionTimestamp (ADR 0007); PlcEpochHistory.",
+      "enforcedBy": "código",
+      "tests": [
+        "T24",
+        "T25",
+        "T26",
+        "T30",
+        "T45"
+      ]
+    },
+    {
+      "id": "I09",
+      "rule": "Nunca modificar silenciosamente el payload de un PrintJob.",
+      "mechanism": "TR_PrintJob_Immutable sobre payload, hash, serial, plazo y revisión; la reimpresión registra su propio AttemptPayloadHash.",
+      "enforcedBy": "SQL",
+      "tests": [
+        "T10",
+        "T33"
+      ]
+    },
+    {
+      "id": "I10",
+      "rule": "Nunca utilizar un snapshot ERP no validado.",
+      "mechanism": "Guardas D02 y D06; FK a ErpWorkOrderCache (WorkOrderId, Revision); revisión congelada en el job.",
+      "enforcedBy": "SQL + código",
+      "tests": [
+        "T03",
+        "T04",
+        "T10",
+        "T13",
+        "T17",
+        "T46"
+      ]
+    },
+    {
+      "id": "I11",
+      "rule": "Nunca permitir que dos propietarios no controlados transmitan al mismo dispositivo.",
+      "mechanism": "Un sender por impresora en el proceso, lock de sistema operativo por impresora, PrinterLease para detectar una segunda instancia; alta disponibilidad solo con aislamiento físico del canal (ADR 0010).",
+      "enforcedBy": "código + infraestructura",
+      "tests": [
+        "T27",
+        "T36"
+      ]
+    },
+    {
+      "id": "I12",
+      "rule": "Nunca presentar como garantía de hardware una condición que solo valida SQL.",
+      "mechanism": "Matriz de garantías con clase y dependencia de hardware; el verificador exige ambas en cada fila física.",
+      "enforcedBy": "revisión + verificador",
+      "tests": [
+        "T28",
+        "T36"
+      ]
+    },
+    {
+      "id": "I13",
+      "rule": "Nunca marcar una prueba como superada sin ejecutarla.",
+      "mechanism": "Campo status en el catálogo de pruebas; el verificador rechaza EJECUTADA_EN_REVISION fuera de las pruebas que él mismo ejecuta; evidencia de comandos y salidas en docs/REVISION_LOG_v1.1.md.",
+      "enforcedBy": "revisión + verificador",
+      "tests": [
+        "T23",
+        "T28"
+      ]
+    },
+    {
+      "id": "I14",
+      "rule": "Nunca introducir complejidad arquitectónica sin un requisito explícito que la justifique.",
+      "mechanism": "Perfil mínimo por defecto; cada componente del perfil extendido ligado a un requisito OT (ADR 0009).",
+      "enforcedBy": "revisión",
+      "tests": [
+        "T12",
+        "T28"
+      ]
+    },
+    {
+      "id": "I15",
+      "rule": "Nunca resolver una colisión de identidad reutilizando la detección existente.",
+      "mechanism": "Huella de origen distinta → SequenceAnomaly IDENTITY_COLLISION y bloqueo de la estación; solo se compara una violación de UQ_CartonDetection_Identity o UQ_CartonDetection_IdempotencyKey.",
+      "enforcedBy": "código + SQL",
+      "tests": [
+        "T24"
+      ]
+    },
+    {
+      "id": "I16",
+      "rule": "Nunca registrar un hueco de secuencia como detección.",
+      "mechanism": "SequenceGap con conteo; sin CartonDetected ni PrintJobResult para ciclos no observados.",
+      "enforcedBy": "código + SQL",
+      "tests": [
+        "T11",
+        "T19",
+        "T35"
+      ]
+    },
+    {
+      "id": "I17",
+      "rule": "Toda decisión crítica referencia la revisión de configuración que la produjo.",
+      "mechanism": "ConfigRevisionId en detección, job y anomalías; revisiones inmutables (TR_StationConfigRevision_Immutable).",
+      "enforcedBy": "SQL",
+      "tests": [
+        "T33"
+      ]
+    },
+    {
+      "id": "I18",
+      "rule": "Toda reimpresión excepcional declara su riesgo de duplicado y queda ligada al job original.",
+      "mechanism": "ReprintAuthorization con DuplicateRisk y regla de dos personas; FK compuesta (AuthorizationId, PrintJobId); TR_PrintAttempt_Guard exige autorización EXECUTED, job en PriorJobStatus e impresora permitida; TR_ReprintAuthorization_Guard limita NONE_PROVEN; X03 publica la reimpresión sin confirmar; UX_PrintAttempt_Authorization.",
+      "enforcedBy": "SQL",
+      "tests": [
+        "T34",
+        "T40",
+        "T41",
+        "T43"
+      ]
+    },
+    {
+      "id": "I19",
+      "rule": "SENDING se persiste antes de cualquier operación que pueda imprimir.",
+      "mechanism": "TX-B confirma el claim y el intento antes de abrir el socket.",
+      "enforcedBy": "código",
+      "tests": [
+        "T07"
+      ]
+    },
+    {
+      "id": "I20",
+      "rule": "Nunca mantener una transacción SQL abierta durante I/O con la impresora.",
+      "mechanism": "TX-B y TX-C son transacciones separadas alrededor de la escritura.",
+      "enforcedBy": "código",
+      "tests": [
+        "T07"
+      ]
+    },
+    {
+      "id": "I21",
+      "rule": "Perfil extendido: nunca enviar ACK al PLC antes del commit durable del ciclo.",
+      "mechanism": "Journal SQLite con synchronous=FULL; AckCycleId se escribe después del commit.",
+      "enforcedBy": "código",
+      "tests": [
+        "T09"
+      ]
+    },
+    {
+      "id": "I22",
+      "rule": "Publisher confirms y ACK manual no equivalen a exactly-once.",
+      "mechanism": "Outbox en la misma transacción, EventId determinista e InboxMessage en cada consumidor.",
+      "enforcedBy": "SQL + código",
+      "tests": [
+        "T08",
+        "T14"
+      ]
+    },
+    {
+      "id": "I23",
+      "rule": "Nunca enviar a una impresora un ciclo anterior a otro que ella ya reclamó.",
+      "mechanism": "PrinterSendOrder leído con UPDLOCK en el claim (J02) y avanzado en la misma transacción con los valores de la fila reclamada; TR_PrinterSendOrder_Monotonic impide retrocederlo y TR_PlcEpochHistory_Immutable impide reordenar épocas; los jobs anteriores vencen con OUT_OF_ORDER (J03, J14); las reimpresiones solo van a la ManualPrinterId.",
+      "enforcedBy": "SQL",
+      "tests": [
+        "T30",
+        "T42"
+      ]
+    },
+    {
+      "id": "I24",
+      "rule": "Toda transición manual y todo desbloqueo de estación o confirmación de época quedan respaldados por una OperatorAction registrada.",
+      "mechanism": "OperatorAction solo de inserción; TR_PrintJob_StateMachine exige una acción nueva (identificador mayor) y coherente en LastOperatorActionId; TR_PrintAttempt_StateMachine, una RECONCILE_NEGATIVE posterior al claim; TR_StationConfig_Guard y TR_PlcEpochHistory_Guard, UNBLOCK_STATION y CONFIRM_EPOCH; CK_OperatorAction_Target exige las tres pruebas de la reconciliación negativa.",
+      "enforcedBy": "SQL",
+      "tests": [
+        "T25",
+        "T39",
+        "T40",
+        "T47"
+      ]
+    },
+    {
+      "id": "I25",
+      "rule": "Un resultado final solo se reemplaza por corrección o procedimiento excepcional, siempre con resultVersion mayor.",
+      "mechanism": "Las únicas salidas de estados terminales son J18 (corrección) y X01 a X03 (excepción), comprobado por el verificador; TR_PrintJob_StateMachine evalúa todo cambio de estado, Reason, marca de reimpresión o punteros de respaldo y exige el respaldo de cada modo con el intento excepcional más reciente; ResultVersion no retrocede (TR_PrintJob_Immutable); eventId depende de resultVersion.",
+      "enforcedBy": "SQL + verificador",
+      "tests": [
+        "T43",
+        "T44",
+        "T14",
+        "T47"
+      ]
+    },
+    {
+      "id": "I26",
+      "rule": "Nunca calcular un plazo para un registro cuya latencia no está acotada.",
+      "mechanism": "Con GATEWAY_RECEIPT solo una notificación SUBSCRIPTION sin overflow, que no sea la primera de un monitored item creado o transferido (esa se registra como READ) y que no abra un hueco, tiene plazo; con PLC_TIMESTAMP, solo un registro con DetectionTimestamp. Lo demás se registra con DeadlineAt = ReceivedAt y queda EXPIRED con LATE_ARRIVAL o BLOCKED con INCOHERENT_SNAPSHOT (CK_CartonDetection_GatewayLive, CK_CartonDetection_PlcTimestamp y reglas de negocio del verificador).",
+      "enforcedBy": "SQL + código",
+      "tests": [
+        "T13",
+        "T23",
+        "T45"
+      ]
+    }
+  ]
+}

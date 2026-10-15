@@ -1,0 +1,18 @@
+{
+  "$comment": "Generado por tools/render_diagrams.py: SHA-256 de cada .mmd con el que se renderizaron su SVG y su PNG.",
+  "sources": {
+    "01_arquitectura.mmd": "30fbd0609ffe80a2c8f79c255cae2c8b1236e5fbe863c9d7b78f22da4fbe2f95",
+    "02_flujo_eventos.mmd": "2c29bbb06013af99a40a35d5276e10143ef444420c2704accab3674378beb9eb",
+    "03a_estados_printjob.mmd": "9a37aa27d05a44c826930b3ac6059e4928883a84542a184c8b31932206f3685a",
+    "03b_estados_printjob_excepciones.mmd": "0638fc0259f6f0b0a11fafc195ea5a6adf974b1bd632195a14f3122d01976d31",
+    "03c_estados_intento.mmd": "d5f07d476bfbaab6b4b6892b03462c995ec5789e8685b9ebbb396ebbc8e9de3c",
+    "03d_estados_deteccion.mmd": "9d868e1a2380539d2281da8e12757592e6aae2e659cd2d07e2045e86537f60cb",
+    "03e_estados_hueco.mmd": "7d5961194cf89377d56f0c0552944cee2936b664686c18df323b20e9c5ac1787",
+    "03f_estados_autorizacion.mmd": "2174053329cd82a86dee1bca559807fc27d3a3c7b51edec20c25fd462012463e",
+    "04_incertidumbre.mmd": "fddbbe53d5668949e65b66539b78eac13f4044f1c0452ba8110ae03f7e8f324a",
+    "05_recuperacion.mmd": "93a1dca485a7624ba513b1e1949551a09721492f1d78677dea02234e9fc30fb9",
+    "06_modelo_datos.mmd": "87bb61c37bca6ed54647e02bffcce7abafc709f46144f6707f579c9ed5cd541d",
+    "07_secuencia.mmd": "938024a0a7d415af9b47b6818d71fcc7a48bd7529ca82737962750ac9f3e5fd7",
+    "08_clasificacion_secuencia.mmd": "8cce5e6fd3937831b8fad0a0698b0cd5814c752e072d977646abdd08cefeb289"
+  }
+}

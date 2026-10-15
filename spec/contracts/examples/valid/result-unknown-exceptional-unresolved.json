@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "eventType": "PrintJobResult",
+  "eventId": "2edf0018-228e-5781-b6c5-269a086e5bde",
+  "correlationId": "a23def11-9397-5038-8cb1-5e1c342c66ac",
+  "occurredAt": "2026-10-12T19:02:41.300Z",
+  "siteId": "PLANT-01",
+  "stationId": "LINE-01",
+  "plcEpoch": 42,
+  "cycleId": "918277",
+  "idempotencyKey": "PLANT-01:LINE-01:42:918277",
+  "labelType": "CARTON_GS1",
+  "resultVersion": 2,
+  "outcome": "UNKNOWN",
+  "final": false,
+  "configRevision": 7,
+  "reason": "EXCEPTIONAL_REPRINT_UNRESOLVED",
+  "printJobId": "0d7f3c2e-91b4-4a5d-b8e6-2f1a7c9d4e05",
+  "labelSerial": "P01L01-000000531205",
+  "workOrderId": "WO-2026-4815",
+  "productId": "SKU-10245",
+  "lotId": "LOT-20261012-A",
+  "printerId": "PRN-LINE-01",
+  "attemptId": "ab17ad7b-afc5-4e3d-a38a-bd0dbb286d2f",
+  "exceptionalReprint": {
+    "authorizationId": 16,
+    "duplicateRisk": "NONE_PROVEN",
+    "reason": "EXPIRED_CARTON_HELD",
+    "approvedBy": "supervisor.ramos"
+  }
+}

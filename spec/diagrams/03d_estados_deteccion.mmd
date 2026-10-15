@@ -1,0 +1,20 @@
+%% GENERADO por tools/generate_artifacts.py desde contracts/state-machine.json. No editar.
+%% Máquina CartonDetection; modos incluidos: auto, manual, exception, correction.
+stateDiagram-v2
+    direction LR
+    state "RECEIVED" as RECEIVED
+    state "WAITING_ERP" as WAITING_ERP
+    state "JOB_CREATED" as JOB_CREATED
+    state "BLOCKED" as BLOCKED
+    state "EXPIRED" as EXPIRED
+    [*] --> RECEIVED: D01 registro único
+    RECEIVED --> JOB_CREATED: D02 snapshot válido
+    RECEIVED --> WAITING_ERP: D03 sin snapshot
+    RECEIVED --> EXPIRED: D04 llega vencida
+    RECEIVED --> BLOCKED: D05 impedimento
+    WAITING_ERP --> JOB_CREATED: D06 snapshot a tiempo
+    WAITING_ERP --> EXPIRED: D07 plazo vencido
+    WAITING_ERP --> BLOCKED: D08 bloqueo durante la espera
+    classDef terminal fill:#eef1f4,stroke:#5d636b,color:#1a1c1f
+    classDef warning fill:#fff4dc,stroke:#d98a00,color:#1a1c1f,stroke-width:2px
+    class JOB_CREATED,BLOCKED,EXPIRED terminal

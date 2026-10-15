@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "eventType": "PrintJobResult",
+  "eventId": "29f2de29-33f8-538c-a2d5-b54b0a9f151b",
+  "correlationId": "4bc9846d-741e-5210-895c-317f2637eaa6",
+  "occurredAt": "2026-10-12T18:22:45.000Z",
+  "siteId": "PLANT-01",
+  "stationId": "LINE-01",
+  "plcEpoch": 42,
+  "cycleId": "918282",
+  "idempotencyKey": "PLANT-01:LINE-01:42:918282",
+  "labelType": "CARTON_GS1",
+  "resultVersion": 2,
+  "outcome": "FAILED",
+  "final": true,
+  "configRevision": 7,
+  "reason": "RECONCILED_NOT_PRINTED",
+  "printJobId": "0d7f3c2e-91b4-4a5d-b8e6-2f1a7c9d4e0a",
+  "labelSerial": "P01L01-000000531210",
+  "workOrderId": "WO-2026-4815",
+  "productId": "SKU-10245",
+  "lotId": "LOT-20261012-A",
+  "printerId": "PRN-LINE-01",
+  "attemptId": "ab17ad7b-afc5-4e3d-a38a-bd0dbb286d0a",
+  "operatorAction": {
+    "operatorActionId": 91,
+    "type": "RECONCILE_NEGATIVE",
+    "performedBy": "operador.lopez",
+    "performedAt": "2026-10-12T18:22:44.120Z"
+  }
+}

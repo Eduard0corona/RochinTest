@@ -1,0 +1,192 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/schemas/carton-detected.v1.schema.json",
+  "title": "CartonDetected v1 (revisión 1.1 del paquete)",
+  "description": "Un ciclo del PLC registrado como detección. Se publica una vez por detección (OBSERVED o RECOVERED). Las colisiones de identidad y los huecos de secuencia no generan este evento. Reglas que el schema no puede expresar (eventId = UUIDv5, sourceFingerprint = SHA-256 del arreglo canónico de contracts/state-machine.json, occurredAt = detectionTimestamp si existe, deadlineAt = receivedAt cuando no hay plazo confiable) se validan en tools/verify_package.py y en el código.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "eventType",
+    "eventId",
+    "correlationId",
+    "occurredAt",
+    "siteId",
+    "stationId",
+    "plcEpoch",
+    "cycleId",
+    "idempotencyKey",
+    "detectionOrigin",
+    "transport",
+    "receivedAt",
+    "deadlineReference",
+    "queueOverflow",
+    "deadlineAt",
+    "configRevision",
+    "sourceFingerprint",
+    "opc"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "eventType": {
+      "const": "CartonDetected"
+    },
+    "eventId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "UUIDv5(namespace, 'CartonDetected|' + idempotencyKey). Es también DetectionId."
+    },
+    "correlationId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Igual a eventId."
+    },
+    "occurredAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "detectionTimestamp si existe; si no, receivedAt."
+    },
+    "siteId": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^:|]+$"
+    },
+    "stationId": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[^:|]+$"
+    },
+    "plcEpoch": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "cycleId": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "maxLength": 20,
+      "description": "UInt64 como texto decimal para no perder precisión en JavaScript."
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "pattern": "^[^:|]+:[^:|]+:(0|[1-9][0-9]*):(0|[1-9][0-9]*)$",
+      "description": "siteId:stationId:plcEpoch:cycleId."
+    },
+    "detectionOrigin": {
+      "enum": [
+        "OBSERVED",
+        "RECOVERED"
+      ]
+    },
+    "transport": {
+      "enum": [
+        "SUBSCRIPTION",
+        "REPUBLISH",
+        "PLC_FIFO",
+        "JOURNAL_REPLAY",
+        "READ",
+        "ANOMALY_REINGEST"
+      ],
+      "description": "SUBSCRIPTION es la única entrega en vivo, salvo la primera notificación de un monitored item creado o transferido, que es el valor actual y se registra como READ. REPUBLISH (reenvío tras una interrupción), PLC_FIFO, JOURNAL_REPLAY, READ (lectura tras reconexión o valor inicial) y ANOMALY_REINGEST (registro retenido que OT liberó) son recuperaciones."
+    },
+    "queueOverflow": {
+      "type": "boolean",
+      "description": "Bit Overflow del StatusCode de OPC UA: la cola del monitored item descartó valores y esta notificación pudo llegar tarde."
+    },
+    "detectionTimestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Valor latched por el PLC. No es el SourceTimestamp de OPC. Con PLC_TIMESTAMP su ausencia es un registro incoherente: se publica con deadlineAt = receivedAt y termina BLOCKED con INCOHERENT_SNAPSHOT."
+    },
+    "receivedAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Recepción original en el EdgeHost. Un replay conserva este valor."
+    },
+    "deadlineReference": {
+      "enum": [
+        "PLC_TIMESTAMP",
+        "GATEWAY_RECEIPT"
+      ],
+      "description": "Referencia de plazo de la revisión capturada."
+    },
+    "deadlineAt": {
+      "type": "string",
+      "format": "date-time",
+      "description": "Plazo congelado con la revisión configRevision. PLC_TIMESTAMP: detectionTimestamp + TransitBudgetMs − DeviceLeadTimeMs − ClockSkewToleranceMs. GATEWAY_RECEIPT en vivo, sin overflow y sin hueco: receivedAt − MaxUpstreamLatencyMs + TransitBudgetMs − DeviceLeadTimeMs. Sin plazo confiable (GATEWAY_RECEIPT recuperado, con overflow o abriendo un hueco; PLC_TIMESTAMP sin detectionTimestamp): igual a receivedAt, y el resultado es EXPIRED con LATE_ARRIVAL o BLOCKED con INCOHERENT_SNAPSHOT."
+    },
+    "configRevision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "ConfigRevisionId (identificador global de StationConfigRevision), no RevisionNumber."
+    },
+    "workOrderId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "cartonId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sourceFingerprint": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 hexadecimal del arreglo JSON canónico [siteId, stationId, plcEpoch, cycleId, detectionTimestamp, workOrderId, cartonId] (contracts/state-machine.json, fingerprint)."
+    },
+    "opc": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nodeId",
+        "statusCode"
+      ],
+      "properties": {
+        "nodeId": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Nodo del registro de ciclo latched, no el booleano de presencia."
+        },
+        "statusCode": {
+          "const": "Good"
+        },
+        "sourceTimestamp": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Informativo; no participa en identidad ni en la huella."
+        },
+        "serverTimestamp": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "transport": {
+            "const": "SUBSCRIPTION"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "detectionOrigin": {
+            "const": "OBSERVED"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "detectionOrigin": {
+            "const": "RECOVERED"
+          }
+        }
+      }
+    }
+  ]
+}

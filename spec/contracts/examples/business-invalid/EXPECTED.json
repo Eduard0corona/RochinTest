@@ -1,0 +1,25 @@
+{
+  "$comment": "Cumplen el schema y deben fallar exactamente una regla de negocio de tools/verify_package.py: error es el mensaje exacto que el verificador exige.",
+  "cases": {
+    "confirmed-serial-mismatch.json": {
+      "why": "CONFIRMED con readSerial distinto de labelSerial (I06)",
+      "error": "CONFIRMED con readSerial distinto de labelSerial (I06)"
+    },
+    "result-eventid-not-deterministic.json": {
+      "why": "eventId no es UUIDv5 de su nombre",
+      "error": "eventId no es UUIDv5 de su nombre de resultado"
+    },
+    "carton-detected-fingerprint-mismatch.json": {
+      "why": "sourceFingerprint no corresponde al arreglo canónico",
+      "error": "sourceFingerprint no corresponde al arreglo canónico de valores latched"
+    },
+    "carton-detected-gateway-fabricated-deadline.json": {
+      "why": "GATEWAY_RECEIPT recuperado con plazo: el plazo sería fabricado (debe ser receivedAt)",
+      "error": "GATEWAY_RECEIPT sin entrega en vivo: deadlineAt debe ser receivedAt (plazo fabricado)"
+    },
+    "carton-detected-missing-timestamp-with-deadline.json": {
+      "why": "PLC_TIMESTAMP sin detectionTimestamp con plazo: el plazo sería fabricado (debe ser receivedAt)",
+      "error": "PLC_TIMESTAMP sin detectionTimestamp: deadlineAt debe ser receivedAt (plazo fabricado)"
+    }
+  }
+}

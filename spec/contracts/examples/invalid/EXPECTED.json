@@ -1,0 +1,149 @@
+{
+  "$comment": "Cada archivo debe fallar contra su schema y solo por la regla indicada: why la describe; keyword y path identifican el error de JSON Schema que el verificador exige (y ningún otro).",
+  "cases": {
+    "confirmed-without-evidence.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "CONFIRMED exige evidence",
+      "keyword": "required",
+      "path": ""
+    },
+    "confirmed-unverified-evidence.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "CONFIRMED exige evidence.verified = true",
+      "keyword": "const",
+      "path": "/evidence/verified"
+    },
+    "confirmed-verified-without-readserial.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "VERIFIED exige readSerial",
+      "keyword": "required",
+      "path": "/evidence"
+    },
+    "confirmed-applied-correlated-to-job.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "APPLIED exige correlación CYCLE",
+      "keyword": "const",
+      "path": "/evidence/correlatedTo"
+    },
+    "confirmed-without-correlation.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "evidence exige correlatedTo (JOB o CYCLE; NONE no existe)",
+      "keyword": "required",
+      "path": "/evidence"
+    },
+    "unknown-final-true.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "UNKNOWN exige final = false",
+      "keyword": "const",
+      "path": "/final"
+    },
+    "unknown-without-attempt.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "UNKNOWN exige attemptId",
+      "keyword": "required",
+      "path": ""
+    },
+    "failed-without-reason.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "FAILED exige reason",
+      "keyword": "required",
+      "path": ""
+    },
+    "failed-with-expired-reason.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "reason incompatible con outcome",
+      "keyword": "enum",
+      "path": "/reason"
+    },
+    "blocked-with-printjob.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "BLOCKED no lleva job",
+      "keyword": "not",
+      "path": ""
+    },
+    "expired-late-arrival-with-printjob.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "EXPIRED sin job no lleva printJobId",
+      "keyword": "not",
+      "path": ""
+    },
+    "transmitted-with-evidence.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "TRANSMITTED no lleva evidence",
+      "keyword": "not",
+      "path": ""
+    },
+    "reprint-on-failed.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "exceptionalReprint solo con CONFIRMED (X01, X02) o UNKNOWN (X03)",
+      "keyword": "enum",
+      "path": "/outcome"
+    },
+    "cancelled-without-operator-action.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "CANCELLED exige operatorAction CANCEL_JOB",
+      "keyword": "required",
+      "path": ""
+    },
+    "evidence-on-failed.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "evidence solo con CONFIRMED o UNKNOWN",
+      "keyword": "not",
+      "path": ""
+    },
+    "unknown-exceptional-without-reprint.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "EXCEPTIONAL_REPRINT_UNRESOLVED exige exceptionalReprint",
+      "keyword": "required",
+      "path": ""
+    },
+    "expired-out-of-order-without-job.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "OUT_OF_ORDER es un job vencido: exige printJobId y labelSerial",
+      "keyword": "required",
+      "path": ""
+    },
+    "serial-mismatch-marked-verified.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "SERIAL_MISMATCH publica la lectura con verified = false",
+      "keyword": "const",
+      "path": "/evidence/verified"
+    },
+    "operator-action-on-confirmed.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "operatorAction solo en CANCELLED, CLOSED_UNRESOLVED o FAILED por reconciliación",
+      "keyword": "enum",
+      "path": "/outcome"
+    },
+    "carton-detected-without-epoch.json": {
+      "schema": "carton-detected.v1.schema.json",
+      "why": "plcEpoch requerido",
+      "keyword": "required",
+      "path": ""
+    },
+    "carton-detected-cycleid-number.json": {
+      "schema": "carton-detected.v1.schema.json",
+      "why": "cycleId es texto decimal",
+      "keyword": "type",
+      "path": "/cycleId"
+    },
+    "carton-detected-fifo-as-observed.json": {
+      "schema": "carton-detected.v1.schema.json",
+      "why": "transporte de recuperación exige RECOVERED",
+      "keyword": "const",
+      "path": "/detectionOrigin"
+    },
+    "carton-detected-bad-quality.json": {
+      "schema": "carton-detected.v1.schema.json",
+      "why": "solo registros Good son detecciones",
+      "keyword": "const",
+      "path": "/opc/statusCode"
+    },
+    "unknown-write-interrupted-with-evidence.json": {
+      "schema": "print-job-result.v1.schema.json",
+      "why": "con UNKNOWN, evidence solo acompaña a SERIAL_MISMATCH",
+      "keyword": "not",
+      "path": ""
+    }
+  }
+}

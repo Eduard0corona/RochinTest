@@ -1,0 +1,40 @@
+flowchart LR
+    subgraph LINEA["Línea"]
+        PLC["PLC<br/>registro latched por ciclo<br/>CycleId · PlcEpoch · DetectionTimestamp"]
+        PRN["Impresora o print-and-apply"]
+        MPR["Impresora fuera de línea<br/>reimpresiones (OT-16)"]
+        SCN["Escáner de verificación<br/>(opcional, OT-08)"]
+    end
+    subgraph EDGE["EdgeHost · un proceso por estación"]
+        ING["OPC Ingest<br/>huella y clasificación"]
+        ORC["Carton Orchestrator<br/>TX-A"]
+        SND["Print Agent<br/>un sender por impresora<br/>orden de envío · TX-X"]
+        REC["Recovery Worker<br/>TX-R0 · TX-S"]
+        OUT["Outbox Relay"]
+        ERPS["ERP Snapshot Sync"]
+        OPS["Operations API<br/>TX-M · OperatorAction<br/>autorizaciones"]
+    end
+    SQL[("SQL Server en planta<br/>autoridad transaccional")]
+    MQ[("RabbitMQ")]
+    CON["MES · ERP · tableros<br/>con Inbox"]
+    ERP["ERP"]
+    JRN[("Journal SQLite<br/>solo perfil extendido")]
+    PLC -- "OPC UA, suscripción" --> ING
+    ING -- "Channel en proceso" --> ORC
+    ORC --> SQL
+    ORC -- "Channel por impresora" --> SND
+    SND -- "TX-B · TX-C · TX-D · TX-X" --> SQL
+    SND -- "protocolo del fabricante" --> PRN
+    SND -- "una conexión por impresora" --> MPR
+    SCN -. "evidencia" .-> SND
+    PRN -. "estado por job (OT-07)" .-> SND
+    ING -. "latido LabelingReady" .-> PLC
+    ERP -. "asíncrono" .-> ERPS
+    ERPS --> SQL
+    SQL --> OUT
+    OUT --> MQ
+    MQ --> CON
+    REC --> SQL
+    OPS --> SQL
+    PLC -. "FIFO y AckCycleId (extendido)" .-> JRN
+    JRN -. "replay" .-> ING

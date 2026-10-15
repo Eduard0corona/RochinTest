@@ -1,0 +1,101 @@
+{
+  "$comment": "Decisiones abiertas para OT. docs/DECISIONES_ABIERTAS_OT.md y la sección correspondiente del documento principal se generan desde aquí.",
+  "decisions": [
+    {
+      "id": "OT-01",
+      "question": "¿La impresora es independiente o forma parte de un sistema print-and-apply?",
+      "impact": "Define si existe evidencia APPLIED y si una compuerta física puede garantizar la ventana (G05).",
+      "canProceed": "Todo el flujo lógico con el simulador; el nivel de evidencia queda configurable."
+    },
+    {
+      "id": "OT-02",
+      "question": "¿Las cajas avanzan de forma continua o pueden detenerse?",
+      "impact": "Si pueden detenerse, el plazo puede extenderse con una señal del PLC y la retención es viable.",
+      "canProceed": "Plazo fijo por revisión; la extensión queda como mejora."
+    },
+    {
+      "id": "OT-03",
+      "question": "¿Cuál es el tiempo real entre el sensor y el punto de aplicación, cuánto tarda el dispositivo desde el envío hasta dejar la etiqueta aplicada, y qué reloj es confiable?",
+      "impact": "Fija TransitBudgetMs, DeviceLeadTimeMs, SendMarginMs y DeadlineReference; determina la factibilidad (G11).",
+      "canProceed": "Valores de laboratorio en el simulador; la desigualdad de factibilidad se evalúa al medir."
+    },
+    {
+      "id": "OT-04",
+      "question": "¿Puede el PLC exponer PlcEpoch persistente y un registro latched con DetectionTimestamp?",
+      "impact": "Sin ellos, la detección de reinicios y rebotes es limitada (G01).",
+      "canProceed": "Época administrada por el gateway, con su limitación documentada."
+    },
+    {
+      "id": "OT-05",
+      "question": "¿Existe un identificador físico de caja?",
+      "impact": "Habilita CARTON_ID_REQUIRED y la garantía por caja (G07).",
+      "canProceed": "Modo CYCLE_ONLY."
+    },
+    {
+      "id": "OT-06",
+      "question": "¿Puede haber recirculación de cajas?",
+      "impact": "Si la hay y no existe identidad física, puede haber dos etiquetas por caja.",
+      "canProceed": "Todo; la limitación queda en la matriz de garantías."
+    },
+    {
+      "id": "OT-07",
+      "question": "¿La impresora informa finalización o cancelación por trabajo?",
+      "impact": "Habilita el nivel PRINTED, J12 (que exige cancelación confirmada por job, no solo 'no impreso') y la prueba 1 y 2 de la reconciliación negativa.",
+      "canProceed": "Adaptador de impresora con capacidad declarada; sin ella, J12 no se usa."
+    },
+    {
+      "id": "OT-08",
+      "question": "¿Existe escáner de verificación y está correlacionado con el ciclo?",
+      "impact": "Habilita VERIFIED y la garantía de etiqueta correcta en caja correcta (G06).",
+      "canProceed": "Nivel configurable; el simulador emite lecturas correlacionadas."
+    },
+    {
+      "id": "OT-09",
+      "question": "¿El PLC puede retener, detener o rechazar cajas?",
+      "impact": "Define qué hace la línea ante UNKNOWN, SQL caído o estación bloqueada.",
+      "canProceed": "El sistema baja la señal de etiquetadora lista; la reacción física queda en el PLC."
+    },
+    {
+      "id": "OT-10",
+      "question": "¿Puede existir más de un agente activo?",
+      "impact": "Si sí, se requiere aislamiento físico del canal (G10).",
+      "canProceed": "Un solo EdgeHost por estación."
+    },
+    {
+      "id": "OT-11",
+      "question": "¿Se requiere alta disponibilidad del Print Agent?",
+      "impact": "Exige aislamiento de red, apagado verificado del nodo anterior o proxy que valide tokens.",
+      "canProceed": "Conmutación manual con procedimiento en el runbook."
+    },
+    {
+      "id": "OT-12",
+      "question": "¿Qué ocurre operacionalmente ante una impresión incierta?",
+      "impact": "Define la retención de cajas UNKNOWN y quién autoriza reimpresiones.",
+      "canProceed": "Estados, autorizaciones y auditoría ya modelados."
+    },
+    {
+      "id": "OT-13",
+      "question": "¿Se permite producir con SQL Server fuera de servicio?",
+      "impact": "Si sí, solo con etiquetado manual o perfil extendido; el perfil mínimo falla cerrado.",
+      "canProceed": "Perfil mínimo con falla cerrada."
+    },
+    {
+      "id": "OT-14",
+      "question": "¿Es obligatorio conservar la historia de todos los ciclos durante una interrupción?",
+      "impact": "Si sí, activa el perfil extendido (G09) y requiere cambios en el PLC.",
+      "canProceed": "Perfil mínimo con SequenceGap."
+    },
+    {
+      "id": "OT-15",
+      "question": "¿Qué nivel de evidencia se exige para declarar una etiqueta confirmada?",
+      "impact": "Fija MinConfirmationLevel por estación (NONE, PRINTED, APPLIED, VERIFIED).",
+      "canProceed": "Todo; el nivel es parámetro de revisión."
+    },
+    {
+      "id": "OT-16",
+      "question": "¿Existe una impresora fuera de línea para reimpresiones excepcionales, o la reimpresión debe hacerse en la impresora de línea con la estación detenida?",
+      "impact": "Define ManualPrinterId. Mientras siga abierta, una reimpresión solo se admite en la impresora fuera de línea: en una print-and-apply en marcha caería en la caja que esté bajo el aplicador, y bloquear la estación en software no detiene la línea.",
+      "canProceed": "Reimpresión con ManualPrinterId en el simulador. La variante en la impresora de línea requeriría una condición física confirmada (línea detenida o aplicador deshabilitado por el PLC) y no está habilitada."
+    }
+  ]
+}

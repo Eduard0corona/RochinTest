@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "eventType": "CartonDetected",
+  "eventId": "6bfe93ac-b5eb-5275-b6b8-128b66e4f435",
+  "correlationId": "6bfe93ac-b5eb-5275-b6b8-128b66e4f435",
+  "occurredAt": "2026-10-12T18:06:02.415Z",
+  "siteId": "PLANT-01",
+  "stationId": "LINE-03",
+  "plcEpoch": 7,
+  "cycleId": "55120",
+  "idempotencyKey": "PLANT-01:LINE-03:7:55120",
+  "detectionOrigin": "RECOVERED",
+  "transport": "REPUBLISH",
+  "queueOverflow": false,
+  "receivedAt": "2026-10-12T18:06:02.415Z",
+  "deadlineReference": "GATEWAY_RECEIPT",
+  "deadlineAt": "2026-10-12T18:06:03.475Z",
+  "configRevision": 12,
+  "workOrderId": "WO-2026-4900",
+  "sourceFingerprint": "66ebb2c4f485767bc5d9321ad92c5ad1b46fe37679d9110331d53593a8a1cc10",
+  "opc": {
+    "nodeId": "ns=2;s=LINE-03.CartonCycleRecord",
+    "statusCode": "Good"
+  }
+}

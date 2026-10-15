@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "eventType": "PrintJobResult",
+  "eventId": "b0b5e013-a131-5da1-a0d7-121af0f859ec",
+  "correlationId": "db9775c2-8924-516c-b311-ffc18dd7fd30",
+  "occurredAt": "2026-10-12T18:04:18.010Z",
+  "siteId": "PLANT-01",
+  "stationId": "LINE-01",
+  "plcEpoch": 42,
+  "cycleId": "918278",
+  "idempotencyKey": "PLANT-01:LINE-01:42:918278",
+  "labelType": "CARTON_GS1",
+  "resultVersion": 1,
+  "outcome": "BLOCKED",
+  "final": true,
+  "configRevision": 7,
+  "reason": "SEQUENCE_ANOMALY"
+}

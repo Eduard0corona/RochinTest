@@ -1,0 +1,238 @@
+{
+  "$comment": "Matriz de garantías y limitaciones (H10). docs/MATRIZ_GARANTIAS.md se genera desde aquí. class: SOFTWARE (demostrable con software y pruebas), FISICA (requiere integración física), RENDIMIENTO (objetivo medible, no garantía), SUPUESTO_OT (pendiente de confirmar con planta).",
+  "guarantees": [
+    {
+      "id": "G01",
+      "class": "SOFTWARE",
+      "desired": "Una detección lógica por ciclo del PLC.",
+      "mechanism": "UQ_CartonDetection_Identity (SiteId, StationId, PlcEpoch, CycleId); INSERT primero; huella de origen.",
+      "conditions": "El PLC expone CycleId monotónico y PlcEpoch persistentes, fijados junto con el resto del registro.",
+      "hardware": "PLC con contador y época persistentes (OT-04).",
+      "residualRisk": "Sin PlcEpoch ni DetectionTimestamp, un reinicio puede confundirse con un duplicado hasta que una colisión lo revele.",
+      "tests": [
+        "T01",
+        "T24",
+        "T25",
+        "T30",
+        "T45"
+      ]
+    },
+    {
+      "id": "G02",
+      "class": "SOFTWARE",
+      "desired": "Un PrintJob ordinario por detección y tipo de etiqueta.",
+      "mechanism": "UQ_PrintJob_DetectionLabel; TX-A atómica.",
+      "conditions": "Ninguna adicional.",
+      "hardware": "Ninguna.",
+      "residualRisk": "Ninguno conocido a nivel lógico.",
+      "tests": [
+        "T01",
+        "T02",
+        "T34"
+      ]
+    },
+    {
+      "id": "G03",
+      "class": "SOFTWARE",
+      "desired": "Como máximo una transmisión ordinaria potencial por job.",
+      "mechanism": "Claim condicional, intento persistido antes del I/O, TR_PrintAttempt_Guard (intento ORDINARY solo con el job en SENDING), UX_PrintAttempt_OrdinarySent, UX_PrintAttempt_JobOpen y transiciones prohibidas aplicadas por trigger.",
+      "conditions": "Un solo transmisor por impresora (G10); los triggers habilitados.",
+      "hardware": "La de G10: en un solo host, ninguna adicional; con varios hosts, control del camino de red hacia la impresora (OT-10).",
+      "residualRisk": "Falso UNKNOWN si el proceso muere entre el commit del claim y la escritura (costo aceptado). Sin G10, un segundo proceso que no registra intentos puede transmitir.",
+      "tests": [
+        "T02",
+        "T06",
+        "T07",
+        "T34",
+        "T47"
+      ]
+    },
+    {
+      "id": "G04",
+      "class": "SOFTWARE",
+      "desired": "Ningún envío ordinario iniciado después del plazo calculado, dentro de los límites declarados.",
+      "mechanism": "Plazo que descuenta DeviceLeadTimeMs; guarda en el claim; segunda comprobación monotónica antes de escribir; detección de saltos del reloj de pared (CLOCK_JUMP); con GATEWAY_RECEIPT, plazo solo para entregas en vivo; barrido de vencimientos.",
+      "conditions": "Reloj del EdgeHost sincronizado; con PLC_TIMESTAMP, desfase dentro de ClockSkewToleranceMs; con GATEWAY_RECEIPT, MaxUpstreamLatencyMs conservador y válido solo para SUBSCRIPTION sin overflow.",
+      "hardware": "NTP o PTP validado si se usa el reloj del PLC (OT-03).",
+      "residualRisk": "Una pausa del proceso entre la segunda comprobación y la llamada de escritura no se puede excluir; SendMarginMs debe cubrir la pausa observada. Un salto de reloj menor que ClockJumpToleranceMs no se detecta. Un job recuperado tras un reinicio solo tiene la comprobación con reloj de pared.",
+      "tests": [
+        "T21",
+        "T29",
+        "T37",
+        "T45"
+      ]
+    },
+    {
+      "id": "G05",
+      "class": "FISICA",
+      "desired": "Ninguna etiqueta aplicada fuera de la ventana física de su caja.",
+      "mechanism": "Compuerta de autorización del PLC o del aplicador que solo aplica con la caja correcta en posición.",
+      "conditions": "Print-and-apply controlado por el PLC, o tracking que retenga la caja.",
+      "hardware": "Aplicador o compuerta controlados por el PLC (OT-01, OT-02, OT-09).",
+      "residualRisk": "Sin compuerta, una etiqueta retenida en la cola del dispositivo puede salir tarde; el software solo la reporta como UNKNOWN. El orden de envío lo protege G16, no esta fila.",
+      "tests": [
+        "T31"
+      ]
+    },
+    {
+      "id": "G06",
+      "class": "FISICA",
+      "desired": "La etiqueta correcta está en la caja correcta.",
+      "mechanism": "Nivel VERIFIED: escáner que lee LabelSerial, correlacionado con el ciclo por tracking del PLC.",
+      "conditions": "Lector posterior a la aplicación y correlación por ciclo.",
+      "hardware": "Escáner de verificación (OT-08) y tracking (OT-01).",
+      "residualRisk": "Con nivel PRINTED o APPLIED solo se prueba impresión o aplicación, no contenido en la caja correcta.",
+      "tests": [
+        "T15",
+        "T22",
+        "T44"
+      ]
+    },
+    {
+      "id": "G07",
+      "class": "FISICA",
+      "desired": "Una etiqueta por caja física, incluso si recircula.",
+      "mechanism": "CartonIdentityMode CARTON_ID_REQUIRED con validación en TX-A sobre IX_PrintJob_Carton.",
+      "conditions": "Identificador físico confiable leído antes de etiquetar.",
+      "hardware": "Código previo, RFID o tracking de recirculación (OT-05, OT-06).",
+      "residualRisk": "Sin identidad física la garantía es por ciclo: una caja recirculada recibe otra etiqueta.",
+      "tests": [
+        "T16",
+        "T32"
+      ]
+    },
+    {
+      "id": "G08",
+      "class": "SOFTWARE",
+      "desired": "Ningún evento lógico perdido si cae el broker.",
+      "mechanism": "Outbox transaccional, publisher confirms, EventId determinista, Inbox en consumidores.",
+      "conditions": "SQL disponible.",
+      "hardware": "Ninguna.",
+      "residualRisk": "El orden entre agregados distintos es de mejor esfuerzo; el consumidor usa resultVersion.",
+      "tests": [
+        "T08",
+        "T14"
+      ]
+    },
+    {
+      "id": "G09",
+      "class": "SUPUESTO_OT",
+      "desired": "Registro de todos los ciclos durante una caída de SQL.",
+      "mechanism": "Perfil extendido: FIFO del PLC, AckCycleId y journal SQLite. Perfil mínimo: solo el conteo del hueco.",
+      "conditions": "OT exige la historia completa (OT-14) y acepta modificar el PLC.",
+      "hardware": "PLC con FIFO y ACK.",
+      "residualRisk": "En perfil mínimo, los ciclos durante la caída solo se conocen como cantidad.",
+      "tests": [
+        "T09",
+        "T19",
+        "T35"
+      ]
+    },
+    {
+      "id": "G10",
+      "class": "FISICA",
+      "desired": "Un solo transmisor por impresora.",
+      "mechanism": "Un host: sender único y lock de sistema operativo. Varios hosts: aislamiento de red, apagado verificado del nodo anterior o proxy que valide tokens.",
+      "conditions": "Sin alta disponibilidad automática en el MVP.",
+      "hardware": "Para alta disponibilidad, control del camino de red hacia la impresora (OT-10, OT-11).",
+      "residualRisk": "PrinterLease con fencing token en SQL no detiene a un proceso suspendido que ya validó su token.",
+      "tests": [
+        "T27",
+        "T36"
+      ]
+    },
+    {
+      "id": "G11",
+      "class": "RENDIMIENTO",
+      "desired": "Latencia de recepción OPC a inicio de transmisión compatible con el plazo.",
+      "mechanism": "Un proceso edge, señal en proceso, una transacción por caja, socket persistente.",
+      "conditions": "Desigualdad de factibilidad de la sección 17 del documento principal, evaluada con percentiles medidos.",
+      "hardware": "Red local, SQL en planta.",
+      "residualRisk": "Hipótesis de diseño sin benchmark.",
+      "tests": [
+        "T12"
+      ]
+    },
+    {
+      "id": "G12",
+      "class": "RENDIMIENTO",
+      "desired": "Capacidad sostenida igual o mayor que la tasa de cajas.",
+      "mechanism": "Medición de tasa de llegada y de servicio; alerta de backlog.",
+      "conditions": "Takt time y capacidad de la impresora conocidos (OT-02).",
+      "hardware": "Impresora y aplicador.",
+      "residualRisk": "Si la tasa de llegada supera la de servicio, ningún software lo corrige.",
+      "tests": [
+        "T12"
+      ]
+    },
+    {
+      "id": "G13",
+      "class": "SOFTWARE",
+      "desired": "Trazabilidad completa de reimpresiones excepcionales.",
+      "mechanism": "ReprintAuthorization con dos personas, riesgo declarado, caja y evidencia; intento ligado de forma única por FK compuesta; ejecutado por el sender de la ManualPrinterId; confirmado solo con evidencia que referencia al intento; resultado publicado también si no se confirma (X03).",
+      "conditions": "Procedimiento operativo aprobado (OT-12).",
+      "hardware": "Ninguna.",
+      "residualRisk": "Con riesgo ACCEPTED puede existir una segunda etiqueta física.",
+      "tests": [
+        "T34",
+        "T41",
+        "T43"
+      ]
+    },
+    {
+      "id": "G14",
+      "class": "SOFTWARE",
+      "desired": "Cada decisión se explica con la configuración que la produjo.",
+      "mechanism": "Revisiones inmutables y ConfigRevisionId congelado.",
+      "conditions": "Ninguna adicional.",
+      "hardware": "Ninguna.",
+      "residualRisk": "Ninguno conocido.",
+      "tests": [
+        "T33"
+      ]
+    },
+    {
+      "id": "G15",
+      "class": "SOFTWARE",
+      "desired": "Toda detección registrada termina con un resultado publicado.",
+      "mechanism": "Estados terminales con resultOutcome; barrido de vencimientos.",
+      "conditions": "SQL disponible.",
+      "hardware": "Ninguna.",
+      "residualRisk": "Los ciclos de un hueco y los registros en colisión de identidad no son detecciones y no tienen resultado: quedan como SequenceGap o SequenceAnomaly.",
+      "tests": [
+        "T04",
+        "T13",
+        "T17",
+        "T24"
+      ]
+    },
+    {
+      "id": "G16",
+      "class": "SOFTWARE",
+      "desired": "Una impresora de línea nunca recibe un envío ordinario de un ciclo anterior a otro que ya reclamó.",
+      "mechanism": "PrinterSendOrder leído con UPDLOCK y avanzado en el claim, protegido contra retrocesos; épocas inmutables; los jobs atrasados vencen con OUT_OF_ORDER; las reimpresiones excepcionales solo van a la ManualPrinterId.",
+      "conditions": "Un solo transmisor por impresora (G10); una impresora de línea por estación y un LabelType por revisión; el orden entre épocas lo da PlcEpochHistory.AcceptedAt.",
+      "hardware": "Ninguna para el orden de envío. Que el orden de envío sea el de aplicación depende del aplicador (OT-01).",
+      "residualRisk": "Un job atrasado se pierde (EXPIRED) en lugar de imprimirse cruzado; la caja sigue la política de OT-09.",
+      "tests": [
+        "T30",
+        "T42"
+      ]
+    },
+    {
+      "id": "G17",
+      "class": "SOFTWARE",
+      "desired": "Toda transición manual, excepcional o de corrección, y todo desbloqueo o confirmación de época, tiene su respaldo registrado en SQL.",
+      "mechanism": "OperatorAction, ReprintAuthorization, EvidenceObservation y los triggers TR_PrintJob_StateMachine, TR_PrintAttempt_StateMachine, TR_PrintAttempt_Guard, TR_StationConfig_Guard y TR_PlcEpochHistory_Guard.",
+      "conditions": "Los triggers habilitados; el rol de la aplicación sin permisos de DDL ni de escritura sobre AllowedTransition, que solo modifica la migración.",
+      "hardware": "Ninguna.",
+      "residualRisk": "Un administrador con permisos de DDL o de escritura sobre AllowedTransition puede saltarse las reglas; se controla con permisos y auditoría de SQL Server. RESOLVE_ANOMALY queda como auditoría, sin trigger.",
+      "tests": [
+        "T39",
+        "T40",
+        "T41",
+        "T47"
+      ]
+    }
+  ]
+}

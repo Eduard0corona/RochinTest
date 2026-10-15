@@ -1,0 +1,137 @@
+erDiagram
+    StationConfigRevision ||--o{ StationConfig : "revisión activa"
+    StationConfigRevision ||--o{ CartonDetection : "congela"
+    StationConfigRevision ||--o{ PrintJob : "congela"
+    PlcEpochHistory ||--o{ CartonDetection : "época aceptada"
+    PlcEpochHistory ||--o{ SequenceGap : "época"
+    CartonDetection ||--o{ PrintJob : "uno por LabelType"
+    CartonDetection ||--o{ SequenceAnomaly : "colisión con"
+    ErpWorkOrderCache ||--o{ PrintJob : "snapshot"
+    PrintJob ||--o{ PrintAttempt : "intentos"
+    PrintJob ||--o{ ReprintAuthorization : "autoriza"
+    ReprintAuthorization ||--o| PrintAttempt : "un intento"
+    PrintJob ||--o{ OperatorAction : "acciones manuales"
+    OperatorAction ||--o| PrintAttempt : "A09"
+    PrintJob ||--o{ EvidenceObservation : "evidencia"
+    EvidenceObservation ||--o| PrintAttempt : "confirma"
+    PrintJob ||--o| PrinterSendOrder : "último reclamado"
+    StationConfigRevision {
+        bigint ConfigRevisionId PK
+        string SiteId
+        string StationId
+        int RevisionNumber
+        string DeadlineReference
+        int TransitBudgetMs
+        int DeviceLeadTimeMs
+        int SendMarginMs
+        int ClockJumpToleranceMs
+        string PrinterId
+        string ManualPrinterId
+        string MinConfirmationLevel
+    }
+    StationConfig {
+        string SiteId PK
+        string StationId PK
+        bigint ActiveConfigRevisionId FK
+        bit LabelingEnabled
+    }
+    PlcEpochHistory {
+        string SiteId PK
+        string StationId PK
+        bigint PlcEpoch PK
+        string AcceptanceMode
+        datetime AcceptedAt
+    }
+    CartonDetection {
+        uuid DetectionId PK
+        bigint PlcEpoch
+        decimal CycleId
+        binary SourceFingerprint
+        string Transport
+        bit QueueOverflow
+        datetime ReceivedAt
+        datetime DeadlineAt
+        string Status
+        string Reason
+    }
+    SequenceAnomaly {
+        bigint AnomalyId PK
+        string AnomalyType
+        binary IncomingFingerprint
+    }
+    SequenceGap {
+        bigint GapId PK
+        decimal FromCycleId
+        decimal ToCycleId
+        string Status
+    }
+    ErpWorkOrderCache {
+        string WorkOrderId PK
+        string Revision PK
+        string LotId
+        datetime ValidUntil
+    }
+    PrintJob {
+        uuid PrintJobId PK
+        uuid DetectionId FK
+        bigint PlcEpoch
+        decimal CycleId
+        string LabelSerial
+        binary PayloadHash
+        datetime DeadlineAt
+        string Status
+        bigint LastOperatorActionId FK
+        uuid LastExceptionalAttemptId FK
+    }
+    PrintAttempt {
+        uuid AttemptId PK
+        uuid PrintJobId FK
+        string Kind
+        string Outcome
+        bit MayHaveSent
+        datetime EvidenceDeadlineAt
+        bigint ConfirmingObservationId FK
+        bigint OperatorActionId FK
+    }
+    ReprintAuthorization {
+        bigint AuthorizationId PK
+        uuid PrintJobId FK
+        string DuplicateRisk
+        string TargetPrinterId
+        string Status
+    }
+    OperatorAction {
+        bigint OperatorActionId PK
+        string ActionType
+        uuid PrintJobId FK
+        string TargetStatus
+        string PerformedBy
+    }
+    EvidenceObservation {
+        bigint ObservationId PK
+        uuid PrintJobId FK
+        decimal CycleId
+        string EvidenceLevel
+        string CorrelatedTo
+        string ReadSerial
+    }
+    PrinterSendOrder {
+        string PrinterId PK
+        bigint LastPlcEpoch
+        decimal LastCycleId
+        uuid LastPrintJobId FK
+    }
+    PrinterLease {
+        string PrinterId PK
+        bigint FencingToken
+        datetime LeaseUntil
+    }
+    OutboxEvent {
+        bigint OutboxSequence PK
+        uuid EventId
+        string EventType
+    }
+    InboxMessage {
+        string ConsumerName PK
+        uuid EventId PK
+    }

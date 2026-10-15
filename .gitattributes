@@ -1,0 +1,11 @@
+# Normaliza fines de línea en el repositorio y deja la plataforma decidir en el checkout.
+* text=auto
+
+# La especificación se conserva byte por byte: sus checksums dependen de ello.
+spec/** -text
+
+# Binarios
+*.png binary
+*.pdf binary
+*.docx binary
+*.zip binary

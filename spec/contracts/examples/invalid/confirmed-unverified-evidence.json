@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "eventType": "PrintJobResult",
+  "eventId": "47785260-a4d2-5d4f-9c9c-a5f395817faa",
+  "correlationId": "6ca03007-d7b1-5163-8595-e5d8349a78e8",
+  "occurredAt": "2026-10-12T18:04:11.733Z",
+  "siteId": "PLANT-01",
+  "stationId": "LINE-01",
+  "plcEpoch": 42,
+  "cycleId": "918273",
+  "idempotencyKey": "PLANT-01:LINE-01:42:918273",
+  "labelType": "CARTON_GS1",
+  "resultVersion": 1,
+  "outcome": "CONFIRMED",
+  "final": true,
+  "configRevision": 7,
+  "printJobId": "0d7f3c2e-91b4-4a5d-b8e6-2f1a7c9d4e01",
+  "labelSerial": "P01L01-000000531201",
+  "workOrderId": "WO-2026-4815",
+  "productId": "SKU-10245",
+  "lotId": "LOT-20261012-A",
+  "printerId": "PRN-LINE-01",
+  "attemptId": "ab17ad7b-afc5-4e3d-a38a-bd0dbb286d01",
+  "evidence": {
+    "type": "BARCODE_VERIFICATION",
+    "level": "VERIFIED",
+    "correlatedTo": "CYCLE",
+    "verified": false,
+    "readSerial": "P01L01-000000531201",
+    "reference": "SCN-LINE-01-77812",
+    "observedAt": "2026-10-12T18:04:11.731Z"
+  },
+  "timings": {
+    "detectionTimestamp": "2026-10-12T18:04:11.204Z",
+    "receivedAt": "2026-10-12T18:04:11.221Z",
+    "jobReadyAt": "2026-10-12T18:04:11.226Z",
+    "sendStartAt": "2026-10-12T18:04:11.229Z",
+    "writeCompletedAt": "2026-10-12T18:04:11.231Z",
+    "evidenceAt": "2026-10-12T18:04:11.731Z"
+  }
+}

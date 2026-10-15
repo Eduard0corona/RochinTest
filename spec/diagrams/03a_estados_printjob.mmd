@@ -1,0 +1,38 @@
+%% GENERADO por tools/generate_artifacts.py desde contracts/state-machine.json. No editar.
+%% Máquina PrintJob; modos incluidos: auto, manual, correction.
+stateDiagram-v2
+    direction LR
+    state "READY" as READY
+    state "SENDING" as SENDING
+    state "TRANSMITTED" as TRANSMITTED
+    state "RETRY_WAIT" as RETRY_WAIT
+    state "CONFIRMED" as CONFIRMED
+    state "UNKNOWN" as UNKNOWN
+    state "FAILED" as FAILED
+    state "EXPIRED" as EXPIRED
+    state "CANCELLED" as CANCELLED
+    state "CLOSED_UNRESOLVED" as CLOSED_UNRESOLVED
+    [*] --> READY: J01 creación
+    READY --> SENDING: J02 claim
+    READY --> EXPIRED: J03 plazo vencido
+    READY --> CANCELLED: J04 [manual] cancelación
+    SENDING --> TRANSMITTED: J05 escritura completa
+    SENDING --> RETRY_WAIT: J06 NOT_SENT, reintento
+    SENDING --> FAILED: J07 NOT_SENT, sin intentos
+    SENDING --> EXPIRED: J08 NOT_SENT, plazo vencido
+    SENDING --> UNKNOWN: J09 interrupción o reinicio
+    TRANSMITTED --> CONFIRMED: J10 evidencia
+    TRANSMITTED --> UNKNOWN: J11 sin evidencia o serial distinto
+    TRANSMITTED --> FAILED: J12 dispositivo: no impreso
+    RETRY_WAIT --> READY: J13 backoff cumplido
+    RETRY_WAIT --> EXPIRED: J14 plazo vencido
+    UNKNOWN --> CONFIRMED: J15 reconciliación positiva
+    UNKNOWN --> FAILED: J16 [manual] reconciliación negativa
+    UNKNOWN --> CLOSED_UNRESOLVED: J17 [manual] cierre operativo
+    CONFIRMED --> UNKNOWN: J18 [corrección] lectura contradictoria
+    UNKNOWN --> UNKNOWN: J18 [corrección] lectura contradictoria
+    note right of TRANSMITTED: Terminal si MinConfirmationLevel = NONE en la revisión congelada
+    classDef terminal fill:#eef1f4,stroke:#5d636b,color:#1a1c1f
+    classDef warning fill:#fff4dc,stroke:#d98a00,color:#1a1c1f,stroke-width:2px
+    class CONFIRMED,FAILED,EXPIRED,CANCELLED,CLOSED_UNRESOLVED terminal
+    class UNKNOWN warning

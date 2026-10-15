@@ -1,0 +1,1095 @@
+{
+  "$comment": "Catálogo canónico de pruebas v1.1. tests/MATRIZ_PRUEBAS.md se genera desde aquí. status: NO_EJECUTADA (pendiente de implementación) o EJECUTADA_EN_REVISION (corrida en esta revisión documental, con evidencia en docs/REVISION_LOG_v1.1.md).",
+  "levels": {
+    "UNIT": "Prueba unitaria sin infraestructura.",
+    "INTEGRATION": "SQL Server real (Testcontainers) y simuladores.",
+    "FAULT": "Inyección de fallas con simuladores de OPC UA, impresora, ERP, red y procesos.",
+    "LOAD": "Carga sostenida con payload realista.",
+    "FAT": "Aceptación con PLC, impresora y aplicador reales.",
+    "DOC": "Verificación del paquete documental."
+  },
+  "tests": [
+    {
+      "id": "T01",
+      "origin": "v1.0",
+      "title": "Tag duplicado",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "Estación habilitada; snapshot ERP válido; impresora simulada disponible.",
+      "initialData": "Ciclo P01:L03:42:918273 con huella H1.",
+      "injection": "100 entregas del mismo registro (notificaciones repetidas, Republish y relectura) desde 10 consumidores concurrentes.",
+      "expectedStates": "1 CartonDetection JOB_CREATED; 1 PrintJob; 1 PrintAttempt.",
+      "publishedEvents": "1 CartonDetected; 1 PrintJobResult por transición publicable.",
+      "physicalEffects": "El simulador recibe como máximo una transmisión.",
+      "metrics": "duplicate_detection_total = 99 (por transporte); duplicate_physical_transmissions_total = 0.",
+      "passCriteria": "Conteos exactos en SQL y en el simulador; ningún error de unicidad sin manejar.",
+      "transitions": [
+        "D01",
+        "D02",
+        "J01"
+      ],
+      "invariants": [
+        "I01"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T02",
+      "origin": "v1.0",
+      "title": "Concurrencia en el claim",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "Un job READY con plazo vigente.",
+      "initialData": "Job J con DeadlineAt a 2 s.",
+      "injection": "10 tareas ejecutan el claim del mismo job a la vez.",
+      "expectedStates": "Exactamente 1 claim afecta 1 fila; 1 PrintAttempt SENDING.",
+      "publishedEvents": "Ninguno adicional.",
+      "physicalEffects": "Una transmisión como máximo.",
+      "metrics": "claim_conflicts_total = 9.",
+      "passCriteria": "Un solo ganador; los demás terminan con @claimed vacío y sin excepción: los triggers tienen la guarda de 0 filas.",
+      "transitions": [
+        "J02",
+        "A01"
+      ],
+      "invariants": [
+        "I01",
+        "I03"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T03",
+      "origin": "v1.0",
+      "title": "ERP lento dentro del plazo",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "Snapshot ausente en caché; TransitBudgetMs mayor que el retraso del ERP.",
+      "initialData": "Orden WO-1 sin snapshot.",
+      "injection": "El simulador ERP responde con 300 ms de retraso.",
+      "expectedStates": "Detección WAITING_ERP y luego JOB_CREATED; el callback OPC nunca espera al ERP.",
+      "publishedEvents": "CartonDetected al registrar; resultado del job al terminar.",
+      "physicalEffects": "Una etiqueta si el plazo lo permite.",
+      "metrics": "erp_snapshot_wait_ms; opc_callback_duration_ms sin incremento.",
+      "passCriteria": "Ninguna llamada síncrona al ERP en el camino de ingesta.",
+      "transitions": [
+        "D03",
+        "D06"
+      ],
+      "invariants": [
+        "I10"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T04",
+      "origin": "v1.0",
+      "title": "ERP caído",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "Snapshot ausente o vencido.",
+      "initialData": "Orden WO-2 sin snapshot válido.",
+      "injection": "ERP devuelve 503 y timeouts durante toda la prueba.",
+      "expectedStates": "Detecciones WAITING_ERP y luego EXPIRED con Reason ERP_UNAVAILABLE.",
+      "publishedEvents": "PrintJobResult EXPIRED sin job por cada detección.",
+      "physicalEffects": "Ninguna etiqueta.",
+      "metrics": "erp_cache_age_seconds; detections_expired_total{reason=ERP_UNAVAILABLE}.",
+      "passCriteria": "Cero jobs con lote o producto no validados.",
+      "transitions": [
+        "D03",
+        "D07"
+      ],
+      "invariants": [
+        "I10"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T05",
+      "origin": "v1.0",
+      "title": "Impresora no conecta antes de enviar",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "MaxAutoAttempts = 3; plazo suficiente para los reintentos.",
+      "initialData": "Job READY.",
+      "injection": "El simulador rechaza la conexión TCP en todos los intentos.",
+      "expectedStates": "Intentos NOT_SENT; job SENDING → RETRY_WAIT → READY en ciclo; al agotar intentos, FAILED con PRINTER_UNAVAILABLE.",
+      "publishedEvents": "PrintJobResult FAILED.",
+      "physicalEffects": "Ninguna etiqueta.",
+      "metrics": "print_attempts_total{outcome=NOT_SENT} = 3; bytes recibidos por el simulador = 0.",
+      "passCriteria": "El simulador registra 0 bytes recibidos en cada intento NOT_SENT; ningún UNKNOWN innecesario. El criterio no usa WriteStartedAt: se persiste después de escribir y no prueba nada en SQL (I02).",
+      "transitions": [
+        "A02",
+        "J06",
+        "J13",
+        "J07"
+      ],
+      "invariants": [
+        "I02"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T06",
+      "origin": "v1.0",
+      "title": "Respuesta perdida después de transmitir",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "Simulador configurado para recibir e imprimir y no responder.",
+      "initialData": "Job READY.",
+      "injection": "Corte del canal a mitad de la escritura; minutos después llega la lectura tardía del serial correcto.",
+      "expectedStates": "Intento UNKNOWN; job UNKNOWN con WRITE_INTERRUPTED; luego CONFIRMED por reconciliación.",
+      "publishedEvents": "PrintJobResult UNKNOWN (final false) y después CONFIRMED con resultVersion mayor.",
+      "physicalEffects": "Exactamente una etiqueta.",
+      "metrics": "printer_unknown_total; duplicate_physical_transmissions_total = 0.",
+      "passCriteria": "Cero retransmisiones automáticas; la reconciliación conserva el mismo PrintJobId y LabelSerial.",
+      "transitions": [
+        "A04",
+        "J09",
+        "A08",
+        "J15"
+      ],
+      "invariants": [
+        "I02",
+        "I03",
+        "I05"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T07",
+      "origin": "v1.0",
+      "title": "Reinicio del servicio en SENDING",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "Puntos de falla inyectables en el sender.",
+      "initialData": "Job READY.",
+      "injection": "kill -9 en tres puntos: tras el commit del claim y antes de escribir; durante la escritura; tras escribir y antes de TX-C.",
+      "expectedStates": "En los tres casos el arranque pasa intento y job a UNKNOWN con RESTART_DURING_SEND; nunca a READY.",
+      "publishedEvents": "PrintJobResult UNKNOWN.",
+      "physicalEffects": "Cero o una etiqueta según el punto; nunca dos.",
+      "metrics": "restart_recovered_sending_total.",
+      "passCriteria": "Se documenta el falso UNKNOWN del primer punto como costo aceptado; ninguna transacción SQL abierta durante el I/O.",
+      "transitions": [
+        "J09",
+        "A04"
+      ],
+      "invariants": [
+        "I02",
+        "I03",
+        "I19",
+        "I20"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T08",
+      "origin": "v1.0",
+      "title": "RabbitMQ caído",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "Carga nominal.",
+      "initialData": "—",
+      "injection": "Detener RabbitMQ 10 minutos y reanudarlo.",
+      "expectedStates": "Detecciones y jobs avanzan igual; filas del Outbox pendientes.",
+      "publishedEvents": "Al volver, todos los eventos con el mismo EventId, en orden de OutboxSequence.",
+      "physicalEffects": "Sin cambio en la impresión.",
+      "metrics": "outbox_pending_age_seconds; latencias de impresión sin cambio.",
+      "passCriteria": "Cero eventos perdidos; consumidores sin efectos duplicados.",
+      "transitions": [],
+      "invariants": [
+        "I22"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T09",
+      "origin": "v1.0",
+      "title": "SQL caído con journal (perfil extendido)",
+      "level": "FAULT",
+      "profile": "EXTENDIDO",
+      "preconditions": "PLC con FIFO y AckCycleId simulados; journal SQLite con synchronous=FULL.",
+      "initialData": "—",
+      "injection": "Detener SQL 30 s bajo carga.",
+      "expectedStates": "Ciclos capturados en el journal y ACK al PLC solo tras commit; ningún job nuevo sin SQL.",
+      "publishedEvents": "Al volver SQL, CartonDetected de cada ciclo capturado.",
+      "physicalEffects": "Ninguna etiqueta durante la caída.",
+      "metrics": "gateway_journal_depth; labeling_ready = 0 durante la caída.",
+      "passCriteria": "Ningún ciclo con ACK se pierde; ningún ACK precede al commit del journal.",
+      "transitions": [],
+      "invariants": [
+        "I21"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T10",
+      "origin": "v1.0",
+      "title": "Cambio de lote en carrera",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "Snapshot revisión R1 vigente.",
+      "initialData": "Job creado con R1.",
+      "injection": "Llega R2 del ERP mientras el job está READY; un proceso intenta actualizar Payload.",
+      "expectedStates": "El job conserva R1; el UPDATE de Payload falla por TR_PrintJob_Immutable.",
+      "publishedEvents": "Resultados con ErpRevision R1.",
+      "physicalEffects": "La etiqueta lleva el lote de R1.",
+      "metrics": "—",
+      "passCriteria": "Payload y PayloadHash idénticos al momento de creación.",
+      "transitions": [],
+      "invariants": [
+        "I09",
+        "I10"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T11",
+      "origin": "v1.0",
+      "title": "Reconexión OPC con FIFO (perfil extendido)",
+      "level": "FAULT",
+      "profile": "EXTENDIDO",
+      "preconditions": "PLC con FIFO de ciclos.",
+      "initialData": "Marca alta en el ciclo 1000.",
+      "injection": "Desconectar el gateway mientras pasan 20 cajas; reconectar.",
+      "expectedStates": "Hueco 1001-1020 OPEN; la FIFO entrega los 20 como RECOVERED y EXPIRED por LATE_ARRIVAL; hueco RECOVERED.",
+      "publishedEvents": "20 CartonDetected y 20 PrintJobResult EXPIRED sin job.",
+      "physicalEffects": "Ninguna impresión tardía.",
+      "metrics": "opc_reconnect_total; sequence_gaps_open.",
+      "passCriteria": "Ningún ciclo duplicado ni impreso fuera de plazo.",
+      "transitions": [
+        "G01",
+        "G02",
+        "D04"
+      ],
+      "invariants": [
+        "I04",
+        "I16"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T12",
+      "origin": "v1.0",
+      "title": "Carga sostenida y capacidad",
+      "level": "LOAD",
+      "profile": "AMBOS",
+      "preconditions": "Tasa de cajas y tamaño de payload acordados con OT; intervalos OPC negociados registrados.",
+      "initialData": "—",
+      "injection": "30 minutos a la tasa pactada y 10 minutos al doble.",
+      "expectedStates": "Backlog estable a tasa pactada.",
+      "publishedEvents": "—",
+      "physicalEffects": "Tasa de llegada menor que la capacidad de la impresora.",
+      "metrics": "Histogramas de los seis tramos de latencia (ver sección de rendimiento).",
+      "passCriteria": "Se reportan p50, p95, p99 y máximo con hardware declarado; se comprueba la desigualdad de factibilidad del plazo, incluido el DeviceLeadTimeMs medido (send_start a etiqueta aplicada).",
+      "transitions": [],
+      "invariants": [
+        "I14"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T13",
+      "origin": "v1.0",
+      "title": "Snapshot del PLC incoherente",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "Simulador OPC capaz de publicar campos de ciclos distintos.",
+      "initialData": "—",
+      "injection": "CycleId de un ciclo con WorkOrderId de otro. Variante: con DeadlineReference = PLC_TIMESTAMP, un registro sin DetectionTimestamp.",
+      "expectedStates": "Detección BLOCKED con INCOHERENT_SNAPSHOT. Variante: también BLOCKED con INCOHERENT_SNAPSHOT y DeadlineAt = ReceivedAt (CK_CartonDetection_PlcTimestamp).",
+      "publishedEvents": "CartonDetected y PrintJobResult BLOCKED sin job.",
+      "physicalEffects": "Ninguna etiqueta.",
+      "metrics": "detections_blocked_total{reason=INCOHERENT_SNAPSHOT}.",
+      "passCriteria": "Ningún job con datos mezclados.",
+      "transitions": [
+        "D05"
+      ],
+      "invariants": [
+        "I10"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T14",
+      "origin": "v1.0",
+      "title": "Resultado republicado",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "Consumidor con InboxMessage.",
+      "initialData": "Un PrintJobResult.",
+      "injection": "Publicar el mismo evento 3 veces.",
+      "expectedStates": "Una sola fila en InboxMessage; un solo efecto.",
+      "publishedEvents": "—",
+      "physicalEffects": "—",
+      "metrics": "inbox_duplicates_total = 2.",
+      "passCriteria": "El consumidor aplica la versión mayor por (idempotencyKey, labelType).",
+      "transitions": [],
+      "invariants": [
+        "I22"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T15",
+      "origin": "v1.0",
+      "title": "Confirmación física por escáner",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "MinConfirmationLevel = VERIFIED; escáner correlacionado por tracking del PLC.",
+      "initialData": "Job READY.",
+      "injection": "El escáner lee el LabelSerial correcto asociado al ciclo.",
+      "expectedStates": "Intento SENDING → TRANSMITTED → CONFIRMED; job TRANSMITTED → CONFIRMED.",
+      "publishedEvents": "PrintJobResult CONFIRMED con evidence.level VERIFIED y correlatedTo CYCLE.",
+      "physicalEffects": "Una etiqueta verificada.",
+      "metrics": "send_to_verified_ms.",
+      "passCriteria": "readSerial = labelSerial; TR_PrintAttempt_Guard acepta la confirmación solo con esa EvidenceObservation.",
+      "transitions": [
+        "A03",
+        "J05",
+        "A05",
+        "J10"
+      ],
+      "invariants": [
+        "I05",
+        "I06"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T16",
+      "origin": "v1.0",
+      "title": "Caja recirculada con CartonId",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "CartonIdentityMode = CARTON_ID_REQUIRED; el PLC entrega CartonId.",
+      "initialData": "Caja C-77 con job CONFIRMED.",
+      "injection": "C-77 vuelve a pasar y genera un ciclo nuevo. Variante: dos ciclos de C-77 llegan sin snapshot y quedan WAITING_ERP; después llega el snapshot.",
+      "expectedStates": "Segunda detección BLOCKED con RECIRCULATED_CARTON (D05). Variante: el primero JOB_CREATED (D06); el segundo BLOCKED con RECIRCULATED_CARTON al repetir la validación en TX-E (D08).",
+      "publishedEvents": "PrintJobResult BLOCKED sin job.",
+      "physicalEffects": "Ninguna segunda etiqueta.",
+      "metrics": "detections_blocked_total{reason=RECIRCULATED_CARTON}.",
+      "passCriteria": "La validación ocurre en TX-A y en TX-E con bloqueo de rango sobre IX_PrintJob_Carton e IX_CartonDetection_Carton; un 1205 se reintenta y termina en el mismo resultado.",
+      "transitions": [
+        "D05",
+        "D06",
+        "D08"
+      ],
+      "invariants": [
+        "I07"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T17",
+      "origin": "rev1",
+      "title": "ERP vuelve después del plazo",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "Detección WAITING_ERP.",
+      "initialData": "DeadlineAt en 800 ms.",
+      "injection": "El snapshot válido llega a los 2 s.",
+      "expectedStates": "Detección EXPIRED con ERP_UNAVAILABLE; ningún job.",
+      "publishedEvents": "PrintJobResult EXPIRED sin job.",
+      "physicalEffects": "Cero bytes a la impresora.",
+      "metrics": "detections_expired_total{reason=ERP_UNAVAILABLE}.",
+      "passCriteria": "La llegada del snapshot no crea job.",
+      "transitions": [
+        "D07"
+      ],
+      "invariants": [
+        "I04",
+        "I10"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T18",
+      "origin": "rev1",
+      "title": "Backoff mayor que el plazo restante",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "RetryBackoffMs mayor que el plazo restante.",
+      "initialData": "Job en RETRY_WAIT.",
+      "injection": "Dejar correr el backoff.",
+      "expectedStates": "Job EXPIRED con DEADLINE_PASSED.",
+      "publishedEvents": "PrintJobResult EXPIRED.",
+      "physicalEffects": "Cero bytes.",
+      "metrics": "jobs_expired_total{from=RETRY_WAIT}.",
+      "passCriteria": "Nunca se pasa a READY con el plazo vencido.",
+      "transitions": [
+        "J14"
+      ],
+      "invariants": [
+        "I04"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T19",
+      "origin": "rev1",
+      "title": "SQL caído (perfil mínimo)",
+      "level": "FAULT",
+      "profile": "MINIMO",
+      "preconditions": "Sin journal; latido de etiquetadora lista al PLC.",
+      "initialData": "Marca alta en el ciclo 500.",
+      "injection": "Detener SQL 30 s mientras pasan 25 cajas.",
+      "expectedStates": "Falla cerrado; al volver, hueco 501-525 OPEN y luego CLOSED_UNRECOVERED con UnrecoveredCount = 25.",
+      "publishedEvents": "Ningún PrintJobResult para el hueco; alerta operacional.",
+      "physicalEffects": "Cero impresiones durante y después de la caída para esos ciclos.",
+      "metrics": "cycles_unobserved_total = 25; labeling_ready = 0 durante la caída.",
+      "passCriteria": "Ninguna detección inventada para el hueco.",
+      "transitions": [
+        "G01",
+        "G03"
+      ],
+      "invariants": [
+        "I04",
+        "I16"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T20",
+      "origin": "rev1",
+      "title": "Replay tardío del journal (perfil extendido)",
+      "level": "FAULT",
+      "profile": "EXTENDIDO",
+      "preconditions": "Journal con ciclos capturados durante una caída de SQL.",
+      "initialData": "Ciclos con plazo ya vencido.",
+      "injection": "Restaurar SQL y reproducir el journal.",
+      "expectedStates": "Detecciones RECOVERED y EXPIRED con LATE_ARRIVAL.",
+      "publishedEvents": "CartonDetected y PrintJobResult EXPIRED sin job.",
+      "physicalEffects": "Cero bytes.",
+      "metrics": "detections_expired_total{reason=LATE_ARRIVAL}.",
+      "passCriteria": "Ningún job para registros vencidos.",
+      "transitions": [
+        "D04"
+      ],
+      "invariants": [
+        "I04"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T21",
+      "origin": "rev1",
+      "title": "Claim con plazo vencido",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "Job READY con DeadlineAt en el pasado.",
+      "initialData": "—",
+      "injection": "Ejecutar el claim y después el barrido.",
+      "expectedStates": "El claim afecta 0 filas; el barrido pasa el job a EXPIRED.",
+      "publishedEvents": "PrintJobResult EXPIRED.",
+      "physicalEffects": "Cero bytes.",
+      "metrics": "claim_rejected_total{cause=deadline}.",
+      "passCriteria": "Ningún PrintAttempt creado; el claim no deja fila en @claimed y no lanza excepción.",
+      "transitions": [
+        "J03"
+      ],
+      "invariants": [
+        "I04"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T22",
+      "origin": "rev1",
+      "title": "El escáner lee el serial de otro job",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "MinConfirmationLevel = VERIFIED.",
+      "initialData": "Job A TRANSMITTED.",
+      "injection": "Evidencia correlacionada con el ciclo de A pero con el LabelSerial de B.",
+      "expectedStates": "EvidenceObservation registrada; intento UNKNOWN; job A UNKNOWN con SERIAL_MISMATCH; nunca CONFIRMED.",
+      "publishedEvents": "PrintJobResult UNKNOWN con la lectura contradictoria (evidence.verified = false).",
+      "physicalEffects": "La caja de A lleva una etiqueta ajena: incidente.",
+      "metrics": "serial_mismatch_total; alerta inmediata.",
+      "passCriteria": "TR_PrintAttempt_Guard rechaza confirmar con ese serial aunque el código lo intente; el schema no puede comprobarlo.",
+      "transitions": [
+        "J11",
+        "A06"
+      ],
+      "invariants": [
+        "I06"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T23",
+      "origin": "rev1",
+      "title": "Contratos inválidos",
+      "level": "DOC",
+      "profile": "AMBOS",
+      "preconditions": "Schemas Draft 2020-12.",
+      "initialData": "contracts/examples/valid e invalid.",
+      "injection": "Validar todos los ejemplos; aplicar reglas de negocio a los válidos.",
+      "expectedStates": "—",
+      "publishedEvents": "—",
+      "physicalEffects": "—",
+      "metrics": "—",
+      "passCriteria": "Todos los válidos pasan schema y reglas de negocio; cada inválido falla solo por la palabra clave y la ruta declaradas en EXPECTED.json; cada ejemplo de negocio pasa el schema y falla exactamente su regla.",
+      "transitions": [],
+      "invariants": [
+        "I06",
+        "I13"
+      ],
+      "status": "EJECUTADA_EN_REVISION"
+    },
+    {
+      "id": "T24",
+      "origin": "rev1",
+      "title": "Contador reiniciado sin cambio de época",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "Época 42 con ciclos 1-5000 registrados.",
+      "initialData": "—",
+      "injection": "El PLC reinicia CycleId a 1 sin incrementar PlcEpoch y continúa hasta 5200; los ciclos 1 a 5000 repiten claves existentes.",
+      "expectedStates": "El ciclo 1 choca con la clave existente: SequenceAnomaly IDENTITY_COLLISION BLOCKING y estación bloqueada. Los ciclos 2 a 5000 también chocan: cada uno queda como SequenceAnomaly con su registro completo, no como detección. Las claves nuevas 5001 a 5200 llegadas durante el bloqueo quedan BLOCKED con STATION_DISABLED.",
+      "publishedEvents": "Ningún CartonDetected ni PrintJobResult para los ciclos en colisión: no son detecciones. CartonDetected y PrintJobResult BLOCKED para 5001 a 5200. Alerta operacional.",
+      "physicalEffects": "Ninguna etiqueta; señal de lista baja. Las cajas en colisión no tienen resultado publicado y la planta las trata según OT-09.",
+      "metrics": "plc_sequence_anomaly_total{type=IDENTITY_COLLISION}.",
+      "passCriteria": "La detección existente nunca se reutiliza; cada colisión queda en SequenceAnomaly; ninguna caja recibe etiqueta durante el bloqueo.",
+      "transitions": [
+        "D05"
+      ],
+      "invariants": [
+        "I08",
+        "I15"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T25",
+      "origin": "rev1",
+      "title": "Contador reiniciado con cambio de época",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "Dos corridas: EpochChangePolicy AUTO_INCREMENT_BY_ONE y REQUIRE_CONFIRMATION.",
+      "initialData": "Época 42.",
+      "injection": "El PLC pasa a época 43 y reinicia CycleId; en una tercera corrida salta a época 45.",
+      "expectedStates": "AUTO: época 43 aceptada y cajas normales. REQUIRE: bloqueo hasta confirmación; los registros retenidos se reingresan con Transport ANOMALY_REINGEST (RECOVERED) y su propio plazo decide. Salto a 45: EPOCH_UNEXPECTED y bloqueo.",
+      "publishedEvents": "Según el caso.",
+      "physicalEffects": "Etiquetas solo en el caso aceptado.",
+      "metrics": "plc_epoch_changes_total; plc_sequence_anomaly_total{type=EPOCH_UNEXPECTED}.",
+      "passCriteria": "PlcEpochHistory registra quién y cómo aceptó cada época; una aceptación manual sin OperatorAction CONFIRM_EPOCH la rechaza el trigger. La huella del EdgeHost coincide byte a byte con source_fingerprint de tools/verify_package.py, incluido un vector con caracteres que los serializadores escapan distinto (+, &, <, >, ', no ASCII).",
+      "transitions": [],
+      "invariants": [
+        "I08"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T26",
+      "origin": "rev1",
+      "title": "Rebote del sensor",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "MinCycleIntervalMs configurado; DetectionTimestamp disponible.",
+      "initialData": "—",
+      "injection": "Dos ciclos separados por menos de MinCycleIntervalMs.",
+      "expectedStates": "Segunda detección BLOCKED con IMPLAUSIBLE_RATE.",
+      "publishedEvents": "PrintJobResult BLOCKED.",
+      "physicalEffects": "Cero bytes para el segundo ciclo.",
+      "metrics": "detections_blocked_total{reason=IMPLAUSIBLE_RATE}.",
+      "passCriteria": "Sin DetectionTimestamp la regla queda desactivada y se documenta.",
+      "transitions": [
+        "D05"
+      ],
+      "invariants": [
+        "I08"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T27",
+      "origin": "rev1",
+      "title": "Dos instancias del EdgeHost",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "Dos procesos con la misma configuración, en el mismo host y en hosts distintos.",
+      "initialData": "Jobs READY.",
+      "injection": "Arrancar la segunda instancia con la primera activa.",
+      "expectedStates": "Mismo host: la segunda no obtiene el lock de SO por impresora. Hosts distintos: no obtiene el lease. En ambos casos 0 envíos y alerta.",
+      "publishedEvents": "—",
+      "physicalEffects": "Un solo transmisor.",
+      "metrics": "printer_owner_conflicts_total.",
+      "passCriteria": "Si la primera muere, los SENDING heredados pasan a UNKNOWN antes de que la segunda envíe.",
+      "transitions": [
+        "J09"
+      ],
+      "invariants": [
+        "I11"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T28",
+      "origin": "rev1",
+      "title": "Coherencia del paquete",
+      "level": "DOC",
+      "profile": "AMBOS",
+      "preconditions": "Python 3 con jsonschema y sqlfluff.",
+      "initialData": "Paquete completo.",
+      "injection": "python3 tools/verify_package.py",
+      "expectedStates": "—",
+      "publishedEvents": "—",
+      "physicalEffects": "—",
+      "metrics": "—",
+      "passCriteria": "Código de salida 0; las propiedades no verificables quedan listadas como pendientes de integración.",
+      "transitions": [],
+      "invariants": [
+        "I12",
+        "I13",
+        "I14"
+      ],
+      "status": "EJECUTADA_EN_REVISION"
+    },
+    {
+      "id": "T29",
+      "origin": "rev2",
+      "title": "Suspensión después del claim",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "Punto de pausa inyectable entre el commit del claim y la escritura.",
+      "initialData": "Job con plazo a 500 ms.",
+      "injection": "Suspender el sender 2 s tras el claim y reanudarlo.",
+      "expectedStates": "La segunda comprobación con reloj monotónico rechaza: intento NOT_SENT, job EXPIRED.",
+      "publishedEvents": "PrintJobResult EXPIRED.",
+      "physicalEffects": "Cero bytes.",
+      "metrics": "presend_check_rejected_total; presend_check_to_write_ms.",
+      "passCriteria": "Se documenta el límite: una pausa entre la comprobación y la llamada de escritura no se puede excluir por software.",
+      "transitions": [
+        "A02",
+        "J08"
+      ],
+      "invariants": [
+        "I04"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T30",
+      "origin": "rev2",
+      "title": "Evento OPC antiguo fuera de orden",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "Marca alta en el ciclo 2000.",
+      "initialData": "El ciclo 1998 nunca se registró.",
+      "injection": "Llega una retransmisión válida del ciclo 1998 con DetectionTimestamp anterior al de 2000.",
+      "expectedStates": "Si su plazo venció: detección EXPIRED con LATE_ARRIVAL. Si sigue vigente: job creado y, como la impresora ya reclamó el ciclo 2000, el job vence con OUT_OF_ORDER (J03). Sin anomalía de reinicio.",
+      "publishedEvents": "CartonDetected y su resultado.",
+      "physicalEffects": "Ninguna impresión de 1998 después de 2000: en print-and-apply cruzaría etiquetas entre cajas.",
+      "metrics": "out_of_order_detections_total.",
+      "passCriteria": "La estación no se bloquea; ningún envío fuera de orden.",
+      "transitions": [
+        "D04",
+        "J03"
+      ],
+      "invariants": [
+        "I08",
+        "I23"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T31",
+      "origin": "rev2",
+      "title": "Etiqueta retenida en la cola del dispositivo",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "Simulador con cola interna; MinConfirmationLevel = APPLIED.",
+      "initialData": "Job READY.",
+      "injection": "Bytes transmitidos antes del plazo; el simulador retiene la etiqueta hasta después de la ventana física. Variante 1: el simulador informa 'no impreso' sin confirmar cancelación. Variante 2: confirma cancelación y cola sin el job.",
+      "expectedStates": "Sin evidencia APPLIED a tiempo: job UNKNOWN con EVIDENCE_WINDOW_ELAPSED. Variante 1: sigue UNKNOWN (un 'no impreso' sin cancelación no basta). Variante 2: FAILED con DEVICE_REPORTED_NOT_PRINTED.",
+      "publishedEvents": "PrintJobResult UNKNOWN o FAILED.",
+      "physicalEffects": "Posible etiqueta fuera de ventana: el sistema no la declara aplicada.",
+      "metrics": "send_to_printed_ms; printed_to_applied_ms.",
+      "passCriteria": "Nunca CONFIRMED sin evidencia del nivel exigido.",
+      "transitions": [
+        "J11",
+        "A06",
+        "J12",
+        "A07"
+      ],
+      "invariants": [
+        "I05"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T32",
+      "origin": "rev2",
+      "title": "Recirculación sin identidad física",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "CartonIdentityMode = CYCLE_ONLY; sin CartonId.",
+      "initialData": "Una caja ya etiquetada.",
+      "injection": "La misma caja genera un segundo ciclo válido.",
+      "expectedStates": "Segunda detección JOB_CREATED y segundo job.",
+      "publishedEvents": "Dos resultados con idempotencyKey distinta.",
+      "physicalEffects": "La caja puede recibir dos etiquetas: comportamiento documentado de la garantía por ciclo.",
+      "metrics": "Sin métrica posible: la recirculación no es observable sin identidad física.",
+      "passCriteria": "La documentación y la matriz de garantías declaran la limitación.",
+      "transitions": [
+        "D02"
+      ],
+      "invariants": [
+        "I07"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T33",
+      "origin": "rev2",
+      "title": "Cambio de configuración con job pendiente",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "Job READY creado con la revisión 7.",
+      "initialData": "Revisión 7: TransitBudgetMs 1500, SendMarginMs 100.",
+      "injection": "Se activa la revisión 8 con TransitBudgetMs 1000 y SendMarginMs 150; se intenta UPDATE sobre la revisión 7.",
+      "expectedStates": "El job conserva ConfigRevisionId 7 y DeadlineAt; el claim usa el plazo efectivo más restrictivo; el UPDATE falla por TR_StationConfigRevision_Immutable.",
+      "publishedEvents": "Resultados con configRevision 7.",
+      "physicalEffects": "Comportamiento determinista.",
+      "metrics": "config_revision_active.",
+      "passCriteria": "Ninguna modificación retroactiva silenciosa.",
+      "transitions": [],
+      "invariants": [
+        "I09",
+        "I17"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T34",
+      "origin": "rev2",
+      "title": "Reimpresión con incertidumbre",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "Job UNKNOWN; caja retenida.",
+      "initialData": "Intento original UNKNOWN.",
+      "injection": "Un operador pide reimprimir: primero sin autorización, después con autorización aprobada por otra persona. Además: insertar un intento ORDINARY sobre el job UNKNOWN; fijar SESSION_CONTEXT EXCEPTION y pasar el job a CONFIRMED sin intento excepcional.",
+      "expectedStates": "Sin autorización: rechazo. Con autorización: R01 APPROVED, R02 EXECUTED, intento EXCEPTIONAL_REPRINT CONFIRMED y job CONFIRMED por X01. El intento ORDINARY y el UPDATE sin intento los rechazan TR_PrintAttempt_Guard y TR_PrintJob_StateMachine.",
+      "publishedEvents": "PrintJobResult CONFIRMED con exceptionalReprint y duplicateRisk ACCEPTED.",
+      "physicalEffects": "Puede existir una segunda etiqueta del job original: riesgo declarado.",
+      "metrics": "exceptional_reprints_total{risk=ACCEPTED}.",
+      "passCriteria": "Ningún job nuevo; mismo LabelSerial; ningún UPDATE UNKNOWN → SENDING aceptado por el trigger.",
+      "transitions": [
+        "R01",
+        "R02",
+        "A01",
+        "X01"
+      ],
+      "invariants": [
+        "I01",
+        "I03",
+        "I18"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T35",
+      "origin": "rev2",
+      "title": "Hueco de secuencia sin timestamps",
+      "level": "FAULT",
+      "profile": "MINIMO",
+      "preconditions": "PLC sin FIFO.",
+      "initialData": "Marca alta en el ciclo 300.",
+      "injection": "Llega el ciclo 310 sin datos de los ciclos 301-309.",
+      "expectedStates": "SequenceGap 301-309 OPEN y después CLOSED_UNRECOVERED con UnrecoveredCount 9.",
+      "publishedEvents": "Ningún CartonDetected ni PrintJobResult para el hueco.",
+      "physicalEffects": "Desconocidos: el sistema no afirma nada sobre esas cajas.",
+      "metrics": "cycles_unobserved_total = 9.",
+      "passCriteria": "Ninguna detección fabricada; ningún plazo calculado sin timestamp.",
+      "transitions": [
+        "G01",
+        "G03"
+      ],
+      "invariants": [
+        "I07",
+        "I16"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T36",
+      "origin": "v1.1",
+      "title": "Agente suspendido después de validar su token",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "Dos agentes en hosts distintos; impresora simulada.",
+      "initialData": "Agente A con token 12.",
+      "injection": "A valida su token y se suspende; vence el lease; B obtiene el token 13 y transmite; A reanuda y transmite. Corrida 1: solo lease en SQL. Corrida 2: aislamiento de red que solo deja pasar al dueño activo.",
+      "expectedStates": "Corrida 1: el simulador registra dos transmisiones (la configuración se declara no permitida). Corrida 2: la escritura de A falla; su intento queda NOT_SENT o UNKNOWN según el punto.",
+      "publishedEvents": "—",
+      "physicalEffects": "Corrida 1: duplicado posible. Corrida 2: un solo transmisor.",
+      "metrics": "printer_owner_conflicts_total.",
+      "passCriteria": "Demuestra que el fencing token en SQL no protege el canal físico.",
+      "transitions": [],
+      "invariants": [
+        "I11",
+        "I12"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T37",
+      "origin": "v1.1",
+      "title": "Desfase de reloj del PLC",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "DeadlineReference = PLC_TIMESTAMP; ClockSkewToleranceMs = 50.",
+      "initialData": "—",
+      "injection": "Adelantar el reloj del PLC 300 ms. Variante: retroceder 2 s el reloj del EdgeHost (ajuste de NTP) con jobs READY.",
+      "expectedStates": "Estación bloqueada con CLOCK_SKEW; detecciones siguientes BLOCKED con STATION_DISABLED. Variante: la divergencia entre UtcNow y Stopwatch supera ClockJumpToleranceMs; estación bloqueada con CLOCK_JUMP; ningún claim se evalúa con el reloj saltado.",
+      "publishedEvents": "PrintJobResult BLOCKED.",
+      "physicalEffects": "Ninguna etiqueta mientras dure el desfase.",
+      "metrics": "clock_skew_ms.",
+      "passCriteria": "Nunca se calcula un plazo ni se evalúa un claim con un reloj fuera de tolerancia.",
+      "transitions": [
+        "D05"
+      ],
+      "invariants": [
+        "I04"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T38",
+      "origin": "v1.1",
+      "title": "Ventana de evidencia vencida y estación sin evidencia",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "Corrida 1: MinConfirmationLevel = PRINTED. Corrida 2: NONE.",
+      "initialData": "Job READY.",
+      "injection": "Transmitir sin que llegue evidencia.",
+      "expectedStates": "Corrida 1: TRANSMITTED → UNKNOWN con EVIDENCE_WINDOW_ELAPSED. Corrida 2: TRANSMITTED terminal.",
+      "publishedEvents": "Corrida 1: UNKNOWN. Corrida 2: TRANSMITTED con final true y sin evidence.",
+      "physicalEffects": "Desconocidos en ambos casos; el resultado no afirma impresión.",
+      "metrics": "evidence_window_elapsed_total.",
+      "passCriteria": "TRANSMITTED nunca se publica como CONFIRMED.",
+      "transitions": [
+        "J11",
+        "A06",
+        "J05"
+      ],
+      "invariants": [
+        "I05"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T39",
+      "origin": "v1.1",
+      "title": "Cancelación autorizada",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "Job READY; otro job con un intento TRANSMITTED.",
+      "initialData": "—",
+      "injection": "Cancelar ambos.",
+      "expectedStates": "El READY pasa a CANCELLED con OperatorAction CANCEL_JOB en LastOperatorActionId; el segundo se rechaza porque tiene MayHaveSent = 1. Un UPDATE a CANCELLED sin OperatorAction lo rechaza el trigger.",
+      "publishedEvents": "PrintJobResult CANCELLED con operatorAction.",
+      "physicalEffects": "Ninguna etiqueta del cancelado.",
+      "metrics": "—",
+      "passCriteria": "La cancelación queda registrada en OperatorAction con identidad y motivo.",
+      "transitions": [
+        "J04"
+      ],
+      "invariants": [
+        "I03",
+        "I24"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T40",
+      "origin": "v1.1",
+      "title": "Reconciliación negativa y cierre operativo",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "Dos jobs UNKNOWN con cajas retenidas.",
+      "initialData": "—",
+      "injection": "Job 1: el dispositivo confirma no impresión, cola vacía, inspección sin etiqueta. Job 2: sin pruebas; la caja se rechaza.",
+      "expectedStates": "Job 1: OperatorAction RECONCILE_NEGATIVE con las tres pruebas, intento NOT_PRINTED (A09) y job FAILED con RECONCILED_NOT_PRINTED. Sin una de las pruebas, CK_OperatorAction_Target rechaza el INSERT. Job 2: OperatorAction CLOSE_UNRESOLVED y job CLOSED_UNRESOLVED con CLOSED_CARTON_REJECTED.",
+      "publishedEvents": "PrintJobResult FAILED y CLOSED_UNRESOLVED, ambos con operatorAction.",
+      "physicalEffects": "Ninguna etiqueta nueva.",
+      "metrics": "unknown_resolution_total{result}.",
+      "passCriteria": "Cada cierre registra persona, motivo y evidencia en OperatorAction; ningún cierre sin ella.",
+      "transitions": [
+        "J16",
+        "A09",
+        "J17"
+      ],
+      "invariants": [
+        "I18",
+        "I24"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T41",
+      "origin": "v1.1",
+      "title": "Autorizaciones revocadas, vencidas y etiqueta dañada",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "Tres autorizaciones aprobadas.",
+      "initialData": "Un job CONFIRMED con etiqueta dañada.",
+      "injection": "Revocar una; dejar vencer otra; ejecutar la tercera (LABEL_DAMAGED) primero sin retiro registrado y después con retiro registrado. Además: usar la autorización de otro job; dirigir una reimpresión a la impresora de línea; confirmar la reimpresión con la lectura VERIFIED anterior del mismo serial.",
+      "expectedStates": "REVOKED y EXPIRED no permiten intento (TX-X no obtiene fila en @executed). LABEL_DAMAGED sin retiro: TR_PrintAttempt_Guard rechaza. Con retiro: EXECUTED en la ManualPrinterId y el job sigue CONFIRMED (X02) solo con una EvidenceObservation que referencia al intento de reemplazo. La autorización de otro job la rechaza la FK compuesta; la impresora de línea, TR_ReprintAuthorization_Guard; la lectura anterior, TR_PrintAttempt_Guard.",
+      "publishedEvents": "PrintJobResult CONFIRMED con resultVersion mayor y exceptionalReprint.",
+      "physicalEffects": "Una etiqueta de reemplazo impresa fuera de la línea; la original retirada antes de reimprimir.",
+      "metrics": "exceptional_reprints_total{risk=REPLACES_EXISTING_LABEL}.",
+      "passCriteria": "Ninguna autorización se usa dos veces (UX_PrintAttempt_Authorization).",
+      "transitions": [
+        "R03",
+        "R04",
+        "X02"
+      ],
+      "invariants": [
+        "I18"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T42",
+      "origin": "revisión independiente",
+      "title": "Envío fuera de orden",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "Print-and-apply simulado que aplica en orden de impresión; MaxAutoAttempts = 3.",
+      "initialData": "Jobs N y N+1 READY en la misma impresora.",
+      "injection": "El primer intento de N falla antes de escribir (RETRY_WAIT); N+1 se reclama y transmite; vence el backoff de N.",
+      "expectedStates": "N+1 TRANSMITTED; PrinterSendOrder en N+1; el claim de N no obtiene fila y N termina EXPIRED con OUT_OF_ORDER (J14).",
+      "publishedEvents": "PrintJobResult EXPIRED con OUT_OF_ORDER para N.",
+      "physicalEffects": "Ninguna etiqueta de N después de la de N+1.",
+      "metrics": "jobs_expired_total{reason=OUT_OF_ORDER}.",
+      "passCriteria": "Ningún envío con un ciclo anterior al último reclamado por la impresora; un reintento del mismo job sigue permitido.",
+      "transitions": [
+        "J06",
+        "J14"
+      ],
+      "invariants": [
+        "I04",
+        "I23"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T43",
+      "origin": "revisión independiente",
+      "title": "Reimpresión excepcional sin confirmar",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "Job EXPIRED con DEADLINE_PASSED; caja retenida; ManualPrinterId configurada.",
+      "initialData": "Autorización EXPIRED_CARTON_HELD con DuplicateRisk NONE_PROVEN.",
+      "injection": "El sender de la impresora manual ejecuta TX-X y transmite; no llega evidencia en EvidenceWindowMs. Variante: el sender muere durante la escritura y al arrancar TX-R0 encuentra el intento abierto. Después se intenta otra autorización NONE_PROVEN. Más tarde llega la inspección que lee el serial correcto y referencia al intento.",
+      "expectedStates": "Intento excepcional UNKNOWN (A06, o A04 en la variante) y, en la misma transacción, job UNKNOWN con EXCEPTIONAL_REPRINT_UNRESOLVED (X03). La segunda autorización con NONE_PROVEN la rechaza el CHECK (estado previo UNKNOWN exige ACCEPTED). La inspección tardía confirma el intento (A08) y el job (X01).",
+      "publishedEvents": "PrintJobResult UNKNOWN final false con exceptionalReprint; después CONFIRMED con resultVersion mayor.",
+      "physicalEffects": "Una etiqueta de reimpresión en la caja retenida; ninguna en la línea.",
+      "metrics": "exceptional_reprints_total{result=UNRESOLVED}.",
+      "passCriteria": "El job nunca queda en un estado que afirme que no hay etiqueta mientras una reimpresión pudo imprimir.",
+      "transitions": [
+        "X03",
+        "A06",
+        "A08",
+        "X01"
+      ],
+      "invariants": [
+        "I18",
+        "I25"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T44",
+      "origin": "revisión independiente",
+      "title": "Evidencia contradictoria después de CONFIRMED",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "MinConfirmationLevel = APPLIED; escáner aguas abajo correlacionado por ciclo.",
+      "initialData": "Job A CONFIRMED con evidencia APPLIED.",
+      "injection": "El escáner lee en la caja del ciclo de A el LabelSerial de B. Después: devolver A a CONFIRMED con el intento ordinario ya confirmado; cambiar solo Reason a WRITE_INTERRUPTED y reintentar J15; fijar Reason EXCEPTIONAL_REPRINT_UNRESOLVED para habilitar X01.",
+      "expectedStates": "EvidenceObservation registrada; job A UNKNOWN con SERIAL_MISMATCH (J18). Los tres intentos posteriores los rechaza TR_PrintJob_StateMachine: tras SERIAL_MISMATCH no hay reconciliación automática y Reason no cambia fuera de una transición sembrada.",
+      "publishedEvents": "PrintJobResult UNKNOWN final false con resultVersion mayor y la lectura contradictoria.",
+      "physicalEffects": "Mal etiquetado detectado: incidente.",
+      "metrics": "serial_mismatch_total; alerta inmediata.",
+      "passCriteria": "Un resultado CONFIRMED final se reemplaza por una versión mayor, nunca en silencio.",
+      "transitions": [
+        "J18"
+      ],
+      "invariants": [
+        "I06",
+        "I25"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T45",
+      "origin": "revisión independiente",
+      "title": "Registros sin cota de latencia con GATEWAY_RECEIPT",
+      "level": "FAULT",
+      "profile": "AMBOS",
+      "preconditions": "DeadlineReference = GATEWAY_RECEIPT; PLC sin DetectionTimestamp.",
+      "initialData": "Marca alta en el ciclo 700.",
+      "injection": "Tras una desconexión llegan el ciclo 701 por READ, el 702 por REPUBLISH, el 703 en vivo con Overflow y un registro retenido reingresado (ANOMALY_REINGEST). Al recrear la suscripción, su primera notificación trae el ciclo 730 (valor actual). Después llega en vivo un ciclo que abre un hueco, y uno con CycleId menor que la marca alta, clave nueva y sin timestamp.",
+      "expectedStates": "701, 702, 703, el reingreso y la primera notificación (registrada como READ): EXPIRED con LATE_ARRIVAL y DeadlineAt = ReceivedAt. El ciclo que abre un hueco: también LATE_ARRIVAL. Un intento de crear job lo rechaza CK_CartonDetection_GatewayLive. El ciclo menor: AMBIGUOUS_DECREASE y detección BLOCKED con SEQUENCE_ANOMALY.",
+      "publishedEvents": "CartonDetected y PrintJobResult EXPIRED o BLOCKED sin job.",
+      "physicalEffects": "Cero bytes para esos ciclos.",
+      "metrics": "detections_expired_total{reason=LATE_ARRIVAL,transport}; plc_sequence_anomaly_total{type=AMBIGUOUS_DECREASE}.",
+      "passCriteria": "Ningún plazo fabricado para un registro sin cota de latencia.",
+      "transitions": [
+        "D04",
+        "D05"
+      ],
+      "invariants": [
+        "I08",
+        "I26"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T46",
+      "origin": "revisión independiente",
+      "title": "Estación bloqueada mientras se espera el ERP",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "Detección WAITING_ERP con plazo vigente.",
+      "initialData": "—",
+      "injection": "Bloquear la estación (por ejemplo IDENTITY_COLLISION en otro ciclo) y después entregar el snapshot.",
+      "expectedStates": "Detección BLOCKED con STATION_DISABLED (D08), no EXPIRED con ERP_UNAVAILABLE.",
+      "publishedEvents": "PrintJobResult BLOCKED sin job.",
+      "physicalEffects": "Ninguna etiqueta.",
+      "metrics": "detections_blocked_total{reason=STATION_DISABLED}.",
+      "passCriteria": "El motivo publicado es el real.",
+      "transitions": [
+        "D08"
+      ],
+      "invariants": [
+        "I10"
+      ],
+      "status": "NO_EJECUTADA"
+    },
+    {
+      "id": "T47",
+      "origin": "revisión independiente",
+      "title": "DDL y sentencias de referencia en SQL Server",
+      "level": "INTEGRATION",
+      "profile": "AMBOS",
+      "preconditions": "SQL Server 2022 en Testcontainers; conexión con ANSI_NULLS y QUOTED_IDENTIFIER en ON.",
+      "initialData": "Base vacía; después datos de un escenario completo.",
+      "injection": "Ejecutar el DDL y la semilla; ejecutar cada sentencia de database/sqlserver_operations_reference.sql con 0 filas afectadas y con filas afectadas; intentar cada transición prohibida y cada transición manual, excepcional o de corrección sin su respaldo o con un respaldo anterior; cambiar solo Reason; retroceder PrinterSendOrder; editar PlcEpochHistory; desbloquear una estación sin OperatorAction.",
+      "expectedStates": "El DDL se crea sin error (incluidos los índices filtrados); ninguna sentencia de 0 filas lanza excepción; ninguna sentencia falla con Msg 334; todo intento indebido falla con su error (51010 a 51032).",
+      "publishedEvents": "—",
+      "physicalEffects": "—",
+      "metrics": "—",
+      "passCriteria": "Salida de la ejecución adjunta al PR; ninguna regla de la sección 6 del documento principal queda sin prueba negativa.",
+      "transitions": [],
+      "invariants": [
+        "I03",
+        "I09",
+        "I24"
+      ],
+      "status": "NO_EJECUTADA"
+    }
+  ]
+}

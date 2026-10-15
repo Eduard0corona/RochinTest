@@ -1,0 +1,12 @@
+flowchart LR
+    F["Falla"] --> B{"Componente"}
+    B -- "RabbitMQ" --> B1["El Outbox acumula<br/>republica con el mismo EventId"]
+    B -- "SQL, perfil mínimo" --> B2["Falla cerrada · LabelingReady falso<br/>al volver: SequenceGap"]
+    B -- "SQL, perfil extendido" --> B3["Journal y AckCycleId<br/>replay: lo vencido EXPIRED"]
+    B -- "ERP" --> B4["Caché válida o WAITING_ERP<br/>después EXPIRED"]
+    B -- "Impresora antes de escribir" --> B5["NOT_SENT<br/>RETRY_WAIT con plazo"]
+    B -- "Impresora tras escribir" --> B6["UNKNOWN<br/>sin reenvío"]
+    B -- "Reinicio del servicio" --> B7["Lock y lease · TX-R0 SENDING a UNKNOWN<br/>barrido · suscripción"]
+    B -- "OPC UA" --> B8["Republish · huecos · FIFO si existe<br/>con GATEWAY_RECEIPT, lo recuperado sin plazo"]
+    B -- "Reloj" --> B9["CLOCK_SKEW o CLOCK_JUMP<br/>estación bloqueada"]
+    B -- "Evidencia contradictoria" --> B10["J18 · CONFIRMED a UNKNOWN<br/>incidente de calidad"]
