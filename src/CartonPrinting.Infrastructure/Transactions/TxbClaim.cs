@@ -37,7 +37,24 @@ public enum ClaimRejection
 /// </summary>
 public sealed class TxbClaim(SqlDb db)
 {
-    public Task<ClaimResult> ExecuteAsync(ClaimRequest req, CancellationToken ct) =>
+    /// <summary>
+    /// Un claim que pierde la carrera contra otro intento SENDING de la misma impresora termina en 2601
+    /// de UX_PrintAttempt_PrinterInFlight: XACT_ABORT revierte la transacción entera (también el paso a
+    /// SENDING del job) y el resultado es "sin claim", como con 0 filas.
+    /// </summary>
+    public async Task<ClaimResult> ExecuteAsync(ClaimRequest req, CancellationToken ct)
+    {
+        try
+        {
+            return await ClaimAsync(req, ct);
+        }
+        catch (SqlException ex) when (ex.Number is 2601 or 2627 && ex.Message.Contains("UX_PrintAttempt_PrinterInFlight", StringComparison.Ordinal))
+        {
+            return new ClaimResult(false, req.AttemptId, 0, 0);
+        }
+    }
+
+    private Task<ClaimResult> ClaimAsync(ClaimRequest req, CancellationToken ct) =>
         db.InTransactionAsync(async (conn, tx) =>
         {
             await using var cmd = conn.Command(tx, """
@@ -72,10 +89,10 @@ public sealed class TxbClaim(SqlDb db)
                       SELECT 1 FROM dbo.PrinterLease AS pl
                       WHERE pl.PrinterId = pj.PrinterId AND pl.OwnerInstanceId = @OwnerInstanceId
                         AND pl.FencingToken = @LeaseToken AND pl.LeaseUntil > @EdgeNowUtc)
-                  -- J02: ningún otro intento SENDING en la impresora (UX_PrintAttempt_PrinterInFlight lo
-                  -- garantiza; la guarda evita que el claim termine en 2601 en lugar de 0 filas).
+                  -- J02: ningún otro intento SENDING ya confirmado en la impresora. Sin bloqueo de rango: la
+                  -- barrera es UX_PrintAttempt_PrinterInFlight y una carrera perdida se trata como 0 filas.
                   AND NOT EXISTS (
-                      SELECT 1 FROM dbo.PrintAttempt AS inflight WITH (UPDLOCK, HOLDLOCK)
+                      SELECT 1 FROM dbo.PrintAttempt AS inflight
                       WHERE inflight.PrinterId = pj.PrinterId AND inflight.Outcome = 'SENDING');
 
                 DECLARE @attemptNumber INT = NULL;

@@ -185,11 +185,13 @@ El revisor notó archivos sin seguimiento que aparecían en el árbol durante su
 4. **Validación de contratos antes del Outbox.** Un evento que no cumple su schema o sus reglas de negocio revierte la transacción: emitir un contrato inválido es un defecto. Única tolerancia: SI-05.
 5. **SI-04 y SI-05** (ver `docs/SPEC_ISSUES.md`): `CARTON_ID_REQUIRED` sin `CartonId` queda `BLOCKED` con `INCOHERENT_SNAPSHOT` (falla cerrada, pendiente de la persona); un registro `GATEWAY_RECEIPT` en vivo que abre un hueco se registra sin plazo según la máquina de estados, aunque la regla del verificador no vea el hueco.
 6. **Plazo efectivo sin referencia activa.** Si la revisión activa no puede dar un plazo confiable para un registro (por ejemplo, cambió a `PLC_TIMESTAMP` y el registro no trae `DetectionTimestamp`), el plazo efectivo es su recepción: el job ya no se envía. Es la lectura más restrictiva de "nunca más permisivo que el congelado". Registrado como SI-09.
-7. **J18 solo con una lectura posterior al primer claim.** El trigger no lo exige para `CORRECTION` (SI-07); TX-D sí, igual que I06 lo exige para confirmar.
-8. **El claim no termina en 2601.** La guarda de TX-B excluye una impresora con otro intento en `SENDING` (`UX_PrintAttempt_PrinterInFlight` sigue siendo la barrera); el rechazo se diagnostica como `PrinterBusy`.
+7. **J18 con la regla del ADR 0016.** La condición propia "lectura posterior al primer claim" que agregó la primera corrección se retiró en la segunda revisión (rodeaba un defecto de clase B). La persona decidió endurecer el trigger (SI-07, spec 1.1.3): la lectura que corrige tiene que ser posterior al último claim y a la observación que confirmó; TX-D aplica la misma regla.
+8. **El claim no termina en excepción con otro intento en vuelo.** La guarda de TX-B excluye, sin bloqueo de rango, una impresora con otro intento `SENDING` ya confirmado; si dos claims de la misma impresora se cruzan, el 2601 de `UX_PrintAttempt_PrinterInFlight` (la barrera) revierte la transacción y el resultado es "sin claim". Así un claim de una impresora no bloquea el de otra.
 9. **TX-C lee el nivel mínimo y la ventana de evidencia congelados dentro de la transacción** (del job para un intento ordinario, de la autorización para uno excepcional); el sender no los pasa.
 10. **Payload de la reimpresión.** Es el del job (mismo `LabelSerial`) y, con `ReprintMarker`, una marca visible antes del cierre de la etiqueta; el intento registra el SHA-256 de ese payload en `AttemptPayloadHash` (I09).
-11. **D07 en TX-E y G02 en el barrido** (SI-06): un snapshot tardío vence la detección sin crear el job; el barrido cierra como `RECOVERED` un hueco que dos TX-A concurrentes dejaron abierto por RCSI.
+11. **D07 solo en TX-S; G02 también en el barrido como rama defensiva** (SI-06): un snapshot tardío deja la detección en `WAITING_ERP` sin job y el barrido aplica D07; el barrido cierra como `RECOVERED` un hueco vencido con todos sus ciclos registrados.
+12. **Con nivel congelado NONE, TRANSMITTED es terminal también para TX-D:** una lectura contradictoria o un "no impreso" se registran sin transición (guardas de A06, A07, J11 y J12).
+13. **Una observación que referencia un intento de otro job no tiene efecto**, igual que una con el `PrintJobId` de otro job.
 
 ### Comandos y resultados
 
@@ -212,7 +214,7 @@ Durante el desarrollo, dos pruebas fallaron por errores de la prueba que el sist
 
 ### Pruebas de la fase
 
-- **T01, T02, T10, T14 y T47: PASA** (detalle en `docs/TEST_STATUS.md`).
+- **T01, T02, T10, T14 y T47: PASA** (detalle en `docs/TEST_STATUS.md`). T47 pasó a cumplirse por completo después del ADR 0016 (SI-07).
 - T47 ejecuta, además del criterio del catálogo, una prueba que lee el DDL y la referencia, extrae los 33 códigos `THROW` y exige que cada uno tenga su prueba negativa.
 
 ### Revisión independiente
@@ -221,7 +223,7 @@ Subagente `revisor-adversarial` sobre `feat/sql-idempotency` (2026-10-14). 1 ALT
 
 | Hallazgo | Severidad | Resolución |
 | --- | --- | --- |
-| 1: una lectura contradictoria después de X01 (job confirmado por reimpresión) no aplicaba J18 | Alta | TX-D evalúa la contradicción antes de elegir el intento: X03 si referencia la reimpresión en curso, J11 si el job está en `TRANSMITTED`, J18 si está `CONFIRMED` (por cualquier vía) o `UNKNOWN` por otra causa; J18 limpia `ConfirmedByExceptionalReprint`. Prueba con y sin `AttemptId` |
+| 1: una lectura contradictoria después de X01 (job confirmado por reimpresión) no aplicaba J18 | Alta | TX-D evalúa la contradicción antes de elegir el intento: X03 si referencia la reimpresión en curso, J11 si el job está en `TRANSMITTED`, J18 si está `CONFIRMED` (por cualquier vía) o `UNKNOWN` por otra causa; J18 limpia `ConfirmedByExceptionalReprint`. Prueba con y sin `AttemptId` (la de "con `AttemptId`" se agregó en la segunda revisión) |
 | 2: una lectura `VERIFIED` de un ciclo con el `PrintJobId` de otro job podía confirmar a ese otro | Media | La evidencia correlacionada al ciclo resuelve el job por el ciclo; un `PrintJobId` que no coincide deja la observación registrada sin efecto |
 | 3: un registro `GATEWAY_RECEIPT` no en vivo sin `WorkOrderId` terminaba en 547 (`CK_CartonDetection_WorkOrder`) | Media | El registro incompleto se clasifica antes que el plazo: `BLOCKED` con `INCOHERENT_SNAPSHOT` (salvo que la secuencia ya lo bloqueara) |
 | 4: `ReprintMarker` se ignoraba y el intento excepcional repetía el hash del job | Media | `ReprintPayload.Render` y `AttemptPayloadHash` propio (decisión 10) |
@@ -232,7 +234,7 @@ Subagente `revisor-adversarial` sobre `feat/sql-idempotency` (2026-10-14). 1 ALT
 | 9: TX-C confiaba en el nivel y la ventana que pasaba el llamador | Baja | Decisión 9 |
 | 10: la tolerancia de SI-05 no tenía pruebas | Baja | `OutboxWriter.ToleratedRule` y cuatro pruebas unitarias: tolerada solo con hueco, `GATEWAY_RECEIPT` y `DeadlineAt = ReceivedAt`; nunca encubre otra regla |
 | 11: T14 no decía dónde vive el efecto "conserva la versión mayor" | Baja | Nota en `docs/TEST_STATUS.md`: es el efecto del consumidor de prueba |
-| 12: faltaban CHANGELOG, lista de lo no verificado y trazas con `correlationId` | Baja | Entrada en `CHANGELOG.md`; secciones siguientes; actividades `carton.register`, `carton.claim` y `outbox.publish` con `idempotencyKey`, `correlationId`, `printJobId` y `attemptId` (`TracingTests`) |
+| 12: faltaban CHANGELOG, lista de lo no verificado y trazas con `correlationId` | Baja | Entrada en `CHANGELOG.md`; secciones siguientes; actividades `carton.register` y `carton.claim` con `idempotencyKey`, `correlationId`, `printJobId` y `attemptId` (`TracingTests`), y `outbox.publish` con `eventId` e `idempotencyKey` (sin prueba: requiere RabbitMQ) |
 | 13: D07 en TX-E y G02 en el barrido sin documentar | Baja | Comentarios en el código y SI-06 |
 | 14: la decisión 6 no estaba registrada; SI-04 no decía que el camino quedó detenido | Baja | SI-09; SI-04 reformulado (camino en falla cerrada hasta la decisión); riesgo de la Fase 4 abajo |
 
@@ -253,6 +255,67 @@ Resultado: trazabilidad OK, 0 errores
 Compuerta en verde.
 ```
 
+### Segunda revisión independiente
+
+Subagente `revisor-adversarial` sobre una copia limpia de `20e3194` (2026-10-14), obligatoria porque se había corregido un hallazgo ALTA. Ejecutó la compuerta (128 y 74 pruebas en verde), mutaciones (al restaurar el código anterior fallan 7 de las 8 pruebas de regresión) y siete sondas propias contra SQL Server real. Sin hallazgos ALTA; 3 MEDIA y 7 BAJA:
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| M1: la guarda propia de SI-07 no protegía el caso que la motivó y comparaba relojes de pared | Media | Retirada (decisión 7): J18 sigue la máquina de estados; la reaplicación diferida de evidencia queda detenida hasta la decisión sobre SI-07 |
+| M2: T47 figuraba como PASA con un subcriterio que el DDL no puede cumplir | Media | T47 `FALLA` en ese punto en `docs/TEST_STATUS.md`; `Si_07_documents_that_the_trigger_accepts_…` fija el comportamiento del trigger; SI-07 menciona T47 |
+| M3: con nivel congelado NONE, una contradicción o un "no impreso" lanzaban 51012 | Media | Decisión 12 y `Review2_m3_…` |
+| B1: el bloqueo de rango de la guarda `PrinterBusy` acoplaba claims de impresoras distintas | Baja | Decisión 8 (sin `HOLDLOCK`; carrera perdida = sin claim) y `Review2_b1_…` (8 rondas de claims cruzados, sin excepción) |
+| B2: la marca de reimpresión caía sobre el código de barras | Baja | `^FO40,480`, debajo de las barras y de su interpretación |
+| B3: ninguna prueba detectaba que TX-C usara la ventana de la revisión en un intento excepcional | Baja | `Tx_s_elapsed_window_…` comprueba `EvidenceDeadlineAt` con la ventana de la autorización y que no vence con la de la revisión |
+| B4: SI-06 mal clasificado (D07 en TX-E era una elección) y la carrera de G02 sin evidencia | Baja | TX-E ya no aplica D07 (decisión 11); SI-06 reformulado como rama defensiva |
+| B5: el interino de SI-04 pasaba por encima de D04 | Baja | Solo la orden ausente fuerza BLOCKED antes del plazo; el interino de SI-04 va después (`Review2_b5_…`); SI-04 reformulado |
+| B6: afirmaciones excesivas (prueba "con AttemptId", `correlationId` en `outbox.publish`, `GapToleranceTests` como T45) | Baja | Prueba con `AttemptId` agregada; texto de trazas corregido; `GapToleranceTests` sin Trait de T45 |
+| B7: una contradicción con el `AttemptId` de otro job aplicaba J11 o J18 | Baja | Decisión 13 y `Review2_b7_…` |
+
+Ninguna corrección fue de severidad ALTA: según el prompt, no hace falta una tercera revisión.
+
+Compuerta completa después de las correcciones, 2026-10-14 21:00 (`powershell -File build/ci.ps1`):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   128, Omitido:     0, Total:   128, Duración: 20 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    79, Omitido:     0, Total:    79, Duración: 1 m 42 s - CartonPrinting.IntegrationTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 61 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
+### Decisiones de la persona (2026-10-14)
+
+Con la compuerta en verde, la fase se detuvo (sección 6 del prompt) porque T47 no se cumplía por completo (SI-07, clase B) y había decisiones pendientes. Respuestas:
+
+1. **SI-07:** endurecer el trigger. ADR 0016 y commit `spec: SI-07 …` (`5eb9695`): guarda de J18, mecanismo de I25, `TR_PrintJob_StateMachine` y sección 11; artefactos regenerados y `verify_package.py` en verde. TX-D aplica la misma regla (`e012c23`). Dos pruebas negativas de T47 que fallan con el DDL anterior.
+2. **SI-01:** edición aprobada; commit `spec: SI-01 …` (`82b1e5b`).
+3. **SI-04, SI-05, SI-08 y SI-09:** se mantienen los interinos de falla cerrada y se sigue con la Fase 2.
+
+`build_examples.py` regenera `result-eventid-not-deterministic.json` con un UUID aleatorio en cada corrida; ese cambio sin contenido se descartó (`git checkout`) antes de recalcular los checksums.
+
+Compuerta de cierre, 2026-10-14 21:48 (`powershell -File build/ci.ps1`), con la especificación 1.1.3:
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   128, Omitido:     0, Total:   128, Duración: 18 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    80, Omitido:     0, Total:    80, Duración: 1 m 29 s - CartonPrinting.IntegrationTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 62 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
+Las correcciones posteriores a la segunda revisión fueron el cambio de especificación decidido por la persona y sus pruebas; ninguna corrigió un hallazgo ALTA, así que no se pidió una tercera revisión. La base de datos local de Docker Compose tiene aplicado el DDL anterior: el registro de migraciones (`migrations.AppliedScript`) rechaza el nuevo `sqlserver_schema.sql` y hay que recrearla (`docker compose down -v`). Las pruebas usan bases nuevas y no se ven afectadas.
+
 ### Lo que no se verificó
 
 - T01 mide la transmisión con un arnés de sender y una impresora en memoria; el sender real, el lock de sistema operativo y el simulador TCP llegan en la Fase 4, donde T01 se repite.
@@ -263,6 +326,6 @@ Compuerta en verde.
 
 ### Riesgos
 
-- **Evidencia registrada y no aplicada.** TX-D registra la observación en su propia transacción y la aplica en otra. Si el proceso muere entre las dos, la observación queda sin aplicar. La Fase 4 tiene que reaplicar al arrancar las observaciones sin efecto posteriores al claim (J18 ya ignora las anteriores, SI-07).
+- **Evidencia registrada y no aplicada.** TX-D registra la observación en su propia transacción y la aplica en otra. Si el proceso muere entre las dos, la observación queda sin aplicar. La Fase 4 la reaplica al arrancar; con el ADR 0016, una lectura anterior al estado vigente queda sin efecto en el trigger y en TX-D.
 - Las pruebas de concurrencia dependen del planificador de SQL Server; T02 se repite en cinco rondas y con un bloqueo retenido explícito.
-- SI-04, SI-07, SI-08 y SI-09 esperan una decisión de la persona; mientras tanto, cada camino queda en su variante más restrictiva.
+- SI-04, SI-05, SI-08 y SI-09 quedan con su interino de falla cerrada, por decisión de la persona (2026-10-14).

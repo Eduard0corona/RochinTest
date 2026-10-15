@@ -1187,7 +1187,8 @@ BEGIN
                                   SELECT 1 FROM dbo.PrintAttempt AS p2
                                   WHERE p2.PrintJobId = pa.PrintJobId AND p2.Kind = 'EXCEPTIONAL_REPRINT'
                                     AND p2.AttemptNumber > pa.AttemptNumber)))
-                    -- CORRECTION: una lectura VERIFIED del ciclo del job con otro serial.
+                    -- CORRECTION: una lectura VERIFIED del ciclo del job con otro serial, posterior al
+                    -- último claim del job y a la observación que lo confirmó, si la hay (ADR 0016).
                     OR (t.Kind = 'CORRECTION' AND @kind IS NOT NULL AND @kind = 'CORRECTION'
                         AND c.ExceptionalPointerChanged = 0 AND c.OperatorPointerChanged = 0
                         AND i.ConfirmedByExceptionalReprint = 0
@@ -1197,7 +1198,13 @@ BEGIN
                             WHERE eo.SiteId = i.SiteId AND eo.StationId = i.StationId
                               AND eo.PlcEpoch = i.PlcEpoch AND eo.CycleId = i.CycleId
                               AND eo.CorrelatedTo = 'CYCLE' AND eo.EvidenceLevel = 'VERIFIED'
-                              AND eo.ReadSerial IS NOT NULL AND eo.ReadSerial <> i.LabelSerial))
+                              AND eo.ReadSerial IS NOT NULL AND eo.ReadSerial <> i.LabelSerial
+                              AND eo.ReceivedAt >= (SELECT MAX(lc.ClaimedAt) FROM dbo.PrintAttempt AS lc
+                                                    WHERE lc.PrintJobId = i.PrintJobId)
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM dbo.PrintAttempt AS cf
+                                  WHERE cf.PrintJobId = i.PrintJobId AND cf.ConfirmingObservationId IS NOT NULL
+                                    AND cf.ConfirmingObservationId >= eo.ObservationId)))
                 )))
     BEGIN
         THROW 51012, N'Transición de PrintJob no permitida o sin el respaldo que exige su modo (contracts/state-machine.json).', 1;

@@ -10,7 +10,8 @@ namespace CartonPrinting.Infrastructure.Transactions;
 /// </summary>
 public static class ReprintPayload
 {
-    public const string MarkerLine = "^FO40,400^A0N,28,28^FDREIMPRESION^FS\n";
+    // Debajo del código de barras (filas 340 a 420) y de su línea de interpretación: no tapa las barras.
+    public const string MarkerLine = "^FO40,480^A0N,28,28^FDREIMPRESION^FS\n";
 
     public static string Render(string jobPayload, bool marker)
     {
