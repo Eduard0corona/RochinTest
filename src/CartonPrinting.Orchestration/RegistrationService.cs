@@ -66,12 +66,12 @@ public sealed class RegistrationService(
         var deadline = DeadlinePolicy.Compute(revision, record.DetectionTimestamp, record.ReceivedAt, record.Transport, record.QueueOverflow,
             opensGap: sequence.Gap is not null);
 
-        if (record.WorkOrderId is null || (revision.RequiresCartonId && record.CartonId is null))
+        if (!record.Coherent || record.WorkOrderId is null || (revision.RequiresCartonId && record.CartonId is null))
         {
-            // Registro incompleto: la orden es obligatoria en el contrato con el PLC y, con
-            // CARTON_ID_REQUIRED, la identidad física también (SI-04). Va antes que cualquier otra
-            // clasificación terminal: una detección sin orden solo puede quedar BLOCKED
-            // (CK_CartonDetection_WorkOrder), salvo que la secuencia ya la bloqueara por otra causa.
+            // Registro incoherente (campos de ciclos distintos) o incompleto: la orden es obligatoria en
+            // el contrato con el PLC y, con CARTON_ID_REQUIRED, la identidad física también (SI-04). Va
+            // antes que cualquier otra clasificación terminal: una detección sin orden solo puede quedar
+            // BLOCKED (CK_CartonDetection_WorkOrder), salvo que la secuencia ya la bloqueara por otra causa.
             if (terminalStatus != DetectionStatus.Blocked)
             {
                 (terminalStatus, terminalReason) = (DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot);

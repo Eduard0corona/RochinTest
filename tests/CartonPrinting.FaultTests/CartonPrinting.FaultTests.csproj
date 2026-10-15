@@ -29,6 +29,7 @@
   <ItemGroup>
     <Compile Include="..\Shared\*.cs" LinkBase="Shared" />
     <Compile Include="..\Shared\Integration\*.cs" LinkBase="Shared\Integration" />
+    <Compile Include="..\Shared\Opc\*.cs" LinkBase="Shared\Opc" />
   </ItemGroup>
 
 </Project>

@@ -250,8 +250,10 @@ public sealed class StationScenario
     public Task<IReadOnlyList<AttemptRecord>> AttemptsAsync(Guid jobId, CancellationToken ct = default) =>
         Sql.ReadAsync(conn => JobQueries.GetAttemptsAsync(conn, null, jobId, ct), ct);
 
-    public Task<DetectionRecord?> DetectionAsync(ulong cycleId, CancellationToken ct = default) =>
-        Sql.ReadAsync(conn => DetectionQueries.GetByIdentityAsync(conn, null, new CycleIdentity(SiteId, StationId, Epoch, cycleId), ct), ct);
+    public Task<DetectionRecord?> DetectionAsync(ulong cycleId, CancellationToken ct = default) => DetectionInEpochAsync(Epoch, cycleId, ct);
+
+    public Task<DetectionRecord?> DetectionInEpochAsync(long epoch, ulong cycleId, CancellationToken ct = default) =>
+        Sql.ReadAsync(conn => DetectionQueries.GetByIdentityAsync(conn, null, new CycleIdentity(SiteId, StationId, epoch, cycleId), ct), ct);
 
     /// <summary>Autorización de reimpresión aprobada por dos personas hacia la impresora manual.</summary>
     public Task<long> ApproveReprintAsync(Guid jobId, string priorStatus, string reason, string risk, CancellationToken ct = default,

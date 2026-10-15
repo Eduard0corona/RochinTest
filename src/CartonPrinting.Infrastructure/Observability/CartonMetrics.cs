@@ -104,6 +104,7 @@ public static class MetricNames
     public const string PlcSequenceAnomaly = "plc_sequence_anomaly_total";
     public const string CyclesUnobserved = "cycles_unobserved_total";
     public const string OpcReconnect = "opc_reconnect_total";
+    public const string OpcRecordsRejected = "opc_records_rejected_total";
     public const string OutOfOrderDetections = "out_of_order_detections_total";
     public const string PresendCheckRejected = "presend_check_rejected_total";
     public const string EvidenceWindowElapsed = "evidence_window_elapsed_total";

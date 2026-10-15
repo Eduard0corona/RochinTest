@@ -49,6 +49,18 @@ public sealed class OpcIngestOptions
 }
 
 /// <summary>
+/// Fuente de ciclos de una estación: entrega notificaciones crudas del registro latched en un canal
+/// acotado. La implementación de producción es el cliente OPC UA real; en las pruebas habla con el PLC
+/// simulado (servidor OPC UA en proceso).
+/// </summary>
+public interface ICycleSource : IAsyncDisposable
+{
+    bool Connected { get; }
+
+    Task StartAsync(ChannelWriter<RawNotification> writer, CancellationToken ct);
+}
+
+/// <summary>
 /// Notificación cruda: el callback OPC solo valida el StatusCode, sella la recepción (UTC del EdgeHost
 /// y marca monotónica), clasifica el transporte y encola. No toca SQL, ERP ni impresora.
 /// </summary>
@@ -78,7 +90,7 @@ public sealed record RawNotification(
 /// </list>
 /// La clasificación es conservadora: ante la duda un registro se trata como recuperado, nunca como vivo.
 /// </summary>
-public sealed class OpcUaCycleSource : IAsyncDisposable
+public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
 {
     private static readonly ITelemetryContext Telemetry = DefaultTelemetry.Create(_ => { });
 

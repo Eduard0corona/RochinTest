@@ -18,6 +18,7 @@
     <ProjectReference Include="..\..\src\CartonPrinting.Contracts\CartonPrinting.Contracts.csproj" />
     <ProjectReference Include="..\..\src\CartonPrinting.Infrastructure\CartonPrinting.Infrastructure.csproj" />
     <ProjectReference Include="..\..\src\CartonPrinting.Orchestration\CartonPrinting.Orchestration.csproj" />
+    <ProjectReference Include="..\..\src\CartonPrinting.OpcIngest\CartonPrinting.OpcIngest.csproj" />
   </ItemGroup>
 
   <ItemGroup>

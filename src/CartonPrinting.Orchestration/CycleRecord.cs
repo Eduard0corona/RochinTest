@@ -33,6 +33,12 @@ public sealed record CycleRecord
     public DateTime? OpcSourceTimestamp { get; init; }
     public DateTime? OpcServerTimestamp { get; init; }
 
+    /// <summary>
+    /// false si los campos del registro no corresponden al mismo ciclo (la comprobación de coherencia
+    /// del registro latched falló): la detección queda BLOCKED con INCOHERENT_SNAPSHOT (ADR 0001, T13).
+    /// </summary>
+    public bool Coherent { get; init; } = true;
+
     public CycleIdentity Identity => new(SiteId, StationId, PlcEpoch, CycleId);
 
     /// <summary>Huella de origen: solo valores latched; nada de lo que cambia en una retransmisión legítima.</summary>
