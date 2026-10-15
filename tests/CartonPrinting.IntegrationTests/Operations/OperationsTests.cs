@@ -132,6 +132,17 @@ public sealed class OperationsTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Equal((200, true), (unblocked, unblockBody.GetProperty("applied").GetBoolean()));
         Assert.Equal(1, await s.CountAsync("FROM dbo.OperatorAction WHERE ActionType = 'UNBLOCK_STATION'", null, Ct));
 
+        // Ocho desbloqueos a la vez de la estación bloqueada: uno la desbloquea (200) y los demás reciben 409, con una sola
+        // OperatorAction UNBLOCK_STATION más (segunda revisión de la Fase 5, BAJA 4).
+        await s.Stations.BlockAsync(StationScenario.SiteId, s.StationId, BlockReason.IdentityCollision, "SYSTEM", null, s.Clock.UtcNow, Ct);
+        var concurrent = await Task.WhenAll(Enumerable.Range(0, 8).Select(async i =>
+        {
+            using var http = ops.As(OperationsHost.Supervisor);
+            return (await http.CallAsync($"{station}/unblock", new { reason = $"Revisado {i}" }, Ct)).Status;
+        }));
+        Assert.Equal((1, 7), (concurrent.Count(c => c == 200), concurrent.Count(c => c == 409)));
+        Assert.Equal(2, await s.CountAsync("FROM dbo.OperatorAction WHERE ActionType = 'UNBLOCK_STATION'", null, Ct));
+
         var epoch = s.Epoch + 1;
         Assert.Equal(400, (await supervisor.CallAsync($"{station}/epochs/{epoch}/confirm", new { firstCycleId = 1, reason = "Época nueva" }, Ct)).Status);
         Assert.Equal(400, (await supervisor.CallAsync($"{station}/epochs/{epoch}/confirm", new { firstCycleId = "01", reason = "Época nueva" }, Ct)).Status);

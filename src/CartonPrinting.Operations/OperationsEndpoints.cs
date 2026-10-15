@@ -90,16 +90,10 @@ public static class OperationsEndpoints
         ops.MapPost("/stations/{site}/{station}/unblock", (string site, string station, ReasonBody body, ClaimsPrincipal user, HttpContext http) =>
             RunAsync(http, async (s, ct) =>
             {
-                // Una estación que no está bloqueada no se "desbloquea": sin esto quedaría una OperatorAction UNBLOCK_STATION
-                // sin efecto (revisión de la Fase 5).
-                var (state, _) = await s.Stations.GetActiveAsync(site, station, ct)
-                    ?? throw new ManualActionRejectedException($"La estación {site}/{station} no existe.");
-                if (state.LabelingEnabled)
-                {
-                    throw new ManualActionRejectedException($"La estación {site}/{station} no está bloqueada.");
-                }
-
-                return await s.Txm.UnblockStationAsync(site, station, Who(user), body.Reason, s.Clock.UtcNow, ct);
+                // Una estación que no está bloqueada no se "desbloquea": TX-M lo decide con la fila bloqueada y entonces no
+                // registra la OperatorAction, también con dos desbloqueos a la vez (revisiones de la Fase 5).
+                var result = await s.Txm.UnblockStationAsync(site, station, Who(user), body.Reason, s.Clock.UtcNow, ct);
+                return result.Applied ? result : throw new ManualActionRejectedException($"La estación {site}/{station} no está bloqueada.");
             }));
 
         ops.MapPost("/stations/{site}/{station}/epochs/{epoch:long}/confirm",
@@ -173,15 +167,15 @@ public static class OperationsEndpoints
                 return Results.NotFound(new { error = "La solicitud ya se aprobó." });
             }
 
-            // Si TX-M la rechaza, la solicitud vuelve a quedar pendiente: no hay que pedirla otra vez (revisión de la Fase 5).
+            // Si TX-M la rechaza (409 o 400), la solicitud vuelve a quedar pendiente: no hay que pedirla otra vez. Un error
+            // desconocido, por ejemplo la conexión cortada después del commit, no la restaura: la autorización pudo quedar
+            // creada. TX-M no se cancela con la petición (segunda revisión de la Fase 5, BAJA 7).
             var approved = false;
-            try
+            var result = await GuardAsync(async () =>
             {
-                var result = await GuardAsync(async () =>
-                {
-                var job = await s.Db.ReadAsync(conn => JobQueries.GetJobAsync(conn, null, pending.PrintJobId, http.RequestAborted), http.RequestAborted)
+                var job = await s.Db.ReadAsync(conn => JobQueries.GetJobAsync(conn, null, pending.PrintJobId, CancellationToken.None), CancellationToken.None)
                     ?? throw new ManualActionRejectedException("El job no existe.");
-                var (_, active) = await s.Stations.GetActiveAsync(job.SiteId, job.StationId, http.RequestAborted)
+                var (_, active) = await s.Stations.GetActiveAsync(job.SiteId, job.StationId, CancellationToken.None)
                     ?? throw new ManualActionRejectedException("La estación del job no existe.");
                 if (active.ManualPrinterId is not { } manualPrinter)
                 {
@@ -192,19 +186,16 @@ public static class OperationsEndpoints
                 var id = await s.Txm.ApproveReprintAsync(new ReprintRequest(pending.PrintJobId, job.Status, pending.Reason, pending.DuplicateRisk,
                     pending.CartonReference, pending.InspectionEvidence, manualPrinter, pending.ReprintMarker,
                     active.EvidenceWindowMs ?? s.Options.DefaultReprintEvidenceWindowMs, pending.RequestedBy, pending.RequestedAt, Who(user), now,
-                    now.AddMinutes(s.Options.AuthorizationValidityMinutes)), http.RequestAborted);
-                    approved = true;
-                    return Results.Created($"/api/ops/reprints/{id}", new { authorizationId = id, targetPrinterId = manualPrinter });
-                });
-                return result;
-            }
-            finally
+                    now.AddMinutes(s.Options.AuthorizationValidityMinutes)), CancellationToken.None);
+                approved = true;
+                return Results.Created($"/api/ops/reprints/{id}", new { authorizationId = id, targetPrinterId = manualPrinter });
+            });
+            if (!approved)
             {
-                if (!approved)
-                {
-                    s.Requests.Add(pending);
-                }
+                s.Requests.Add(pending);
             }
+
+            return result;
         });
 
         ops.MapPost("/reprints/{authorizationId:long}/revoke", (long authorizationId, ClaimsPrincipal user, HttpContext http) =>

@@ -36,7 +36,11 @@ public sealed class StartupOrderTests(SqlServerFixture sql) : IAsyncLifetime
         var (sending, _) = await s.SendingJobAsync(600, Ct);   // la caída dejó este envío en SENDING
         var registered = await s.RegisterAsync(s.Cycle(601, detectionTimestamp: DateTime.UtcNow.AddMilliseconds(-58_000)), ct: Ct);
         var expired = registered.PrintJobId ?? throw new InvalidOperationException($"El ciclo 601 quedó {registered.FinalStatus}.");
-        await Task.Delay((await s.JobAsync(expired, Ct)).DeadlineAt - DateTime.UtcNow + TimeSpan.FromMilliseconds(200), Ct);
+        var untilExpired = (await s.JobAsync(expired, Ct)).DeadlineAt - DateTime.UtcNow + TimeSpan.FromMilliseconds(200);
+        if (untilExpired > TimeSpan.Zero)
+        {
+            await Task.Delay(untilExpired, Ct);
+        }
 
         await using var h = await OpcHarness.StartAsync(s.StationId, new EdgeClock(TimeProvider.System));
         using var metrics = new CartonMetrics();

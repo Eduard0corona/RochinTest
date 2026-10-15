@@ -155,6 +155,19 @@ public sealed class TxmManualActions(SqlDb db)
     public Task<ManualResult> UnblockStationAsync(string siteId, string stationId, string performedBy, string reasonText, DateTime edgeNowUtc, CancellationToken ct) =>
         db.InTransactionAsync(async (conn, tx) =>
         {
+            // Con la fila de la estación bloqueada: si no está bloqueada, nada que desbloquear y ninguna OperatorAction sin
+            // efecto, tampoco con dos desbloqueos a la vez (0 filas, sin excepción; segunda revisión de la Fase 5, BAJA 4).
+            await using (var check = conn.Command(tx, """
+                SELECT LabelingEnabled FROM dbo.StationConfig WITH (UPDLOCK, HOLDLOCK) WHERE SiteId = @SiteId AND StationId = @StationId
+                """))
+            {
+                check.NVarChar("@SiteId", siteId, 64).NVarChar("@StationId", stationId, 64);
+                if (await check.ExecuteScalarAsync(ct) is not false)
+                {
+                    return new ManualResult(0, false, null);
+                }
+            }
+
             var oa = await InsertOperatorActionAsync(conn, tx, new OperatorActionInput(OperatorActionType.UnblockStation, siteId, stationId, null, null,
                 performedBy, reasonText), edgeNowUtc, ct);
             await using var cmd = conn.Command(tx, """
