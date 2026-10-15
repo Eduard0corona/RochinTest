@@ -36,7 +36,7 @@ public sealed class StationSweepService(
     {
         var (_, active) = await stations.GetActiveAsync(station.SiteId, station.StationId, ct)
             ?? throw new InvalidOperationException($"La estación {station.SiteId}/{station.StationId} no tiene StationConfig.");
-        var check = await ClockJumpedAsync(stations, station, clockGuard, active, clock, metrics, _logger, ct);
+        var check = await ClockJumpedAsync(txs, station, clockGuard, active, clock, metrics, _logger, ct);
         if (check.Jumped)
         {
             return new SweepReport(true, [], [], [], [], []);
@@ -121,14 +121,15 @@ public sealed class StationSweepService(
 
     /// <summary>
     /// Comprobación compartida por el barrido y el claim: si el reloj de pared divergió del monotónico más
-    /// que la tolerancia de la revisión activa, o hay un salto anterior cuyo bloqueo todavía no se confirmó,
-    /// bloquea la estación con CLOCK_JUMP y devuelve <c>Jumped</c>. El salto solo deja de retenerse cuando el
-    /// bloqueo quedó confirmado en SQL: si <see cref="StationConfigStore.BlockAsync"/> falla, la excepción sube y
-    /// la próxima comprobación lo reintenta. Sin salto, <c>VerifiedUtc</c> es el instante que se verificó, el que
-    /// debe usarse como <c>@EdgeNowUtc</c>.
+    /// que la tolerancia de la revisión activa, o hay un salto anterior todavía sin confirmar, ejecuta
+    /// <see cref="TxsSweep.ClockJumpAsync"/> (bloqueo con CLOCK_JUMP y vencimiento de lo pendiente, SI-16) y devuelve
+    /// <c>Jumped</c>. El salto solo deja de retenerse cuando el bloqueo vigente en SQL es CLOCK_JUMP: si la transacción
+    /// falla, o la estación ya estaba bloqueada por otro motivo, la próxima comprobación lo reintenta, y al levantarse
+    /// el otro bloqueo la estación queda bloqueada con CLOCK_JUMP. Sin salto, <c>VerifiedUtc</c> es el instante que se
+    /// verificó, el que debe usarse como <c>@EdgeNowUtc</c>.
     /// </summary>
     public static async Task<ClockReading> ClockJumpedAsync(
-        StationConfigStore stations, StationSettings station, ClockGuard guard, StationRevision active, EdgeClock clock, CartonMetrics metrics,
+        TxsSweep txs, StationSettings station, ClockGuard guard, StationRevision active, EdgeClock clock, CartonMetrics metrics,
         ILogger logger, CancellationToken ct)
     {
         var reading = guard.Check(active.ClockJumpToleranceMs);
@@ -142,10 +143,29 @@ public sealed class StationSweepService(
             metrics.Increment(MetricNames.ClockJump, ("station", station.StationId));
         }
 
-        var blocked = await stations.BlockAsync(station.SiteId, station.StationId, BlockReason.ClockJump, "SYSTEM", null, clock.UtcNow, ct);
-        guard.Acknowledge(reading);
-        logger.LogError("Salto del reloj de pared de {Divergence} ms en {Station} (tolerancia {Tolerance} ms): estación {Action} con CLOCK_JUMP",
-            reading.DivergenceMs, station.StationId, active.ClockJumpToleranceMs, blocked ? "bloqueada" : "ya bloqueada");
+        var result = await txs.ClockJumpAsync(station.SiteId, station.StationId, clock.UtcNow, ct);
+        foreach (var t in result.Expired)
+        {
+            metrics.Increment(MetricNames.JobsExpired, ("reason", t.Reason!), ("from", t.From));
+        }
+
+        foreach (var _ in result.DetectionsBlocked)
+        {
+            metrics.Increment(MetricNames.DetectionsBlocked, ("reason", DetectionReason.StationDisabled));
+        }
+
+        if (result.BlockReason == BlockReason.ClockJump)
+        {
+            guard.Acknowledge(reading);
+        }
+
+        logger.LogError(
+            "Salto del reloj de pared de {Divergence} ms en {Station} (tolerancia {Tolerance} ms): {Action}; {Jobs} jobs vencidos y {Detections} detecciones bloqueadas",
+            reading.DivergenceMs, station.StationId, active.ClockJumpToleranceMs,
+            result.Blocked ? "estación bloqueada con CLOCK_JUMP"
+                : result.BlockReason == BlockReason.ClockJump ? "ya bloqueada con CLOCK_JUMP"
+                : $"ya bloqueada con {result.BlockReason}: el salto se retiene hasta poder registrarlo",
+            result.Expired.Count, result.DetectionsBlocked.Count);
         return reading;
     }
 

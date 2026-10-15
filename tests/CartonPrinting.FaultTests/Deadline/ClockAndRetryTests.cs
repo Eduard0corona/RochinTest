@@ -120,15 +120,16 @@ public sealed class ClockAndRetryTests(SqlServerFixture sql) : IAsyncLifetime
 
             var outcome = (await claims.TryClaimAsync(jobs[0], s.Lease, Ct))!;
             Assert.False(outcome.Claimed);
-            Assert.Equal(detectedBy == "claim" ? ClaimRejection.ClockJump : ClaimRejection.StationDisabled, outcome.Rejection);
+            Assert.Equal(detectedBy == "claim" ? ClaimRejection.ClockJump : ClaimRejection.NotReady, outcome.Rejection);   // SI-16: el barrido ya lo venció
 
             var station = (await s.Stations.GetActiveAsync(StationScenario.SiteId, s.StationId, Ct))!.Value.State;
             Assert.Equal((false, BlockReason.ClockJump), (station.LabelingEnabled, station.BlockReason));
             Assert.Equal(1, s.Metrics.Total(MetricNames.ClockJump, ("station", s.StationId)));
             foreach (var job in jobs)
             {
+                // SI-16: lo pendiente al confirmar el salto vence; nada anterior al salto se imprime.
                 Assert.Empty(await s.AttemptsAsync(job, Ct));
-                Assert.Equal(JobStatus.Ready, (await s.JobAsync(job, Ct)).Status);
+                Assert.Equal((JobStatus.Expired, JobReason.DeadlinePassed), ((await s.JobAsync(job, Ct)).Status, (await s.JobAsync(job, Ct)).Reason));
             }
         }
     }
@@ -175,12 +176,12 @@ public sealed class ClockAndRetryTests(SqlServerFixture sql) : IAsyncLifetime
         var station = (await s.Stations.GetActiveAsync(StationScenario.SiteId, s.StationId, Ct))!.Value.State;
         Assert.Equal((false, BlockReason.ClockJump), (station.LabelingEnabled, station.BlockReason));
         Assert.Empty(await s.AttemptsAsync(job, Ct));
-        Assert.Equal(JobStatus.Ready, (await s.JobAsync(job, Ct)).Status);
+        Assert.Equal((JobStatus.Expired, JobReason.DeadlinePassed), ((await s.JobAsync(job, Ct)).Status, (await s.JobAsync(job, Ct)).Reason));
         Assert.Equal(1, s.Metrics.Total(MetricNames.ClockJump, ("station", s.StationId)));
 
-        // Con el bloqueo confirmado, el salto deja de retenerse; la estación sigue bloqueada en SQL.
+        // Con el bloqueo confirmado, el salto deja de retenerse; el job ya venció.
         manual.Advance(TimeSpan.FromMilliseconds(10));
-        Assert.Equal(ClaimRejection.StationDisabled, (await claims.TryClaimAsync(job, s.Lease, Ct))!.Rejection);
+        Assert.Equal(ClaimRejection.NotReady, (await claims.TryClaimAsync(job, s.Lease, Ct))!.Rejection);
     }
 
     /// <summary>
@@ -246,5 +247,109 @@ public sealed class ClockAndRetryTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Equal(waiting.DetectionId, Assert.Single(report.WaitingErpExpired).Id);
         Assert.Equal((DetectionStatus.Expired, DetectionReason.ErpUnavailable),
             ((await s.DetectionAsync(432, Ct))!.Status, (await s.DetectionAsync(432, Ct))!.Reason));
+    }
+
+    /// <summary>
+    /// Segunda revisión de la Fase 3, MEDIA-1 (EXP1), y SI-16: el reloj de pared retrocede 1 h con un job READY, uno en
+    /// RETRY_WAIT y una detección en WAITING_ERP. Al confirmar el salto, la misma transacción bloquea la estación con
+    /// CLOCK_JUMP, vence los jobs con DEADLINE_PASSED (J03 y J14) y pasa la detección a BLOCKED con STATION_DISABLED
+    /// (D08), con sus PrintJobResult. Después del desbloqueo, ningún claim encuentra trabajo anterior al salto.
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T37")]
+    public async Task Pending_work_from_before_a_clock_jump_is_never_printed_after_the_unblock()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        var ready = await s.ReadyJobAsync(620, Ct);
+        var (retry, attempt) = await s.SendingJobAsync(621, Ct);
+        await s.Txc.NotSentAsync(attempt, s.Clock.UtcNow, "conexión rechazada", NotSentCause.ConnectionFailed, 200, 3, s.Clock.UtcNow, Ct);
+        var waiting = await s.RegisterAsync(s.Cycle(622, workOrder: "WO-SIN"));
+        Assert.Equal(DetectionStatus.WaitingErp, waiting.FinalStatus);
+
+        var manual = new ManualTimeProvider(new DateTimeOffset(s.Clock.UtcNow, TimeSpan.Zero));
+        var clock = new EdgeClock(manual);
+        var guard = new ClockGuard(clock);
+        var sweep = new StationSweepService(s.Settings, s.Txs, s.Stations, guard, clock, s.Metrics);
+        var claims = new ClaimService(s.Sql, s.Txb, s.Metrics, clock, guard);
+        manual.Advance(TimeSpan.FromMilliseconds(100));
+        manual.JumpWall(TimeSpan.FromHours(-1));
+        Assert.True((await sweep.SweepOnceAsync(Ct)).ClockJump);
+
+        Assert.Equal((JobStatus.Expired, JobReason.DeadlinePassed), ((await s.JobAsync(ready, Ct)).Status, (await s.JobAsync(ready, Ct)).Reason));
+        Assert.Equal((JobStatus.Expired, JobReason.DeadlinePassed), ((await s.JobAsync(retry, Ct)).Status, (await s.JobAsync(retry, Ct)).Reason));
+        var detection = (await s.DetectionAsync(622, Ct))!;
+        Assert.Equal((DetectionStatus.Blocked, DetectionReason.StationDisabled), (detection.Status, detection.Reason));
+        Assert.Equal("EXPIRED", (await s.ResultsAsync(ready, Ct)).Last().GetProperty("outcome").GetString());
+        Assert.Equal(1, s.Metrics.Total(MetricNames.JobsExpired, ("reason", JobReason.DeadlinePassed), ("from", JobStatus.RetryWait)));
+
+        manual.Advance(TimeSpan.FromMinutes(5));
+        await s.Txm.UnblockStationAsync(StationScenario.SiteId, s.StationId, "supervisor.ramos", "Reloj corregido", clock.UtcNow, Ct);
+        Assert.False((await sweep.SweepOnceAsync(Ct)).ClockJump);
+        foreach (var job in new[] { ready, retry })
+        {
+            Assert.False((await claims.TryClaimAsync(job, s.Lease, Ct))!.Claimed);
+        }
+
+        Assert.Single(await s.AttemptsAsync(retry, Ct));   // solo el NOT_SENT anterior al salto
+        Assert.Empty(await s.AttemptsAsync(ready, Ct));
+    }
+
+    /// <summary>
+    /// Segunda revisión de la Fase 3, MEDIA-1 (EXP2): con la estación ya bloqueada por otro motivo, el salto vence lo
+    /// pendiente pero no se da por confirmado (el bloqueo vigente no es CLOCK_JUMP); el barrido no evalúa plazos mientras
+    /// tanto. Al levantarse el otro bloqueo, la estación queda bloqueada con CLOCK_JUMP y solo entonces el salto se
+    /// confirma.
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T37")]
+    public async Task A_clock_jump_on_a_station_blocked_for_another_reason_is_recorded_once_that_block_is_lifted()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        var ready = await s.ReadyJobAsync(630, Ct);
+        await s.Stations.BlockAsync(StationScenario.SiteId, s.StationId, BlockReason.IdentityCollision, "SYSTEM", null, s.Clock.UtcNow, Ct);
+        var manual = new ManualTimeProvider(new DateTimeOffset(s.Clock.UtcNow, TimeSpan.Zero));
+        var clock = new EdgeClock(manual);
+        var sweep = new StationSweepService(s.Settings, s.Txs, s.Stations, new ClockGuard(clock), clock, s.Metrics);
+        manual.Advance(TimeSpan.FromMilliseconds(100));
+        manual.JumpWall(TimeSpan.FromMinutes(-10));
+
+        Assert.True((await sweep.SweepOnceAsync(Ct)).ClockJump);
+        Assert.Equal(JobStatus.Expired, (await s.JobAsync(ready, Ct)).Status);
+        Assert.Equal(BlockReason.IdentityCollision, (await s.Stations.GetActiveAsync(StationScenario.SiteId, s.StationId, Ct))!.Value.State.BlockReason);
+        manual.Advance(TimeSpan.FromMilliseconds(100));
+        Assert.True((await sweep.SweepOnceAsync(Ct)).ClockJump);   // retenido: sigue sin registrarse
+
+        await s.Txm.UnblockStationAsync(StationScenario.SiteId, s.StationId, "supervisor.ramos", "Colisión revisada", clock.UtcNow, Ct);
+        manual.Advance(TimeSpan.FromMilliseconds(100));
+        Assert.True((await sweep.SweepOnceAsync(Ct)).ClockJump);
+        Assert.Equal(BlockReason.ClockJump, (await s.Stations.GetActiveAsync(StationScenario.SiteId, s.StationId, Ct))!.Value.State.BlockReason);
+        manual.Advance(TimeSpan.FromMilliseconds(100));
+        Assert.False((await sweep.SweepOnceAsync(Ct)).ClockJump);  // confirmado
+        Assert.Equal(1, s.Metrics.Total(MetricNames.ClockJump, ("station", s.StationId)));
+    }
+
+    /// <summary>
+    /// Segunda revisión de la Fase 3, BAJA-2: J03/J14 y D07 del barrido no actúan si la revisión con que se calculó el
+    /// plazo efectivo ya no es la activa.
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T18")]
+    public async Task Sweep_expirations_require_the_revision_they_were_computed_with()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        var ready = await s.ReadyJobAsync(640, Ct);
+        await s.RegisterAsync(s.Cycle(641, workOrder: "WO-SIN"));
+        var detection = (await s.DetectionAsync(641, Ct))!;
+        var stale = s.Revision.ConfigRevisionId + 1_000;
+        var now = s.Clock.UtcNow;
+
+        Assert.Null(await s.Txs.ExpireEffectiveDeadlineAsync(StationScenario.SiteId, s.StationId, ready, now.AddMilliseconds(-1), 100, stale, now, Ct));
+        Assert.Null(await s.Txs.ExpireWaitingErpDetectionAsync(detection.DetectionId, now.AddMilliseconds(-1), 100, stale, now, Ct));
+        Assert.Equal(JobStatus.Ready, (await s.JobAsync(ready, Ct)).Status);
+        Assert.Equal(DetectionStatus.WaitingErp, (await s.DetectionAsync(641, Ct))!.Status);
+
+        Assert.NotNull(await s.Txs.ExpireEffectiveDeadlineAsync(StationScenario.SiteId, s.StationId, ready, now.AddMilliseconds(-1), 100,
+            s.Revision.ConfigRevisionId, now, Ct));
+        Assert.NotNull(await s.Txs.ExpireWaitingErpDetectionAsync(detection.DetectionId, now.AddMilliseconds(-1), 100, s.Revision.ConfigRevisionId, now, Ct));
     }
 }

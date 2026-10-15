@@ -230,7 +230,7 @@ public sealed class PrinterFaultTests(SqlServerFixture sql) : IAsyncLifetime
 
         s.AdvanceMs(150);
         var claim = await s.Txb.ExecuteAsync(new ClaimRequest(n, Guid.NewGuid(), s.OwnerInstanceId, s.Lease.FencingToken, s.Clock.UtcNow,
-            (await s.JobAsync(n, Ct)).DeadlineAt, s.Revision.SendMarginMs), Ct);
+            (await s.JobAsync(n, Ct)).DeadlineAt, s.Revision.SendMarginMs, s.Revision.ConfigRevisionId), Ct);
         Assert.False(claim.Claimed);
         var report = await Sweep(s).SweepOnceAsync(Ct);
         Assert.Empty(report.Released);
