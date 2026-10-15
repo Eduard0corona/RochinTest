@@ -16,6 +16,7 @@ namespace CartonPrinting.FaultTests.Ownership;
 /// perdido detiene el sender y TX-R0 corre antes de volver a enviar (M2) y una renovación que falla por SQL cuenta como
 /// lease perdido (A2).
 /// </summary>
+[Collection(nameof(CartonPrinting.FaultTests.Hardening.BrokerOutageCollection))]
 public sealed class OwnershipReviewTests(SqlServerFixture sql) : IAsyncLifetime
 {
     private TestDatabase _db = null!;

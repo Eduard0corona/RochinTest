@@ -11,6 +11,7 @@ namespace CartonPrinting.FaultTests.Hardening;
 /// Con la señal en proceso (G11), el sender empieza a escribir sin esperar su sondeo. Es la base de la medición de T12, que corre
 /// aparte (carga) con el Outbox Relay hacia RabbitMQ.
 /// </summary>
+[Collection(nameof(CartonPrinting.FaultTests.Hardening.BrokerOutageCollection))]
 public sealed class LatencySegmentsTests(SqlServerFixture sql) : IAsyncLifetime
 {
     private const int WarmUp = 3;

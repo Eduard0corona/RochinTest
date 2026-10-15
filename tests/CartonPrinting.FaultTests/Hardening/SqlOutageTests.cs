@@ -22,6 +22,7 @@ namespace CartonPrinting.FaultTests.Hardening;
 /// que la ingesta declara la caída hasta que recarga el estado al volver SQL. El PLC solo manda la caja siguiente cuando vuelve
 /// LabelingReady; ese ciclo abre el hueco de la caída y el barrido lo cierra CLOSED_UNRECOVERED.
 /// </summary>
+[Collection(nameof(CartonPrinting.FaultTests.Hardening.BrokerOutageCollection))]
 public sealed class SqlOutageTests(SqlServerFixture sql) : IAsyncLifetime
 {
     private TestDatabase _db = null!;

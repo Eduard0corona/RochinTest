@@ -20,9 +20,11 @@ public interface ILabelingReadySink
 /// está habilitada, la ingesta conectada y su canal sin saturar; false si la estación está bloqueada, si se
 /// pierde OPC, si el canal está lleno (ARQUITECTURA_TECNICA §2), si SQL Server está declarado no disponible (<see cref="SqlOutage"/>,
 /// hasta que la vigilancia de la ingesta lo levanta, ESTRATEGIA_RECUPERACION §3) o si no se puede leer el estado de la estación en
-/// SQL dentro de <c>readTimeout</c>. En ese último caso, si la causa es SQL no disponible o la lectura no respondió, declara la
-/// caída: es una sola para el latido, la ingesta y el sender, y los ciclos que llegan durante ella no se registran. Una lectura que
-/// no respondió queda como operación abandonada: mientras no termine no se lanza otra y la caída no se levanta. Con impresora de
+/// SQL dentro de <c>readTimeout</c>. Una lectura lenta baja la señal en ese latido; si sigue sin respuesta en el latido siguiente, o
+/// si el error es SQL no disponible, declara la caída: es una sola para el latido, la ingesta y el sender, y los ciclos que llegan
+/// durante ella no se registran. Una sola lectura lenta no la declara: la especificación la ata a TX-A (ESTRATEGIA_RECUPERACION §3,
+/// "hasta dos reintentos cortos; después se baja LabelingReady"). Una lectura que no respondió queda como operación abandonada:
+/// mientras no termine no se lanza otra y la caída no se levanta. Con impresora de
 /// línea (<see cref="LinePrinterReadiness"/>), también en falso mientras no está tomada con TX-R0 hecho o su sender está en pausa
 /// (ESTRATEGIA_RECUPERACION §1, etapas 2, 3 y 8; §3 Impresora). Si el latido deja de llegar, el PLC aplica su propia política (OT).
 /// </summary>
@@ -46,8 +48,12 @@ public sealed class LabelingReadyHeartbeat(
         bool ready;
         if (_pendingRead is { IsCompleted: false })
         {
-            _logger.LogWarning("LabelingReady: la lectura anterior del estado de {Station} sigue sin respuesta; se señala no lista", station.StationId);
-            outage?.Declare();
+            // Dos latidos sin respuesta: SQL no responde de forma sostenida.
+            if (outage?.Declare() == true)
+            {
+                _logger.LogError("SQL Server sigue sin responder a la lectura del latido de {Station}: falla cerrada", station.StationId);
+            }
+
             ready = false;
         }
         else
@@ -63,11 +69,7 @@ public sealed class LabelingReadyHeartbeat(
                 _pendingRead = read.ContinueWith(t => _ = t.Exception, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously,
                     TaskScheduler.Default);
                 outage?.TrackAbandoned(read);
-                if (outage?.Declare() == true)
-                {
-                    _logger.LogError("SQL Server no respondió a la lectura del latido de {Station} en {Timeout}: falla cerrada", station.StationId, _readTimeout);
-                }
-
+                _logger.LogWarning("LabelingReady: el estado de {Station} no se leyó en {Timeout}; se señala no lista", station.StationId, _readTimeout);
                 ready = false;
             }
             catch (Exception ex) when (!ct.IsCancellationRequested)

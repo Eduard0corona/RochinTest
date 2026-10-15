@@ -19,6 +19,7 @@ namespace CartonPrinting.FaultTests.Hardening;
 /// real y la impresora simulada: LabelingReady con la impresora de línea, la pausa por fallos seguidos del dispositivo, TX-R0 después
 /// de un claim sin respuesta, TX-A y TX-E frente a un bloqueo de la estación en curso, y los tramos de evidencia monotónicos.
 /// </summary>
+[Collection(nameof(CartonPrinting.FaultTests.Hardening.BrokerOutageCollection))]
 public sealed class FinalVerificationTests(SqlServerFixture sql) : IAsyncLifetime
 {
     private TestDatabase _db = null!;

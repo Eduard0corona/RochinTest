@@ -1203,7 +1203,7 @@ Compuerta en verde.
 7. **Falla cerrada decidida por la recepción, con una sola caída por proceso** (revisiones independientes: A1 y M1; M-1, M-2, M-3, BAJA-1 y BAJA-9; SI-20).
    - **Quién la declara.** `SqlOutage` es una sola caída para la ingesta, el latido y el sender de línea. La declaran:
      - la ingesta, cuando un ciclo agota sus intentos: hasta 1 s cada uno (`SqlAttemptTimeoutMs`), con reintentos solo dentro del plazo de la caja (tres si el registro no tiene plazo vigente);
-     - el latido, cuando no puede leer la estación en ese tiempo o con SQL no disponible;
+     - el latido, con SQL no disponible o cuando su lectura sigue sin respuesta en el latido siguiente (una sola lectura lenta solo baja la señal en ese latido: la especificación ata la caída a TX-A);
      - el sender de línea, ante un error de SQL no disponible en TX-B;
      - la recarga con que la ingesta empieza a consumir, si SQL no responde justo entonces.
    - **Mientras está declarada:** `LabelingReady` en falso, cada ciclo se rechaza sin ir a SQL y el sender de línea no reclama.
@@ -1505,7 +1505,21 @@ Comandos, con la máquina en reposo, 2026-10-15:
   - sin período de prueba: no hay segunda pausa.
 
   Las seis de la verificación final, a las 09:35, también se detectaron.
-- La compuerta completa, con `--carga`, se ejecuta después de esta ronda, con la máquina en reposo (sección siguiente).
+- **Compuerta de `02992c0`** (`build/ci.ps1 --fase 7 --carga`, 2026-10-15 de 10:16 a 10:35, en reposo). Falló en las pruebas sin carga:
+  - UnitTests 176 de 176 e IntegrationTests 105 de 105;
+  - FaultTests 115 de 117, con T08 correcta. Fallaron dos pruebas:
+    - `LatencySegmentsTests(signal: False)`: "Los 1 jobs no quedaron CONFIRMED en 60 s";
+    - `OwnershipReviewTests.A_transient_renewal_error_does_not_stop_the_sender`: `lease_lost` 1 en lugar de 0.
+
+  Las dos son sensibles a tiempos, y corrieron en paralelo con la prueba que arranca y detiene un SQL Server propio.
+  - En la primera, una lectura del latido tardó más de 1 s, el latido declaró la caída y la primera caja quedó como hueco. Era demasiado agresivo: la especificación ata la caída a TX-A. Ahora una sola lectura lenta solo baja la señal en ese latido, y la caída se declara si la lectura sigue sin respuesta en el latido siguiente o con SQL no disponible.
+  - Las pruebas que comparan tiempos o que cargan la máquina pasaron a la colección sin paralelismo: `SqlOutageTests`, `LatencySegmentsTests`, `FinalVerificationTests` y `OwnershipReviewTests`.
+- 10:50, `dotnet test tests/CartonPrinting.FaultTests --no-build --filter "FullyQualifiedName~SqlOutageTests|FullyQualifiedName~LatencySegmentsTests|FullyQualifiedName~OwnershipReviewTests|FullyQualifiedName~FinalVerificationTests"`:
+
+  ```
+  Correctas! - Con error: 0, Superado: 25, Omitido: 0, Total: 25, Duración: 4 m 11 s - CartonPrinting.FaultTests.dll (net10.0)
+  ```
+- La compuerta completa, con `--carga`, se ejecuta después, con la máquina en reposo.
 
 ### Lo que no se verificó
 

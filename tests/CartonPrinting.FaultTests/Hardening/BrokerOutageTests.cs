@@ -288,6 +288,9 @@ public sealed class BrokerOutageTests(SqlServerFixture sql, RabbitMqFixture rabb
     }
 }
 
-/// <summary>Colección sin paralelismo: T08 corre cuando terminan las demás pruebas del ensamblado.</summary>
+/// <summary>
+/// Colección sin paralelismo: corre cuando terminan las demás pruebas del ensamblado. Para las pruebas que comparan tiempos (T08, los
+/// tramos de latencia, las pausas del sender, la renovación del lease) o que cargan la máquina (un SQL Server propio que se detiene).
+/// </summary>
 [CollectionDefinition(nameof(BrokerOutageCollection), DisableParallelization = true)]
 public sealed class BrokerOutageCollection;
