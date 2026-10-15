@@ -13,7 +13,8 @@ echo "== 2/5 Artefactos derivados al día"
 echo "== 3/5 Compilación sin advertencias"
 dotnet build -warnaserror
 echo "== 4/5 Pruebas (sin carga)"
+rm -rf TestResults
 dotnet test --no-build --filter "Category!=Load" --logger "trx" --results-directory TestResults
 echo "== 5/5 Trazabilidad Txx"
-"$PY" -B build/check_traceability.py "$@"
+"$PY" -B build/check_traceability.py --trx-dir TestResults "$@"
 echo "Compuerta en verde."

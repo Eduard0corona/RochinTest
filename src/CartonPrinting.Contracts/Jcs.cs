@@ -21,7 +21,7 @@ public static class Jcs
         return sb.ToString();
     }
 
-    public static byte[] SerializeToUtf8(object? value) => Encoding.UTF8.GetBytes(Serialize(value));
+    public static byte[] SerializeToUtf8(object? value) => StrictUtf8.Encoding.GetBytes(Serialize(value));
 
     private static void Write(StringBuilder sb, object? value)
     {
@@ -41,6 +41,9 @@ public static class Jcs
                 break;
             case System.Numerics.BigInteger bi:
                 sb.Append(bi.ToString(CultureInfo.InvariantCulture));
+                break;
+            case PythonFloat f:
+                sb.Append(f.JsonRepr);
                 break;
             case IReadOnlyDictionary<string, object?> map:
                 WriteObject(sb, map);

@@ -102,6 +102,25 @@ public sealed class ContractReferenceDifferentialTests
         yield return Mut("evidence vacía", R, "result-confirmed-verified.json", d => d["evidence"] = new JsonObject());
         yield return Mut("tipo equivocado en queueOverflow", C, "carton-detected-observed.json", d => d["queueOverflow"] = "false");
         yield return Mut("documento válido", R, "result-unknown-serial-mismatch-correction.json", _ => { });
+
+        // Hallazgo M2 de la revisión de la Fase 0: un salto de línea final no es un formato válido.
+        yield return Mut("fecha con salto de línea final", C, "carton-detected-observed.json", d => d["receivedAt"] = d["receivedAt"]!.GetValue<string>() + "\n");
+        yield return Mut("uuid con salto de línea final", R, "result-confirmed-verified.json", d => d["printJobId"] = d["printJobId"]!.GetValue<string>() + "\n");
+        yield return Mut("eventId con salto de línea final", C, "carton-detected-observed.json", d => d["eventId"] = d["eventId"]!.GetValue<string>() + "\n");
+
+        // Hallazgo B1: desplazamientos y medianoche que fromisoformat (Python 3.14) acepta.
+        foreach (var offset in new[] { "+14:01", "+15:00", "-23:59", "+02:60", "+24:00", "+23:60" })
+        {
+            yield return Mut($"desplazamiento {offset}", R, "result-cancelled.json", d => d["occurredAt"] = "2026-10-12T18:05:02.330" + offset);
+        }
+
+        yield return Mut("hora 24:00:00", R, "result-cancelled.json", d => d["occurredAt"] = "2026-10-12T24:00:00Z");
+        yield return Mut("hora 24:00:01", R, "result-cancelled.json", d => d["occurredAt"] = "2026-10-12T24:00:01Z");
+        yield return Mut("segundo 60", R, "result-cancelled.json", d => d["occurredAt"] = "2026-10-12T18:00:60Z");
+        yield return Mut("fracción de 9 dígitos", R, "result-cancelled.json", d => d["occurredAt"] = "2026-10-12T18:05:02.123456789Z");
+
+        // Propiedad que se llama como una palabra clave aplicadora.
+        yield return Mut("propiedad llamada not", R, "result-cancelled.json", d => d["not"] = 1);
     }
 
     private static IEnumerable<Case> BusinessMutations()
@@ -137,5 +156,23 @@ public sealed class ContractReferenceDifferentialTests
         yield return Mut("final incoherente", "result-cancelled.json", d => d["final"] = false);
         yield return Mut("eventId de otra versión", "result-closed-unresolved.json", d => d["resultVersion"] = 3);
         yield return Mut("válido", "result-expired-out-of-order.json", _ => { });
+
+        // Hallazgo M1: marcadores de uuidNames dentro de los valores no se vuelven a sustituir.
+        yield return Mut("siteId con {labelType}", "carton-detected-observed.json", d =>
+        {
+            d["siteId"] = "{labelType}";
+            d["idempotencyKey"] = "{labelType}:LINE-01:42:918273";
+        });
+        yield return Mut("siteId con {resultVersion} en un resultado", "result-cancelled.json", d =>
+        {
+            d["siteId"] = "{resultVersion}";
+            d["idempotencyKey"] = "{resultVersion}:LINE-01:42:918280";
+        });
+        yield return Mut("labelType con {resultVersion}", "result-cancelled.json", d => d["labelType"] = "CARTON {resultVersion}");
+
+        // Hallazgo B2: números con parte decimal o exponente, que json.loads lee como float.
+        yield return Mut("plcEpoch 42.0", "carton-detected-observed.json", d => d["plcEpoch"] = JsonNode.Parse("42.0"));
+        yield return Mut("resultVersion 1e0", "result-cancelled.json", d => d["resultVersion"] = JsonNode.Parse("1e0"));
+        yield return Mut("plcEpoch 4.2e1", "carton-detected-observed.json", d => d["plcEpoch"] = JsonNode.Parse("4.2e1"));
     }
 }

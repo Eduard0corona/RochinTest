@@ -54,10 +54,10 @@ Resultado: 15 grupos OK, 0 errores
 - `CartonPrinting.Contracts`:
   - `Uuid5` (RFC 9562: SHA-1 del namespace big-endian más el nombre UTF-8, versión 5 y variante RFC; `new Guid(bytes, bigEndian: true)`), comprobado con el vector del apéndice A.4 de RFC 9562.
   - `Jcs`: serialización RFC 8785 para null, booleanos, cadenas, enteros, arreglos y objetos. Solo escapa comillas, barra invertida y controles. Los números no enteros no se admiten (no se usan).
-  - `SourceFingerprint`, `Identity` (`idempotencyKey`, `CycleId` canónico), `EventIds`, `CanonicalTimestamp` (truncado a milisegundos, nunca redondeo; RFC 3339 con la semántica de `fromisoformat`).
+  - `SourceFingerprint`, `Identity` (`idempotencyKey`, `CycleId` canónico), `EventIds` (marcadores de `uuidNames` sustituidos en una sola pasada, como `str.format`), `CanonicalTimestamp` (truncado a milisegundos, nunca redondeo; RFC 3339 con la semántica de `datetime.fromisoformat` de Python 3.14, ver SI-03). UTF-8 estricto: un surrogate aislado lanza, como en Python.
   - `CartonDetectedEvent` y `PrintJobResultEvent` con `CycleId` como `ulong` serializado en texto decimal y los instantes en la forma canónica.
-  - `ContractSchemaValidator` con JsonSchema.Net 9.4.1 y los formatos `uuid` y `date-time` con las reglas del verificador.
-  - `ContractBusinessRules`: port de `business_errors` con los mismos mensajes y el mismo orden.
+  - `ContractSchemaValidator` con JsonSchema.Net 9.4.1 y los formatos `uuid` y `date-time` como el FormatChecker del verificador (con `\z`: un salto de línea final no es válido).
+  - `ContractBusinessRules`: port de `business_errors` con los mismos mensajes y el mismo orden, comprobado contra la referencia con documentos mutados (incluidos números como `42.0`, que `json.loads` lee como `float`).
   - `StateMachineSpec`: lectura de `state-machine.json`.
 - `CartonPrinting.Infrastructure`: `SqlScript` (lotes divididos en las líneas que solo contienen `GO`; sustitución de variables sqlcmd), `SqlMigrationRunner` (aprovisionamiento con `build/sql/provision.sql`; migración con el DDL y la semilla de `spec/database`), `EdgeClock` sobre `TimeProvider`, `CartonTelemetry` y `SqlServerHealthCheck`.
 - `src/EdgeHost`: `WebApplication` con `/health/live` y `/health/ready`, OpenTelemetry (exportador OTLP solo si `OTEL_EXPORTER_OTLP_ENDPOINT` está configurado) y los comandos `provision` y `migrate`. Arranca sin módulos activos.
@@ -96,6 +96,20 @@ Resultado: trazabilidad OK, 0 errores
 Compuerta en verde.
 ```
 
+Compuerta después de corregir los hallazgos de la revisión, 2026-10-14 19:08 (`powershell -File build/ci.ps1`, ahora con `--trx-dir`):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error: 0, Superado: 122, Omitido: 0, Total: 122 - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error: 0, Superado: 13, Omitido: 0, Total: 13 - CartonPrinting.IntegrationTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
 Primera ejecución del DDL en SQL Server 2022 real (Testcontainers, `IntegrationTests/Schema/MigrationTests`, 11 pruebas): el esquema completo (58 lotes) y la semilla se crean sin error, incluidos los 14 índices filtrados y todos los triggers (ninguno deshabilitado); la semilla coincide fila por fila con las transiciones de `state-machine.json`; una segunda migración no aplica nada; el login de la aplicación recibe error de permisos al escribir `AllowedTransition`, deshabilitar un trigger o crear una tabla, y sí puede tomar valores de `LabelSerialSeq`.
 
 Entorno local con Docker Compose, 2026-10-14 (contraseñas generadas al azar en un archivo fuera del repositorio):
@@ -115,7 +129,24 @@ Entorno local con Docker Compose, 2026-10-14 (contraseñas generadas al azar en 
 
 ### Revisión independiente
 
-Pendiente de registrar (ver más abajo en esta sección cuando termine).
+Subagente `revisor-adversarial` sobre `feat/foundation` (2026-10-14). Ejecutó la compilación y las pruebas en el árbol y en una copia limpia (`git archive`), el verificador, la trazabilidad, 49 382 mutaciones diferenciales contra jsonschema 4.26 y pruebas de permisos en un contenedor propio. Sin hallazgos ALTA; 3 MEDIA y 9 BAJA. Todos se corrigieron:
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| M1: nombres UUIDv5 con `Replace` encadenados sustituían marcadores dentro de los valores | Media | `EventIds.FormatName` sustituye en una sola pasada; `ContractBusinessRules.Validate` usa el `spec` recibido; casos `{labelType}` y `{resultVersion}` en el diferencial |
+| M2: `$` aceptaba un salto de línea final en `uuid` y `date-time` | Media | `\z` en ambas expresiones; tres casos en el diferencial. La misma semántica en los `pattern` del schema es de la referencia: SI-02 |
+| M3: la trazabilidad contaba Traits en comentarios y `#if`, y no exigía ejecución | Media | `check_traceability.py` quita comentarios, cadenas y bloques `#if`, asocia cada Trait a su clase o método y, con `--trx-dir`, exige pruebas superadas en el TRX de la corrida; la compuerta borra `TestResults` antes de probar. El comentario de `MigrationTests` declara que es la parte de esquema de T47 |
+| B1: desplazamientos y `24:00` que Python acepta | Baja | `CanonicalTimestamp` calcula el UTC sin `DateTimeOffset` (desplazamiento < 24 h, `24:00:00`); casos en el diferencial; CI fijada en Python 3.14 (SI-03) |
+| B2: `42.0` hacía lanzar las reglas de negocio | Baja | `PythonFloat` reproduce `repr` y `json.dumps` de `float`; enteros de precisión arbitraria |
+| B3: surrogates aislados reemplazados por U+FFFD | Baja | `StrictUtf8` (lanza) en UUIDv5, huella y JCS |
+| B4: `cp_app` podía escribir `migrations.AppliedScript` | Baja | `DENY INSERT, UPDATE, DELETE, ALTER ON SCHEMA::migrations` |
+| B5: la prueba de permisos aceptaba varios códigos | Baja | Código exacto por sentencia y control positivo con `cp_migrator` dentro de una transacción revertida |
+| B6: `ci.ps1` no reenviaba `--fase` | Baja | `$scriptArgs = $args` al inicio |
+| B7: sin red de seguridad si el mapeo no encontraba errores; propiedades llamadas como palabras clave | Baja | Violación genérica si el documento es inválido sin errores hoja; la ruta de evaluación distingue nombres de propiedad de palabras clave |
+| B8: migraciones concurrentes | Baja | `sp_getapplock` exclusivo de sesión al inicio de `MigrateAsync` |
+| B9: afirmaciones excesivas y vacíos sin registrar | Baja | Textos corregidos en este registro y en los comentarios; SI-02 y SI-03 en `docs/SPEC_ISSUES.md` |
+
+El revisor notó archivos sin seguimiento que aparecían en el árbol durante su revisión: eran el trabajo de la Fase 1 que empezó en paralelo en la rama `feat/sql-idempotency`; por eso repitió todo sobre una copia limpia de `feat/foundation`, con el mismo resultado.
 
 ### Lo que no se verificó
 

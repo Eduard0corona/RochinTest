@@ -94,4 +94,32 @@ public sealed class IdentityPrimitivesTests
     {
         Assert.Equal(ok, CanonicalTimestamp.TryParseRfc3339(text, out _));
     }
+
+    [Theory]
+    [InlineData(0xD800)]
+    [InlineData(0xDFFF)]
+    public void Lone_surrogates_are_rejected_like_python_utf8_encoding(int codeUnit)
+    {
+        // Se construye aquí: xUnit no conserva un surrogate aislado en los datos de la teoría.
+        var siteId = "P" + (char)codeUnit;
+        // Python lanza UnicodeEncodeError; reemplazar por U+FFFD daría la misma huella que "P�".
+        var key = Identity.IdempotencyKey(siteId, "L", 1, 1);
+
+        Assert.Throws<System.Text.EncoderFallbackException>(() => SourceFingerprint.Compute(siteId, "L", 1, 1, null, null, null));
+        Assert.Throws<System.Text.EncoderFallbackException>(() => EventIds.CartonDetected(key));
+    }
+
+    [Theory]
+    [InlineData(42.0, "42.0")]
+    [InlineData(1e16, "1e+16")]
+    [InlineData(1e15, "1000000000000000.0")]
+    [InlineData(1e-5, "1e-05")]
+    [InlineData(0.0001, "0.0001")]
+    [InlineData(1.5e300, "1.5e+300")]
+    [InlineData(-0.0, "-0.0")]
+    [InlineData(123456789012345678.0, "1.2345678901234568e+17")]
+    public void Python_float_repr_is_reproduced(double value, string expected)
+    {
+        Assert.Equal(expected, new PythonFloat(value).Repr);
+    }
 }

@@ -15,8 +15,9 @@ public sealed record SchemaViolation(string Keyword, string InstancePath, string
 /// al compilar), con JsonSchema.Net.
 /// </summary>
 /// <remarks>
-/// Los formatos <c>uuid</c> y <c>date-time</c> se validan con las mismas reglas que
-/// tools/verify_package.py: UUID canónico en minúsculas y RFC 3339 con fecha válida.
+/// Los formatos <c>uuid</c> y <c>date-time</c> se validan como el FormatChecker de
+/// tools/verify_package.py: UUID canónico en minúsculas y RFC 3339 con la semántica de
+/// <c>datetime.fromisoformat</c> de Python 3.14 (ver <see cref="CanonicalTimestamp"/>).
 /// <see cref="Validate"/> devuelve los errores "hoja" con la semántica de <c>iter_errors</c> de
 /// jsonschema (Python): <c>allOf</c>, <c>properties</c>, <c>if/then/else</c> y <c>$ref</c> no
 /// producen error propio, sino los de sus subschemas; <c>not</c>, <c>anyOf</c>, <c>oneOf</c> y
@@ -84,6 +85,12 @@ public sealed partial class ContractSchemaValidator
         if (!results.IsValid)
         {
             Collect(results, violations);
+            if (violations.Count == 0)
+            {
+                // Red de seguridad: un documento inválido nunca pasa como válido aunque el mapeo no
+                // encuentre un error hoja (cambio de la biblioteca o del schema).
+                violations.Add(new SchemaViolation("schema", string.Empty, "Documento inválido sin error hoja identificable."));
+            }
         }
 
         return violations;
@@ -128,10 +135,10 @@ public sealed partial class ContractSchemaValidator
                 continue;
             }
 
-            var last = LastSegment(child.EvaluationPath.ToString());
-            // El resultado del subschema "if" nunca es un error; los subschemas de not/anyOf/oneOf/contains
-            // se resumen en el error de la propia palabra clave.
-            if (last == "if" || CollapsingKeywords.Contains(ParentKeyword(child.EvaluationPath.ToString())))
+            // El resultado del subschema "if" nunca es un error; los subschemas de not, anyOf, oneOf,
+            // contains y additionalProperties se resumen en el error de la propia palabra clave.
+            var keyword = ApplicatorOf(child.EvaluationPath.ToString());
+            if (keyword == "if" || CollapsingKeywords.Contains(keyword))
             {
                 continue;
             }
@@ -140,39 +147,46 @@ public sealed partial class ContractSchemaValidator
         }
     }
 
-    private static string LastSegment(string pointer)
-    {
-        var i = pointer.LastIndexOf('/');
-        return i < 0 ? pointer : pointer[(i + 1)..];
-    }
+    // Palabras clave cuyo segmento siguiente es un nombre (de propiedad o de definición), no otra palabra clave.
+    private static readonly HashSet<string> NameIntroducers = ["properties", "patternProperties", "dependentSchemas", "$defs", "definitions"];
 
-    /// <summary>Palabra clave aplicadora que contiene al subschema (para /not, /anyOf/0, ...).</summary>
-    private static string ParentKeyword(string pointer)
+    private static readonly HashSet<string> ArrayApplicators = ["allOf", "anyOf", "oneOf", "prefixItems"];
+
+    /// <summary>
+    /// Palabra clave aplicadora que introdujo el último subschema de la ruta de evaluación:
+    /// <c>/allOf/3</c> → allOf, <c>/properties/not</c> → properties (una propiedad llamada "not"),
+    /// <c>/allOf/3/then/not</c> → not.
+    /// </summary>
+    private static string ApplicatorOf(string pointer)
     {
-        var parts = pointer.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        var parts = pointer.Split('/', StringSplitOptions.RemoveEmptyEntries)
+            .Select(p => p.Replace("~1", "/", StringComparison.Ordinal).Replace("~0", "~", StringComparison.Ordinal)).ToArray();
         if (parts.Length == 0)
         {
             return string.Empty;
         }
 
-        var last = parts[^1];
-        if (last is "not" or "contains" or "additionalProperties")
-        {
-            return last;
-        }
-
-        if (parts.Length >= 2 && int.TryParse(last, out _))
+        if (parts.Length >= 2 && NameIntroducers.Contains(parts[^2]) && !IsNameSegment(parts, parts.Length - 2))
         {
             return parts[^2];
         }
 
-        return string.Empty;
+        if (parts.Length >= 2 && int.TryParse(parts[^1], out _) && ArrayApplicators.Contains(parts[^2]))
+        {
+            return parts[^2];
+        }
+
+        return parts[^1];
     }
+
+    /// <summary>¿El segmento i es un nombre (precedido por una palabra clave que introduce nombres)?</summary>
+    private static bool IsNameSegment(string[] parts, int i) =>
+        i > 0 && NameIntroducers.Contains(parts[i - 1]) && !IsNameSegment(parts, i - 1);
 
     private static JsonSchema Build(string text) =>
         JsonSchema.FromText(text, new BuildOptions { SchemaRegistry = new SchemaRegistry() });
 
-    [GeneratedRegex("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", RegexOptions.CultureInvariant)]
+    [GeneratedRegex(@"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z", RegexOptions.CultureInvariant)]
     private static partial Regex CanonicalUuid();
 }
 
