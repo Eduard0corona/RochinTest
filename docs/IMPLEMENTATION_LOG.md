@@ -214,7 +214,7 @@ Durante el desarrollo, dos pruebas fallaron por errores de la prueba que el sist
 
 ### Pruebas de la fase
 
-- **T01, T02, T10, T14 y T47: PASA** (detalle en `docs/TEST_STATUS.md`).
+- **T01, T02, T10 y T14: PASA. T47: FALLA en un subcriterio** (corrección respaldada por una lectura anterior al claim, SI-07); el resto de su criterio se cumple (detalle en `docs/TEST_STATUS.md`).
 - T47 ejecuta, además del criterio del catálogo, una prueba que lee el DDL y la referencia, extrae los 33 códigos `THROW` y exige que cada uno tenga su prueba negativa.
 
 ### Revisión independiente
