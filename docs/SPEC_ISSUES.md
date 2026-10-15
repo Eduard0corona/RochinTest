@@ -157,3 +157,13 @@ Clasificación de `CLAUDE.md`:
   Nada anterior al salto se imprime. El salto solo se da por confirmado cuando el bloqueo vigente es `CLOCK_JUMP`. Con otro bloqueo vigente se vence lo pendiente y el salto se retiene; al levantarse ese bloqueo, la estación queda bloqueada con `CLOCK_JUMP`.
 - **Costo aceptado.** Un job vence con `DEADLINE_PASSED` aunque su plazo real no haya pasado: falla cerrada, como el `UNKNOWN` del reinicio.
 
+## SI-18 · Un error o un apagado entre el claim y la escritura
+
+- **Vacío.** J06 nombra dos disparadores de NOT_SENT con el plazo vigente: el fallo de conexión antes de escribir, que consume intento, y el rechazo de la segunda comprobación por compuerta o estación bloqueada, que no lo consume. La especificación no dice qué transición aplica cuando, antes de invocar la escritura, falla otra cosa (SQL Server no responde al releer la estación, la compuerta lanza una excepción) o el servicio se detiene. I02 permite NOT_SENT, porque la escritura nunca se invocó, pero no dice si consume intento.
+- **Evidencia.** Segunda revisión de la Fase 4, M-1: sin una regla, esos casos dejaban el intento en `SENDING` y la impresora ocupada hasta reiniciar, y TX-R0 los volvía un `UNKNOWN` falso. Tercera revisión, BAJA-6: el comportamiento elegido no estaba registrado aquí.
+- **Interino (en el código desde `a2c4205`).** NOT_SENT por J06 sin consumir intento, como un rechazo de la segunda comprobación (la comprobación no pudo completarse). Con el plazo monotónico vencido, J08. Si el error persiste, el job vence por su plazo efectivo. Si SQL Server está caído, el NOT_SENT de TX-C tampoco se registra: el intento queda en `SENDING` y el sender se detiene (decisión 10 de la Fase 4).
+- **Alternativas.**
+  - J06 consumiendo intento, como un fallo de conexión: después de `MaxAutoAttempts` errores, J07 (`FAILED` con `PRINTER_UNAVAILABLE`).
+  - Dejar el intento en `SENDING` hasta TX-R0: un `UNKNOWN` falso y la impresora ocupada hasta reiniciar.
+- **Clase B. Decisión de la persona (2026-10-15): sin consumir intento**, el interino. Queda como está en el código.
+

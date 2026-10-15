@@ -62,6 +62,10 @@ public sealed class ErpSimulatorServer : IAsyncDisposable
         var simulator = new ErpSimulatorServer();
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
+
+        // Independiente de cualquier appsettings.json del directorio de ejecución: un AllowedHosts restringido rechazaría
+        // con 400 las peticiones a 127.0.0.1.
+        builder.Configuration["AllowedHosts"] = "*";
         builder.WebHost.UseUrls("http://127.0.0.1:0");
         var app = builder.Build();
         app.MapGet("/api/work-orders/{id}", simulator.HandleAsync);

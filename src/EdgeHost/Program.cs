@@ -64,10 +64,20 @@ if (!string.IsNullOrWhiteSpace(ingest?.Opc.EndpointUrl))
 // el ERP solo con "ErpSync:BaseUrl".
 builder.Services.AddStationServices(builder.Configuration);
 
-// Los demás módulos (senders, recuperación, Operations API) se registran en sus fases.
+// Sender de la impresora de línea (Fase 4): solo con "Printer:PrinterId" y su puerto configurados.
+var printer = builder.Configuration.GetSection("Printer").Get<CartonPrinting.EdgeHost.PrinterHostOptions>();
+if (!string.IsNullOrWhiteSpace(printer?.PrinterId) && printer.Transport.Port > 0)
+{
+    builder.Services.AddSingleton(printer);
+    builder.Services.AddHostedService<CartonPrinting.EdgeHost.PrinterHostedService>();
+}
+
+// Los demás módulos (propiedad de la impresora, Operations API) se registran en sus fases.
 
 var app = builder.Build();
 app.MapHealthChecks("/health/live", new() { Predicate = _ => false });
 app.MapHealthChecks("/health/ready", new() { Predicate = c => c.Tags.Contains("ready") });
 await app.RunAsync();
-return 0;
+
+// 0, o el código que fijó un módulo que detuvo el host por una falla (por ejemplo, el sender sin TX-C posible).
+return Environment.ExitCode;

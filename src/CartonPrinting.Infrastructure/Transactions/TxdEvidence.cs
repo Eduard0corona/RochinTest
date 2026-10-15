@@ -53,10 +53,18 @@ public sealed class TxdEvidence(SqlDb db)
     private static readonly HashSet<string> ReconcilableReasons =
         [JobReason.WriteInterrupted, JobReason.RestartDuringSend, JobReason.EvidenceWindowElapsed];
 
-    /// <summary>Paso 1: registrar la observación (ReceivedAt = reloj del EdgeHost).</summary>
+    /// <summary>
+    /// Paso 1: registrar la observación (ReceivedAt = reloj del EdgeHost). Una observación de ciclo (APPLIED o VERIFIED) se
+    /// inserta con el lock de evidencia de su ciclo (<see cref="LockCycleAsync"/>).
+    /// </summary>
     public Task<long> RecordAsync(ObservationInput o, DateTime edgeNowUtc, CancellationToken ct) =>
         db.InTransactionAsync(async (conn, tx) =>
         {
+            if (o.CorrelatedTo == CorrelatedTo.Cycle && o.PlcEpoch is { } epoch && o.CycleId is { } cycle)
+            {
+                await LockCycleAsync(conn, tx, o.SiteId, o.StationId, epoch, cycle, "Exclusive", ct);
+            }
+
             await using var cmd = conn.Command(tx, """
                 DECLARE @observation TABLE (ObservationId BIGINT NOT NULL);
                 INSERT INTO dbo.EvidenceObservation (
@@ -85,17 +93,22 @@ public sealed class TxdEvidence(SqlDb db)
 
             // APPLIED y VERIFIED correlacionan por ciclo: el job es el de ese ciclo. Un PrintJobId que no
             // coincide con el job del ciclo hace la observación incoherente: queda registrada, sin efecto.
+            // El lock compartido del ciclo se toma antes del UPDLOCK del job, en el mismo orden que el registro (lock
+            // del ciclo, después las FK): al revés, un registro con AttemptId, TX-C y esta aplicación podían
+            // interbloquearse (tercera revisión de la Fase 4, BAJA-1).
             JobRecord? job = null;
             if (o.CorrelatedTo == CorrelatedTo.Cycle && o.PlcEpoch is { } epoch && o.CycleId is { } cycle)
             {
                 var found = await JobQueries.GetJobByCycleAsync(conn, tx, new CycleIdentity(o.SiteId, o.StationId, epoch, cycle), ct);
                 if (found is not null && (o.PrintJobId is null || o.PrintJobId == found.PrintJobId))
                 {
+                    await LockCycleAsync(conn, tx, o.SiteId, o.StationId, epoch, cycle, "Shared", ct);
                     job = await JobQueries.GetJobAsync(conn, tx, found.PrintJobId, ct, updLock: true);
                 }
             }
-            else if (o.PrintJobId is { } jid)
+            else if (o.PrintJobId is { } jid && await JobQueries.GetJobAsync(conn, tx, jid, ct) is { } unlocked)
             {
+                await LockCycleAsync(conn, tx, unlocked.SiteId, unlocked.StationId, unlocked.PlcEpoch, unlocked.CycleId, "Shared", ct);
                 job = await JobQueries.GetJobAsync(conn, tx, jid, ct, updLock: true);
             }
 
@@ -133,6 +146,15 @@ public sealed class TxdEvidence(SqlDb db)
             if (!IsSufficient(o, job, attempt, minimum))
             {
                 return new EvidenceOutcome(EvidenceAction.Recorded, job.PrintJobId, attempt.AttemptId, job.Status, null);
+            }
+
+            // Una lectura contradictoria anterior, todavía sin aplicar, va primero: esta observación no confirma (I06, J11).
+            if (await EarlierContradictionAsync(conn, tx, job, attempt, attempts, observationId, ct) is { } earlier)
+            {
+                var contradiction = await ApplyContradictionAsync(conn, tx, earlier, job, attempts, minimum, edgeNowUtc, ct);
+                return contradiction.Action == EvidenceAction.Recorded
+                    ? new EvidenceOutcome(EvidenceAction.Recorded, job.PrintJobId, attempt.AttemptId, job.Status, null)
+                    : contradiction;
             }
 
             if (attempt.Kind == AttemptKind.ExceptionalReprint)
@@ -353,6 +375,57 @@ public sealed class TxdEvidence(SqlDb db)
             : frozenMinimumLevel == EvidenceLevel.None ? int.MaxValue : EvidenceLevel.Rank(frozenMinimumLevel);
         return EvidenceLevel.Rank(o.EvidenceLevel) >= required;
     }
+
+    /// <summary>
+    /// Segunda revisión de la Fase 4, A-1: una lectura VERIFIED del ciclo con otro serial, recibida desde el claim del intento,
+    /// registrada antes que la observación que se va a aplicar y después de cualquier confirmación del job. Si existe, todavía
+    /// no se aplicó: llegó con el intento en SENDING (sin transición posible) y otro pase llegó antes a esta confirmación.
+    /// Confirmar primero la dejaría sin efecto para siempre, porque ya no sería posterior a la etiqueta vigente (ADR 0016).
+    /// La lectura cuenta con la misma coherencia que en <see cref="ApplyAsync"/>: sin intento o con cualquier intento del job
+    /// (tercera revisión de la Fase 4, MEDIA-1); <see cref="ApplyContradictionAsync"/> decide qué transición aplica.
+    /// </summary>
+    private static async Task<ObservationRecord?> EarlierContradictionAsync(
+        SqlConnection conn, SqlTransaction tx, JobRecord job, AttemptRecord attempt, IReadOnlyList<AttemptRecord> attempts, long observationId,
+        CancellationToken ct)
+    {
+        await using var cmd = conn.Command(tx, """
+            SELECT TOP (1) ObservationId FROM dbo.EvidenceObservation
+            WHERE SiteId = @SiteId AND StationId = @StationId AND PlcEpoch = @PlcEpoch AND CycleId = @CycleId
+              AND EvidenceLevel = 'VERIFIED' AND ReadSerial <> @LabelSerial
+              AND ReceivedAt >= @ClaimedAt AND ObservationId < @ObservationId AND ObservationId > @LastConfirming
+              AND (PrintJobId IS NULL OR PrintJobId = @PrintJobId)
+              AND (AttemptId IS NULL OR AttemptId IN (SELECT pa.AttemptId FROM dbo.PrintAttempt AS pa WHERE pa.PrintJobId = @PrintJobId))
+            ORDER BY ObservationId;
+            """);
+        cmd.NVarChar("@SiteId", job.SiteId, 64).NVarChar("@StationId", job.StationId, 64).BigInt("@PlcEpoch", job.PlcEpoch).Cycle("@CycleId", job.CycleId)
+            .VarChar("@LabelSerial", job.LabelSerial, 40).DateTime2("@ClaimedAt", attempt.ClaimedAt).BigInt("@ObservationId", observationId)
+            .BigInt("@LastConfirming", attempts.Max(a => a.ConfirmingObservationId) ?? 0).Guid("@PrintJobId", job.PrintJobId);
+        return await cmd.ExecuteScalarAsync(ct) is long id ? await JobQueries.GetObservationAsync(conn, tx, id, ct) : null;
+    }
+
+    /// <summary>
+    /// Lock de evidencia del ciclo (segunda revisión de la Fase 4, B-8). ObservationId (IDENTITY) se asigna al insertar, no
+    /// al confirmar: sin el lock, una lectura contradictoria con un ObservationId menor podía confirmarse después de que otra
+    /// observación confirmara el job y quedar como "anterior" a la etiqueta vigente (ADR 0016). El registro de una observación
+    /// de ciclo lo toma exclusivo y la aplicación de cualquier evidencia del job lo toma compartido, ambos hasta el commit:
+    /// la aplicación espera a que el registro en curso termine y lo ve.
+    /// </summary>
+    private static async Task LockCycleAsync(
+        SqlConnection conn, SqlTransaction tx, string siteId, string stationId, long epoch, ulong cycle, string mode, CancellationToken ct)
+    {
+        await using var cmd = conn.Command(tx, """
+            DECLARE @result INT;
+            EXEC @result = sys.sp_getapplock @Resource = @Resource, @LockMode = @LockMode, @LockOwner = 'Transaction', @LockTimeout = 10000;
+            IF @result = -3 THROW 50205, N'Víctima de interbloqueo en el lock de evidencia del ciclo.', 1;
+            IF @result < 0 THROW 50204, N'No se obtuvo el lock de evidencia del ciclo.', 1;
+            """);
+        cmd.NVarChar("@Resource", CycleLockResource(siteId, stationId, epoch, cycle), 255).VarChar("@LockMode", mode, 32);
+        await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <summary>Nombre del lock de evidencia de un ciclo (sp_getapplock).</summary>
+    public static string CycleLockResource(string siteId, string stationId, long epoch, ulong cycle) =>
+        FormattableString.Invariant($"evidence/{siteId}/{stationId}/{epoch}/{cycle}");
 
     private static async Task<string> FrozenMinimumLevelAsync(SqlConnection conn, SqlTransaction tx, long configRevisionId, CancellationToken ct)
     {

@@ -2,6 +2,17 @@
 
 Cambios de la implementación. Los de la especificación están en `spec/CHANGELOG.md`.
 
+## Fase 4 · Print Agent (2026-10-15)
+
+- Impresora simulada por TCP (rechazo de conexiones, corte a mitad de la escritura, impresión sin acuse, cola retenida, cancelación según capacidades) y simulador de evidencia (impresora, aplicador y escáner por ciclo).
+- `PrinterSenderService`: un sender por impresora, claim con `PrinterSendOrder`, segunda comprobación monotónica, `NOT_SENT` solo sin escritura invocada, TX-C en su propia transacción y reaplicación de la evidencia que llega durante `SENDING`; `EvidenceService` (TX-D y métricas de la sección 19), `DeviceCancellation` (A07 y J12) y `SenderRecovery` (TX-R0).
+- `CartonPrinting.FaultHost`: el sender real en un proceso aparte para matarlo en tres puntos (T07).
+- EdgeHost: sender de la impresora de línea con lease, recuperación de arranque y la guarda del reloj de la estación.
+- Pruebas: T05, T06, T07, T15, T22, T29, T31, T38, T39, T42 y T44 en verde contra SQL Server real y la impresora simulada.
+- Correcciones de la revisión independiente: la comprobación monotónica es lo último antes de escribir; la evidencia se aplica en orden desde el último claim y se reaplica al arrancar; TX-C con reintentos y detención del sender; sin bucle con el claim rechazado; conexión cerrada reabierta y escritura con tiempo máximo; sender sin `PrinterSendOrder` no arranca.
+- Segunda revisión independiente: una lectura contradictoria anterior no queda detrás de una confirmación, tampoco bajo concurrencia (guarda en TX-D y lock de evidencia por ciclo); NOT_SENT ante cualquier error o apagado entre el claim y la escritura; el arranque reaplica las correcciones J18 pendientes; consultas de evidencia acotadas; el EdgeHost sale con código 70 si el sender se detiene.
+- Tercera revisión independiente: la guarda de TX-D con la coherencia de la aplicación; el lock del ciclo antes del job y reintento de la víctima de interbloqueo; reaplicación del arranque guiada por la evidencia reciente y en paralelo con el sender; el EdgeHost sale con código 70 ante cualquier falla del servicio de impresora; SI-18 decidido.
+
 ## Fase 3 · ERP y plazo (2026-10-14)
 
 - ERP simulado por HTTP (retraso, 503, sin respuesta); `HttpErpClient` con validación del snapshot; `ErpSnapshotSync` con señal de la ingesta, timeout y circuit breaker (Polly) y caché.
