@@ -25,12 +25,44 @@ public sealed record WriteOutcome(string AttemptOutcome, string? JobStatus, stri
 /// </summary>
 public sealed class TxcWriteResult(SqlDb db)
 {
-    /// <summary>A03 y J05. Con nivel NONE el job es terminal en TRANSMITTED y se publica con ResultVersion + 1.</summary>
+    /// <summary>
+    /// A03 y J05. El nivel mínimo y la ventana de evidencia se leen dentro de la transacción: los del
+    /// job congelado para un intento ordinario, los de su autorización para uno excepcional.
+    /// EvidenceDeadlineAt = WriteCompletedAt + ventana (NULL con nivel NONE). Con NONE el job es terminal
+    /// en TRANSMITTED y se publica con ResultVersion + 1.
+    /// </summary>
     public Task<WriteOutcome> TransmittedAsync(
         Guid attemptId, DateTime writeStartedAt, DateTime writeCompletedAt, DateTime preSendCheckAt, DateTime? deviceAcceptedAt,
-        DateTime? evidenceDeadlineAt, bool levelIsNone, DateTime edgeNowUtc, CancellationToken ct) =>
+        DateTime edgeNowUtc, CancellationToken ct) =>
         db.InTransactionAsync(async (conn, tx) =>
         {
+            string kind;
+            int? window;
+            string level;
+            await using (var read = conn.Command(tx, """
+                SELECT pa.Kind, fr.MinConfirmationLevel, fr.EvidenceWindowMs, ra.EvidenceWindowMs
+                FROM dbo.PrintAttempt AS pa
+                INNER JOIN dbo.PrintJob AS pj ON pj.PrintJobId = pa.PrintJobId
+                INNER JOIN dbo.StationConfigRevision AS fr ON fr.ConfigRevisionId = pj.ConfigRevisionId
+                LEFT JOIN dbo.ReprintAuthorization AS ra ON ra.AuthorizationId = pa.AuthorizationId
+                WHERE pa.AttemptId = @AttemptId
+                """))
+            {
+                read.Guid("@AttemptId", attemptId);
+                await using var r = await read.ExecuteReaderAsync(ct);
+                if (!await r.ReadAsync(ct))
+                {
+                    return new WriteOutcome(AttemptOutcome.Sending, null, null, null);
+                }
+
+                kind = r.GetString(0);
+                level = r.GetString(1);
+                window = kind == AttemptKind.ExceptionalReprint ? r.GetInt32(3) : r.GetNullableInt32(2);
+            }
+
+            var levelIsNone = kind == AttemptKind.Ordinary && level == EvidenceLevel.None;
+            DateTime? evidenceDeadline = levelIsNone || window is null ? null : writeCompletedAt.AddMilliseconds(window.Value);
+
             var attempt = await UpdateAttemptAsync(conn, tx, """
                 UPDATE dbo.PrintAttempt
                 SET Outcome = 'TRANSMITTED', WriteStartedAt = @WriteStartedAt, WriteCompletedAt = @WriteCompletedAt,
@@ -39,7 +71,7 @@ public sealed class TxcWriteResult(SqlDb db)
                 WHERE AttemptId = @AttemptId AND Outcome = 'SENDING';
                 """, c => c.DateTime2("@WriteStartedAt", writeStartedAt).DateTime2("@WriteCompletedAt", writeCompletedAt)
                     .DateTime2("@PreSendCheckAt", preSendCheckAt).DateTime2("@DeviceAcceptedAt", deviceAcceptedAt)
-                    .DateTime2("@EvidenceDeadlineAt", evidenceDeadlineAt).Guid("@AttemptId", attemptId), ct);
+                    .DateTime2("@EvidenceDeadlineAt", evidenceDeadline).Guid("@AttemptId", attemptId), ct);
             if (attempt is null)
             {
                 return new WriteOutcome(AttemptOutcome.Sending, null, null, null);

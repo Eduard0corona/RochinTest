@@ -4,6 +4,26 @@ using Microsoft.Data.SqlClient;
 
 namespace CartonPrinting.Infrastructure.Transactions;
 
+/// <summary>
+/// Payload de una reimpresión excepcional: el del job congelado (mismo LabelSerial) y, con
+/// ReprintMarker, una marca visible de reimpresión antes del cierre de la etiqueta.
+/// </summary>
+public static class ReprintPayload
+{
+    public const string MarkerLine = "^FO40,400^A0N,28,28^FDREIMPRESION^FS\n";
+
+    public static string Render(string jobPayload, bool marker)
+    {
+        if (!marker)
+        {
+            return jobPayload;
+        }
+
+        var end = jobPayload.LastIndexOf("^XZ", StringComparison.Ordinal);
+        return end < 0 ? jobPayload + MarkerLine : jobPayload[..end] + MarkerLine + jobPayload[end..];
+    }
+}
+
 public sealed record ReprintExecution(long AuthorizationId, Guid PrintJobId, Guid AttemptId, int AttemptNumber, int EvidenceWindowMs, string Payload);
 
 /// <summary>
@@ -15,9 +35,25 @@ public sealed class TxxReprint(SqlDb db)
 {
     public const int NotExecutable = 52001;
 
-    public Task<ReprintExecution> ExecuteAsync(
-        long authorizationId, string printerId, string ownerInstanceId, long leaseToken, Guid attemptId, DateTime edgeNowUtc, CancellationToken ct) =>
-        db.InTransactionAsync(async (conn, tx) =>
+    public async Task<ReprintExecution> ExecuteAsync(
+        long authorizationId, string printerId, string ownerInstanceId, long leaseToken, Guid attemptId, DateTime edgeNowUtc, CancellationToken ct)
+    {
+        // El payload de la reimpresión se arma antes de TX-X: el del job congelado y, si la autorización
+        // lo pide, la marca visible de reimpresión. El intento registra su propio hash (I09).
+        var (jobPayload, marker) = await db.ReadAsync(async conn =>
+        {
+            await using var read = conn.Command(null, """
+                SELECT pj.Payload, ra.ReprintMarker FROM dbo.ReprintAuthorization AS ra
+                INNER JOIN dbo.PrintJob AS pj ON pj.PrintJobId = ra.PrintJobId WHERE ra.AuthorizationId = @id
+                """);
+            read.BigInt("@id", authorizationId);
+            await using var r = await read.ExecuteReaderAsync(ct);
+            return await r.ReadAsync(ct) ? (r.GetString(0), r.GetBoolean(1)) : (string.Empty, false);
+        }, ct);
+        var reprintPayload = ReprintPayload.Render(jobPayload, marker);
+        var reprintHash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(reprintPayload));
+
+        var execution = await db.InTransactionAsync(async (conn, tx) =>
         {
             await using var cmd = conn.Command(tx, """
                 DECLARE @executed TABLE (AuthorizationId BIGINT NOT NULL, PrintJobId UNIQUEIDENTIFIER NOT NULL, EvidenceWindowMs INT NOT NULL);
@@ -55,11 +91,11 @@ public sealed class TxxReprint(SqlDb db)
                         AttemptId, PrintJobId, AttemptNumber, Kind, AuthorizationId, PrinterId, OwnerInstanceId,
                         LeaseToken, Outcome, MayHaveSent, AttemptPayloadHash, ClaimedAt)
                     SELECT @AttemptId, e.PrintJobId, @attemptNumber, 'EXCEPTIONAL_REPRINT', e.AuthorizationId, @PrinterId,
-                        @OwnerInstanceId, @LeaseToken, 'SENDING', 1, pj.PayloadHash, @EdgeNowUtc
+                        @OwnerInstanceId, @LeaseToken, 'SENDING', 1, @ReprintPayloadHash, @EdgeNowUtc
                     FROM @executed AS e INNER JOIN dbo.PrintJob AS pj ON pj.PrintJobId = e.PrintJobId;
 
                     EXEC sys.sp_set_session_context @key = N'TransitionKind', @value = NULL;
-                    SELECT e.AuthorizationId, e.PrintJobId, @attemptNumber, e.EvidenceWindowMs, pj.Payload
+                    SELECT e.AuthorizationId, e.PrintJobId, @attemptNumber, e.EvidenceWindowMs
                     FROM @executed AS e INNER JOIN dbo.PrintJob AS pj ON pj.PrintJobId = e.PrintJobId;
                 END TRY
                 BEGIN CATCH
@@ -67,6 +103,7 @@ public sealed class TxxReprint(SqlDb db)
                     THROW;
                 END CATCH;
                 """);
+            cmd.Binary32("@ReprintPayloadHash", reprintHash);
             cmd.DateTime2("@EdgeNowUtc", edgeNowUtc).BigInt("@AuthorizationId", authorizationId).NVarChar("@PrinterId", printerId, 64)
                 .NVarChar("@OwnerInstanceId", ownerInstanceId, 128).BigInt("@LeaseToken", leaseToken).Guid("@AttemptId", attemptId);
             await using var r = await cmd.ExecuteReaderAsync(ct);
@@ -75,8 +112,10 @@ public sealed class TxxReprint(SqlDb db)
                 throw new InvalidOperationException("TX-X no devolvió la ejecución.");
             }
 
-            return new ReprintExecution(r.GetInt64(0), r.GetGuid(1), attemptId, r.GetInt32(2), r.GetInt32(3), r.GetString(4));
+            return new ReprintExecution(r.GetInt64(0), r.GetGuid(1), attemptId, r.GetInt32(2), r.GetInt32(3), reprintPayload);
         }, ct);
+        return execution;
+    }
 
     /// <summary>Autorizaciones APPROVED dirigidas a la impresora (la cola del sender de TargetPrinterId).</summary>
     public Task<IReadOnlyList<long>> PendingForPrinterAsync(string printerId, DateTime edgeNowUtc, CancellationToken ct) =>

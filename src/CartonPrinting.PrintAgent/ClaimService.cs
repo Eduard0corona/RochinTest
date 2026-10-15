@@ -47,11 +47,18 @@ public sealed class ClaimService(SqlDb db, TxbClaim txb, CartonMetrics metrics, 
 
     public async Task<ClaimOutcome?> TryClaimAsync(Guid printJobId, LeaseGrant lease, CancellationToken ct)
     {
+        using var activity = CartonTelemetry.ActivitySource.StartActivity("carton.claim");
+        activity?.SetTag(CartonTelemetry.Tags.PrintJobId, printJobId);
+        activity?.SetTag(CartonTelemetry.Tags.PrinterId, lease.PrinterId);
         var context = await LoadAsync(printJobId, ct);
         if (context is null)
         {
             return null;
         }
+
+        activity?.SetTag(CartonTelemetry.Tags.CorrelationId, context.Job.DetectionId);
+        activity?.SetTag(CartonTelemetry.Tags.IdempotencyKey, context.Job.Identity.IdempotencyKey);
+        activity?.SetTag(CartonTelemetry.Tags.LabelSerial, context.Job.LabelSerial);
 
         var now = clock.UtcNow;
         var request = new ClaimRequest(printJobId, Guid.NewGuid(), lease.OwnerInstanceId, lease.FencingToken, now,
@@ -59,10 +66,12 @@ public sealed class ClaimService(SqlDb db, TxbClaim txb, CartonMetrics metrics, 
         var result = await txb.ExecuteAsync(request, ct);
         if (result.Claimed)
         {
+            activity?.SetTag(CartonTelemetry.Tags.AttemptId, result.AttemptId);
             return new ClaimOutcome(true, result.AttemptId, result.AttemptNumber, ClaimRejection.None, context, now);
         }
 
         var rejection = await txb.DiagnoseAsync(request, ct);
+        activity?.SetTag("claimRejection", rejection.ToString());
         switch (rejection)
         {
             case ClaimRejection.NotReady:

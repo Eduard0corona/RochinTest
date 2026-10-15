@@ -42,7 +42,7 @@ public static class DeadlinePolicy
     /// <summary>
     /// Plazo efectivo de un job pendiente: el menor entre el congelado y el recalculado con la
     /// revisión activa (nunca más permisivo que el congelado). Si la revisión activa no puede dar un
-    /// plazo confiable para el registro, el plazo efectivo es su recepción: el job ya no se envía.
+    /// plazo confiable para el registro, el plazo efectivo es su recepción: el job ya no se envía (SI-09).
     /// </summary>
     public static DateTime Effective(DateTime frozenDeadlineUtc, StationRevision active, DetectionRecord detection, bool opensGap = false)
     {

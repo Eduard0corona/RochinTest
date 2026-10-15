@@ -36,6 +36,9 @@ public sealed class TxeErpArrival(SqlDb db)
             var deadline = d.DeadlineAt < plan.EffectiveDeadlineUtc ? d.DeadlineAt : plan.EffectiveDeadlineUtc;
             if (plan.EdgeNowUtc >= deadline.AddMilliseconds(-plan.EffectiveSendMarginMs))
             {
+                // D07 ("snapshot que llega tarde") dentro de TX-E: state-machine.json asigna D07 a TX-S, pero
+                // su disparador incluye el snapshot tardío. Aplicarlo aquí evita crear un job ya vencido y
+                // deja la detección en el mismo estado que dejaría el barrido (SI-06).
                 return await FinishAsync(conn, tx, d, DetectionStatus.Expired, DetectionReason.ErpUnavailable, plan, ct);
             }
 

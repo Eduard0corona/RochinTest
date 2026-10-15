@@ -450,7 +450,7 @@ public sealed class TriggerGuardTests(SqlServerFixture sql) : IAsyncLifetime
         await s.Txb.ExpireReadyAsync(expired, JobReason.DeadlinePassed, s.Clock.UtcNow, Ct);
         var first = await s.ApproveReprintAsync(expired, JobStatus.Expired, "EXPIRED_CARTON_HELD", "NONE_PROVEN");
         var run = await s.ExecuteReprintAsync(first);
-        await s.TransmitAsync(run.AttemptId, Ct, evidenceWindowMs: 60_000);
+        await s.TransmitAsync(run.AttemptId, Ct);
         ex = await Assert.ThrowsAsync<SqlException>(() => s.ApproveReprintAsync(expired, JobStatus.Expired, "EXPIRED_CARTON_HELD", "NONE_PROVEN"));
         Assert.Equal(51024, ex.Number);
     }

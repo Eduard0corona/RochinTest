@@ -214,6 +214,9 @@ public sealed class TxsSweep(SqlDb db)
     /// <summary>
     /// G03: huecos OPEN cuya gracia venció quedan CLOSED_UNRECOVERED con el conteo de ciclos sin
     /// datos; si entretanto llegaron todos, RECOVERED (G02). Nunca se inventan detecciones.
+    /// G02 pertenece a TX-A, pero con RCSI dos TX-A concurrentes que registran los dos últimos ciclos
+    /// del rango pueden no ver la detección de la otra y dejar el hueco OPEN; el barrido lo cierra como
+    /// RECOVERED con el conteo real en lugar de reportarlo como no recuperado (SI-06).
     /// </summary>
     public Task<IReadOnlyList<GapClosure>> CloseGapsAsync(string siteId, string stationId, DateTime edgeNowUtc, CancellationToken ct) =>
         db.InTransactionAsync<IReadOnlyList<GapClosure>>(async (conn, tx) =>
