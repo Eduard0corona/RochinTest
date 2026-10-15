@@ -18,15 +18,21 @@ public sealed record RetainedAnomaly(long AnomalyId, string AnomalyType, long Pl
 /// </summary>
 public sealed class SequenceStore(SqlDb db)
 {
-    /// <summary>Épocas en orden de AcceptedAt con el mayor CycleId registrado de cada una y su DetectionTimestamp.</summary>
+    /// <summary>
+    /// Épocas en orden de AcceptedAt con el mayor CycleId registrado de cada una y su DetectionTimestamp. Una
+    /// detección BLOCKED con INCOHERENT_SNAPSHOT (D05, terminal) cuenta para la marca alta, pero su hora no: no es
+    /// confiable para distinguir un tardío de un reinicio (la misma regla que la ingesta en memoria).
+    /// </summary>
     public Task<IReadOnlyList<EpochMark>> LoadEpochsAsync(string siteId, string stationId, CancellationToken ct) =>
         db.ReadAsync<IReadOnlyList<EpochMark>>(async conn =>
         {
             await using var cmd = conn.Command(null, """
-                SELECT e.PlcEpoch, e.AcceptedAt, hw.CycleId, hw.DetectionTimestamp, e.AcceptanceMode
+                SELECT e.PlcEpoch, e.AcceptedAt, hw.CycleId,
+                       CASE WHEN hw.Status = 'BLOCKED' AND hw.Reason = 'INCOHERENT_SNAPSHOT' THEN NULL ELSE hw.DetectionTimestamp END,
+                       e.AcceptanceMode
                 FROM dbo.PlcEpochHistory AS e
                 OUTER APPLY (
-                    SELECT TOP (1) cd.CycleId, cd.DetectionTimestamp
+                    SELECT TOP (1) cd.CycleId, cd.DetectionTimestamp, cd.Status, cd.Reason
                     FROM dbo.CartonDetection AS cd
                     WHERE cd.SiteId = e.SiteId AND cd.StationId = e.StationId AND cd.PlcEpoch = e.PlcEpoch
                     ORDER BY cd.CycleId DESC) AS hw

@@ -13,6 +13,9 @@ public enum SequenceCase
     Late,
     ResetSuspected,
     AmbiguousDecrease,
+
+    /// <summary>Registro incoherente con CycleId menor o igual que la marca alta: sin efecto de secuencia.</summary>
+    IncoherentBelowMark,
 }
 
 /// <summary>Veredicto de la clasificación de secuencia de un registro Good.</summary>
@@ -59,6 +62,19 @@ public sealed class SequenceClassifier
     public bool LastWasAmbiguousDecrease { get; private set; }
 
     public SequenceVerdict Classify(CycleRecord record, StationRevision revision, DateTime edgeNowUtc)
+    {
+        var verdict = ClassifyEpoch(record, revision, edgeNowUtc);
+        if (verdict is SequenceVerdict.AcceptEpoch && !record.Coherent)
+        {
+            // Un registro incoherente no acepta épocas: su PlcEpoch puede ser de otro ciclo (SI-13, interino de
+            // falla cerrada).
+            return new SequenceVerdict.RetainEpochUnexpected($"Registro incoherente de la época {record.PlcEpoch}, que no está aceptada.");
+        }
+
+        return verdict;
+    }
+
+    private SequenceVerdict ClassifyEpoch(CycleRecord record, StationRevision revision, DateTime edgeNowUtc)
     {
         var current = Current;
         if (current is null)
@@ -134,6 +150,14 @@ public sealed class SequenceClassifier
             return WithRate(SequenceCase.Gap, new SequenceDecision { Gap = new GapOpen(m + 1, c - 1, grace) }, mark, record, revision);
         }
 
+        if (!record.Coherent)
+        {
+            // Un registro incoherente (queda BLOCKED con INCOHERENT_SNAPSHOT) solo avanza la marca alta y abre
+            // huecos, igual que su fila al recargar el estado desde SQL; su DetectionTimestamp no es confiable, así
+            // que no decide tardíos ni reinicios.
+            return new SequenceVerdict.Register(SequenceCase.IncoherentBelowMark, new SequenceDecision());
+        }
+
         // Clave nueva (si existiera, TX-A lo resuelve) con CycleId menor o igual que la marca alta.
         var retained = RetainedRecords.ToJson(record);
         if (record.DetectionTimestamp is { } ts && mark.HighWaterTimestamp is { } tsM)
@@ -171,7 +195,7 @@ public sealed class SequenceClassifier
     /// </summary>
     private static SequenceVerdict WithRate(SequenceCase kind, SequenceDecision decision, EpochMark mark, CycleRecord record, StationRevision revision)
     {
-        if (revision.MinCycleIntervalMs is { } min && mark.HighWater is { } m && record.DetectionTimestamp is { } ts
+        if (record.Coherent && revision.MinCycleIntervalMs is { } min && mark.HighWater is { } m && record.DetectionTimestamp is { } ts
             && mark.HighWaterTimestamp is { } tsM)
         {
             var elapsedMs = (CanonicalTimestamp.Truncate(ts) - tsM).TotalMilliseconds;
@@ -196,8 +220,17 @@ public sealed class SequenceClassifier
         _epochs.Add(new EpochMark(epoch, acceptedAt, null, null, acceptanceMode));
     }
 
+    /// <summary>
+    /// Actualiza la marca alta y la caché con el resultado de TX-A. La misma regla que
+    /// <see cref="SequenceStore.LoadEpochsAsync"/>: el DetectionTimestamp de una detección BLOCKED con
+    /// INCOHERENT_SNAPSHOT no se toma como hora de la marca alta.
+    /// </summary>
+    public void Observe(CycleRecord record, SequenceCase kind, RegistrationResult result) =>
+        Observe(record, kind, result.Outcome,
+            timestampTrusted: !(result.FinalStatus == DetectionStatus.Blocked && result.FinalReason == DetectionReason.IncoherentSnapshot));
+
     /// <summary>Actualiza la marca alta y la caché con el resultado de TX-A.</summary>
-    public void Observe(CycleRecord record, SequenceCase kind, RegistrationOutcome outcome)
+    public void Observe(CycleRecord record, SequenceCase kind, RegistrationOutcome outcome, bool timestampTrusted = true)
     {
         var key = (record.PlcEpoch, record.CycleId);
         if (outcome == RegistrationOutcome.Collision)
@@ -206,8 +239,9 @@ public sealed class SequenceClassifier
         }
 
         Remember(key, record.SourceFingerprint());
-        if (outcome == RegistrationOutcome.Registered)
+        if (outcome == RegistrationOutcome.Registered && record.Coherent)
         {
+            // Un incoherente entre dos descensos ambiguos no corta la cadena de ciclos consecutivos.
             LastWasAmbiguousDecrease = kind == SequenceCase.AmbiguousDecrease;
         }
 
@@ -225,7 +259,9 @@ public sealed class SequenceClassifier
             _epochs[index] = mark with
             {
                 HighWater = record.CycleId,
-                HighWaterTimestamp = record.DetectionTimestamp is { } ts ? CanonicalTimestamp.Truncate(ts) : null,
+                HighWaterTimestamp = timestampTrusted && record.Coherent && record.DetectionTimestamp is { } ts
+                    ? CanonicalTimestamp.Truncate(ts)
+                    : null,
             };
         }
     }

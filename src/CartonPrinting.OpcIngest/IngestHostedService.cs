@@ -55,17 +55,9 @@ public sealed class IngestHostedService(
 
         Service = ingest;
         await using var source = new OpcUaCycleSource(options.Opc, clock, metrics, loggers.CreateLogger<OpcUaCycleSource>());
-        long droppedSeen = 0;
-        bool Overloaded()
-        {
-            // Canal casi lleno, o notificaciones descartadas desde el latido anterior.
-            var dropped = source.DroppedNotifications;
-            var lost = dropped > droppedSeen;
-            droppedSeen = dropped;
-            return lost || channel.Reader.Count >= options.ChannelCapacity * 9 / 10;
-        }
-
-        var heartbeat = new LabelingReadyHeartbeat(station, stations, source, metrics, loggers.CreateLogger<LabelingReadyHeartbeat>(), Overloaded);
+        var pressure = new ChannelPressure(channel.Reader, options.ChannelCapacity, () => source.DroppedNotifications);
+        var heartbeat = new LabelingReadyHeartbeat(station, stations, source, metrics, loggers.CreateLogger<LabelingReadyHeartbeat>(),
+            pressure.Overloaded);
 
         // Con el PLC inalcanzable al arrancar, se reintenta: el resto del EdgeHost (Outbox, barrido) sigue.
         var backoff = TimeSpan.FromSeconds(1);
