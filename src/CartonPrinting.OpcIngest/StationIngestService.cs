@@ -58,6 +58,7 @@ public sealed class StationIngestService
     private readonly IErpDemand? _erpDemand;
     private readonly SemaphoreSlim _serial = new(1, 1);
     private SequenceClassifier _classifier = new([]);
+    private bool _sqlUnavailable;
 
     public StationIngestService(
         StationSettings station, RegistrationService registration, StationConfigStore stations, PlcEpochStore epochs, SequenceStore sequence,
@@ -107,7 +108,11 @@ public sealed class StationIngestService
         _classifier = new SequenceClassifier(epochs);
     }
 
-    /// <summary>Consume el canal hasta que se cancele. Una excepción de SQL detiene el consumidor: no se salta un registro.</summary>
+    /// <summary>
+    /// Consume el canal hasta que se cancele. Con SQL Server fuera de servicio, el registro no se registra (será un hueco
+    /// al volver SQL; ver <see cref="ProcessAsync"/>). Cualquier otra excepción de SQL detiene el consumidor: no se salta
+    /// un registro por un defecto.
+    /// </summary>
     public async Task RunAsync(ChannelReader<RawNotification> reader, CancellationToken ct)
     {
         await ReloadAsync(ct);
@@ -132,7 +137,49 @@ public sealed class StationIngestService
             return new IngestOutcome(IngestKind.Rejected, Rejection: decoded.Rejection);
         }
 
-        return await ProcessRecordAsync(record, ct);
+        return await ProcessLiveAsync(record, ct);
+    }
+
+    /// <summary>
+    /// SQL Server fuera de servicio, perfil mínimo (ESTRATEGIA_RECUPERACION §3, T19): falla cerrada.
+    /// <list type="bullet">
+    /// <item>Hasta dos reintentos cortos. Después, el ciclo no se registra: al volver SQL será parte de un hueco
+    /// (SequenceGap), nunca una detección.</item>
+    /// <item>El latido ya baja LabelingReady, porque no puede leer la estación.</item>
+    /// <item>Al volver, antes del primer registro, se recarga el estado de la estación desde SQL.</item>
+    /// </list>
+    /// </summary>
+    private async Task<IngestOutcome> ProcessLiveAsync(CycleRecord record, CancellationToken ct)
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                if (_sqlUnavailable)
+                {
+                    await ReloadAsync(ct);
+                    _sqlUnavailable = false;
+                    _logger.LogWarning("SQL Server volvió: estado de la estación {Station} recargado; los ciclos de la caída serán un hueco",
+                        _station.StationId);
+                }
+
+                return await ProcessRecordAsync(record, ct);
+            }
+            catch (Exception ex) when (SqlAvailability.IsUnavailable(ex) && !ct.IsCancellationRequested)
+            {
+                if (attempt < 3)
+                {
+                    await Task.Delay(TimeSpan.FromMilliseconds(100 * attempt), ct);
+                    continue;
+                }
+
+                _sqlUnavailable = true;
+                _metrics.Increment(MetricNames.OpcRecordsRejected, ("cause", "SQL_UNAVAILABLE"), ("transport", record.Transport));
+                _logger.LogError("SQL Server no disponible: el ciclo {Key} no se registra (falla cerrada; será un hueco al volver SQL)",
+                    record.Identity.IdempotencyKey);
+                return new IngestOutcome(IngestKind.Rejected, record, Rejection: "SQL_UNAVAILABLE");
+            }
+        }
     }
 
     public async Task<IngestOutcome> ProcessRecordAsync(CycleRecord record, CancellationToken ct)
