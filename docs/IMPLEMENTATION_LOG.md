@@ -449,3 +449,70 @@ Compuerta en verde.
 - T24 a escala completa tarda unos 2,5 minutos (5200 entregas reales contra SQL).
 - La caché de huellas es de 4096 claves: una repetición más vieja va a TX-A, que la resuelve igual.
 
+## Fase 3 · ERP y plazo (T03, T04, T17, T18, T21, T33, T37, T46)
+
+### Plan
+
+- **Entregables:** sincronización ERP asíncrona con timeout y circuit breaker y un ERP simulado con latencia y caídas; `WAITING_ERP` y TX-E (D06, D08); plazo y margen efectivos (congelado frente a revisión activa) con `DeviceLeadTimeMs`; detector de saltos del reloj (`CLOCK_JUMP`) y desfase del PLC (`CLOCK_SKEW`); barrido TX-S por estación; configuración versionada activada por dos personas.
+- **Pruebas que la cierran:** T03, T04, T17, T18, T21, T33, T37 y T46.
+- **Riesgos previstos:** pruebas sensibles a la latencia real (ERP lento); simular un ajuste de NTP sin un reloj controlable.
+
+### Lo hecho
+
+- **Simulador** (`CartonPrinting.Simulators/Erp`): ERP HTTP en proceso (solo 127.0.0.1) con retraso, 503 y conexión sin respuesta.
+- **ERP** (`CartonPrinting.ErpSync`): `HttpErpClient` (valida el snapshot: campos, vigencia, GTIN de 14 dígitos, orden pedida; nunca usa uno no validado, I10), `ErpSnapshotSync` (sondeo con señal de la ingesta por `System.Threading.Channels`, Polly con timeout y circuit breaker, caché, `erp_cache_age_seconds`).
+- **Orquestación**: `ErpArrivalService` (plazo y margen efectivos, serial y payload antes de TX-E; sin serial si el plazo ya venció), `StationSweepService` (TX-S por estación con la comprobación del reloj antes de evaluar, `config_revision_active`), `IErpDemand`.
+- **Reloj**: `ClockGuard` (divergencia entre `UtcNow` y el monotónico), compartido por el barrido y el claim de la estación; `CLOCK_SKEW` en la ingesta con `PLC_TIMESTAMP`.
+- **EdgeHost**: servicios por estación (ERP y barrido) y señal de la ingesta al ERP.
+
+### Decisiones
+
+1. **Contrato con el ERP.** El del simulador (GET JSON por orden); el real es una decisión de integración y queda detrás de `IErpClient`. Un 404 es "sin snapshot"; un error, un timeout o un snapshot inválido son "ERP no disponible".
+2. **Polly**: circuit breaker por fuera y timeout por dentro (un timeout cuenta como falla). Los tiempos de E/S usan el reloj real; los instantes del dominio, el del EdgeHost.
+3. **Snapshot tardío.** `ErpArrivalService` no reserva serial si el plazo efectivo ya venció; TX-E no crea el job y deja la detección en `WAITING_ERP`; el barrido aplica D07 (decisión 11 de la Fase 1).
+4. **`erp_cache_age_seconds`** = segundos desde la última respuesta del ERP (o desde el arranque si nunca respondió).
+5. **Orden del barrido**: reloj primero (con un salto no evalúa nada); después J03 y J14 (plazo y orden) antes de J13, que además exige plazo vigente en SQL; D07; ventanas de evidencia; autorizaciones; G03.
+6. **`CLOCK_JUMP`**: un `ClockGuard` por estación, compartido por el barrido y el claim; la tolerancia es la de la revisión activa; al detectar un salto se bloquea la estación y el claim se rechaza (`ClockJump`) sin evaluar el plazo. Un salto menor que la tolerancia no se detecta (límite declarado en la sección 10.2).
+7. **`CLOCK_SKEW`**: con `PLC_TIMESTAMP`, un `DetectionTimestamp` posterior a la recepción es un límite inferior del adelanto del reloj del PLC; si supera `ClockSkewToleranceMs`, la estación se bloquea antes de registrar el ciclo y el ciclo queda `BLOCKED` con `STATION_DISABLED`. Su `DeadlineAt` se calcula igual (el contrato exige `deadlineAt` posterior a `detectionTimestamp`) pero no decide nada: no se crea job. Un reloj del PLC atrasado acorta los plazos (es restrictivo) y no se distingue de la latencia: no se detecta.
+8. **El escenario de pruebas admite el reloj real** (`TimeProvider.System`) para las pruebas con latencia real (T03); `ManualTimeProvider` separa el reloj de pared del monotónico para simular un ajuste de NTP (T37).
+
+### Comandos y resultados
+
+Compuerta completa, 2026-10-14 23:10 (`powershell -File build/ci.ps1 --fase 3`):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   159, Omitido:     0, Total:   159, Duración: 22 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    83, Omitido:     0, Total:    83, Duración: 2 m 22 s - CartonPrinting.IntegrationTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    33, Omitido:     0, Total:    33, Duración: 3 m 19 s - CartonPrinting.FaultTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 62 ejecutadas
+  Fase 3: T03=1 destino(s), 1 ejecutadas, T04=1 destino(s), 1 ejecutadas, T17=1 destino(s), 1 ejecutadas, T18=1 destino(s), 1 ejecutadas, T21=1 destino(s), 1 ejecutadas, T33=1 destino(s), 1 ejecutadas, T37=3 destino(s), 3 ejecutadas, T46=1 destino(s), 1 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
+Durante el desarrollo:
+
+- Al integrar las correcciones de la Fase 2, T03 empezó a fallar a veces: con el presupuesto de tránsito por defecto (950 ms útiles), la latencia de arranque en frío de la primera consulta HTTP (Kestrel, `HttpClient`, JIT) se comía el plazo. Una pasada directa sí creaba el job. La prueba ahora calienta el cliente y usa `TransitBudgetMs` = 3000 (la precondición del catálogo solo exige que sea mayor que el retraso del ERP).
+- T26 (Fase 2) falló en esta rama porque un dato de prueba tenía un `DetectionTimestamp` en el futuro, que con `CLOCK_SKEW` bloquea la estación como debe. Se corrigió el dato.
+
+### Pruebas de la fase
+
+- **T03, T04, T17, T18, T21, T33, T37 y T46: PASA** (detalle en `docs/TEST_STATUS.md`).
+
+### Lo que no se verificó
+
+- Ningún ERP real: el contrato y el formato son del simulador.
+- El ajuste de NTP se simula con `ManualTimeProvider`; no se cambió el reloj del sistema.
+- `CLOCK_SKEW` solo detecta un PLC adelantado.
+- Los tiempos del barrido y de la sincronización ERP en el EdgeHost (200 ms y 100 ms) no se ajustaron con carga (Fase 7).
+
+### Riesgos
+
+- Una latencia del ERP cercana al plazo deja la detección en `WAITING_ERP` y la vence: es el comportamiento pedido, pero en la máquina de pruebas depende del ruido.
+- El `ClockGuard` compara entre comprobaciones: si nada lo consulta durante un rato, un salto se detecta en la siguiente comprobación (el barrido corre cada 200 ms).
+
