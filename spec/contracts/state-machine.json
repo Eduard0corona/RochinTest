@@ -485,7 +485,7 @@
           "mode": "correction",
           "tx": "TX-D",
           "trigger": "Llega una lectura VERIFIED correlacionada con el ciclo cuyo serial no es el LabelSerial del job, con el job ya confirmado o en UNKNOWN por otra causa.",
-          "guard": "SESSION_CONTEXT TransitionKind = CORRECTION; EvidenceObservation VERIFIED del ciclo del job con ReadSerial distinto de LabelSerial (el trigger lo exige). Desde UNKNOWN cambian Reason y resultVersion, no el estado; después no hay reconciliación automática.",
+          "guard": "SESSION_CONTEXT TransitionKind = CORRECTION; EvidenceObservation VERIFIED del ciclo del job con ReadSerial distinto de LabelSerial, recibida en o después del ClaimedAt del último intento del job y con ObservationId mayor que el ConfirmingObservationId de cualquier intento del job (el trigger lo exige, ADR 0016). Desde UNKNOWN cambian Reason y resultVersion, no el estado; después no hay reconciliación automática.",
           "action": "Reason SERIAL_MISMATCH; Outbox PrintJobResult UNKNOWN con resultVersion mayor; alerta de mal etiquetado."
         },
         {

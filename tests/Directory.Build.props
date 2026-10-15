@@ -3,8 +3,8 @@
 
   <!-- Común a los proyectos de prueba. -->
   <PropertyGroup>
-    <!-- Los nombres de prueba usan guiones bajos como frases. -->
-    <NoWarn>$(NoWarn);CA1707</NoWarn>
+    <!-- Los nombres de prueba usan guiones bajos como frases; los ayudantes de escenario no reciben el token de cancelación en cada llamada (xUnit1051). -->
+    <NoWarn>$(NoWarn);CA1707;xUnit1051</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

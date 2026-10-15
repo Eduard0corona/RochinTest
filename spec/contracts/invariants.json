@@ -268,7 +268,7 @@
     {
       "id": "I25",
       "rule": "Un resultado final solo se reemplaza por corrección o procedimiento excepcional, siempre con resultVersion mayor.",
-      "mechanism": "Las únicas salidas de estados terminales son J18 (corrección) y X01 a X03 (excepción), comprobado por el verificador; TR_PrintJob_StateMachine evalúa todo cambio de estado, Reason, marca de reimpresión o punteros de respaldo y exige el respaldo de cada modo con el intento excepcional más reciente; ResultVersion no retrocede (TR_PrintJob_Immutable); eventId depende de resultVersion.",
+      "mechanism": "Las únicas salidas de estados terminales son J18 (corrección) y X01 a X03 (excepción), comprobado por el verificador; TR_PrintJob_StateMachine evalúa todo cambio de estado, Reason, marca de reimpresión o punteros de respaldo y exige el respaldo de cada modo con el intento excepcional más reciente y, para la corrección, una lectura posterior al último claim y a la observación que confirmó (ADR 0016); ResultVersion no retrocede (TR_PrintJob_Immutable); eventId depende de resultVersion.",
       "enforcedBy": "SQL + verificador",
       "tests": [
         "T43",
