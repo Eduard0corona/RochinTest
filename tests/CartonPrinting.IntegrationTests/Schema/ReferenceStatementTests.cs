@@ -187,6 +187,7 @@ public sealed class ReferenceStatementTests(SqlServerFixture sql) : IAsyncLifeti
         // 0 filas en todas las operaciones.
         Assert.Empty(await s.Txs.ExpireDeadlinesAsync(StationScenario.SiteId, s.StationId, 100, now, Ct));
         Assert.Empty(await s.Txs.ExpireOutOfOrderAsync(StationScenario.SiteId, s.StationId, now, Ct));
+        Assert.Empty(await s.Txs.ExpireOutOfOrderReferenceAsync(StationScenario.SiteId, s.StationId, now, Ct));
         Assert.Null(await s.Txs.ReleaseRetryAsync(Guid.NewGuid(), now.AddSeconds(5), 100, s.Revision.ConfigRevisionId, now, Ct));
         Assert.Empty(await s.Txs.ListPendingJobsAsync(StationScenario.SiteId, s.StationId, Ct));
         Assert.Empty(await s.Txs.ExpireWaitingErpAsync(StationScenario.SiteId, s.StationId, 100, now, Ct));
@@ -232,6 +233,12 @@ public sealed class ReferenceStatementTests(SqlServerFixture sql) : IAsyncLifeti
         var (_, newer) = await s.SendingJobAsync(61);
         var outOfOrder = Assert.Single(await s.Txs.ExpireOutOfOrderAsync(StationScenario.SiteId, s.StationId, s.Clock.UtcNow, Ct));
         Assert.Equal((older, JobReason.OutOfOrder), (outOfOrder.Id, outOfOrder.Reason));
+        // La sentencia de referencia, tal cual (SI-21: el barrido usa la forma en dos pasos), con N filas en otra estación.
+        var r = await StationScenario.CreateAsync(_db, ct: Ct);
+        var olderRef = await r.ReadyJobAsync(60);
+        await r.SendingJobAsync(61);
+        var reference = Assert.Single(await r.Txs.ExpireOutOfOrderReferenceAsync(StationScenario.SiteId, r.StationId, r.Clock.UtcNow, Ct));
+        Assert.Equal((olderRef, JobStatus.Ready, JobReason.OutOfOrder), (reference.Id, reference.From, reference.Reason));
         var recovery = await s.Txr0.ExecuteAsync(s.PrinterId, s.Clock.UtcNow, Ct);                                        // A04 + J09
         Assert.Single(recovery.OrdinaryJobs);
         Assert.Equal(AttemptOutcome.Unknown, (await s.AttemptsAsync(recovery.OrdinaryJobs[0])).Single(a => a.AttemptId == newer).Outcome);

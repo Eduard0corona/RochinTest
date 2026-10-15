@@ -8,7 +8,8 @@ namespace CartonPrinting.FaultTests.Hardening;
 /// SI-21: los barridos que recorren los jobs pendientes de la estación (OUT_OF_ORDER y CLOCK_JUMP) bloquean cada job por PK_PrintJob
 /// antes que por IX_PrintJob_Sweep, en el mismo orden que el claim de TX-B (J02). Las sentencias de referencia recorrían
 /// IX_PrintJob_Sweep con U y buscaban la fila después; contra el claim de esa misma fila se interbloqueaban, y el sender quedaba
-/// detenido hasta que SQL Server detectaba el ciclo (hasta 5 s): en T12, una o dos cajas vencidas cada media hora.
+/// detenido hasta que SQL Server detectaba el ciclo (hasta 5 s): en la corrida "c" de T12, dos cajas vencidas con un 1205.
+/// Es la prueba de regresión de SI-21, sin Trait de la especificación: no comprueba el criterio de T42 ni el de T37.
 /// La prueba fija el orden: una sesión toma el job como el claim (U en la clave primaria), el barrido real queda esperando esa fila
 /// y después la sesión pide el job en IX_PrintJob_Sweep, como hace el claim al sacarlo de READY. Con el orden de las sentencias de
 /// referencia es un interbloqueo seguro.
@@ -29,7 +30,6 @@ public sealed class SweepLockOrderTests(SqlServerFixture sql) : IAsyncLifetime
     private static CancellationToken Ct => TestContext.Current.CancellationToken;
 
     [Theory]
-    [Trait("Spec", "T42")]
     [InlineData("OUT_OF_ORDER")]
     [InlineData("CLOCK_JUMP")]
     public async Task A_sweep_over_the_pending_jobs_never_deadlocks_with_a_claim_of_one_of_them(string sweep)
@@ -44,13 +44,18 @@ public sealed class SweepLockOrderTests(SqlServerFixture sql) : IAsyncLifetime
 
         var job = await s.ReadyJobAsync(++cycle, Ct);
 
-        // El claim: primero la fila en la clave primaria (con prioridad alta, para que la víctima de un interbloqueo sea el barrido y
-        // se cuente en DeadlockRetries).
+        // El claim: primero la fila en la clave primaria. La sesión tiene prioridad alta, para que la víctima de un interbloqueo sea el
+        // barrido y se cuente en DeadlockRetries. El SET va en un lote sin parámetros: dentro de sp_executesql se restauraría al
+        // terminar el lote.
         await using var claim = new SqlConnection(s.Db.AdminConnectionString);
         await claim.OpenAsync(Ct);
+        await using (var priority = new SqlCommand("SET DEADLOCK_PRIORITY HIGH;", claim))
+        {
+            await priority.ExecuteNonQueryAsync(Ct);
+        }
+
         await using var tx = (SqlTransaction)await claim.BeginTransactionAsync(Ct);
         var spid = await ExecuteAsync<short>(claim, tx, """
-            SET DEADLOCK_PRIORITY HIGH;
             SELECT 1 FROM dbo.PrintJob WITH (UPDLOCK, ROWLOCK, INDEX (PK_PrintJob)) WHERE PrintJobId = @job;
             SELECT CAST(@@SPID AS SMALLINT);
             """, job, s.StationId);

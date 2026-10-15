@@ -1262,7 +1262,14 @@ Compuerta en verde.
     - **Qué busca.** Valores literales en cualquier clave que nombre una contraseña, una frase de paso o un secreto, con `=` o `:` y también entre comillas JSON, en todos los archivos de texto salvo `spec/` y `tests/`.
     - **Qué no cuenta.** En código solo cuenta una cadena literal. Las variables y los marcadores (`<...>`) no cuentan.
     - **`.env.example`.** Tenía contraseñas de ejemplo; ahora van vacías, y `docker compose` no arranca hasta completarlas.
-16. **El barrido bloquea los jobs en el mismo orden que el claim** (SI-21). Los barridos que recorren los pendientes de la estación (`OUT_OF_ORDER` y `CLOCK_JUMP`) leen los candidatos sin locks y los actualizan por `PK_PrintJob`, con el predicado completo bajo el lock de cada fila. La sentencia de referencia recorría `IX_PrintJob_Sweep` con U antes de la clave primaria, al revés que el claim J02, y se interbloqueaban: el sender quedaba detenido hasta 5 s y la caja vencía. Ver "Interbloqueo del barrido con el claim".
+16. **El barrido bloquea los jobs en el mismo orden que el claim** (SI-21).
+    - **Cómo.** Los barridos que recorren los pendientes de la estación (`OUT_OF_ORDER` y `CLOCK_JUMP`) leen los candidatos por versiones y los actualizan por `PK_PrintJob`, con el predicado completo bajo el lock de cada fila.
+    - **Por qué.** La sentencia de referencia recorría `IX_PrintJob_Sweep` con U antes de la clave primaria, al revés que el claim J02, y se interbloqueaban. El sender quedaba detenido hasta 5 s y la caja vencía.
+    - **Qué no cambia.** Las guardas, el motivo y los efectos son los mismos.
+    - **La diferencia.** Lo que entra en `READY` o `RETRY_WAIT` durante el barrido queda para la pasada siguiente.
+    - **T47.** La sentencia de referencia se conserva tal cual para T47 (`ExpireOutOfOrderReferenceAsync`).
+
+    Ver "Interbloqueo del barrido con el claim".
 17. **Diagnóstico de T12.** El reporte se escribe antes de las aserciones. Incluye:
     - los jobs sin `CONFIRMED` con sus intentos;
     - los picos de backlog con su momento;
@@ -1272,7 +1279,10 @@ Compuerta en verde.
     - las pausas del propio proceso;
     - el momento de cada falla contada.
 
-    `docs/BENCHMARK.md` lo resume en "Errores y escenarios excluidos".
+    `build/benchmark_report.py` lo escribe en "Errores y escenarios excluidos" al regenerar `docs/BENCHMARK.md` con la compuerta final. El `BENCHMARK.md` versionado todavía es el de la corrida de las 06:46, con la composición anterior (sin barrido ni Outbox Relay).
+    - Un fallo del propio diagnóstico queda en el reporte y no hace fallar T12.
+    - Una fase que no termina de drenar se afirma después de escribir el reporte.
+18. **Un NOT_SENT con la estación bloqueada por `CLOCK_JUMP` vence el job (J08)** en lugar de J06, extensión de SI-16 (revisión de `59e6c73`, MEDIA). Un envío en curso durante el salto no lo veía la purga, y J06 lo devolvía a `RETRY_WAIT` para imprimirlo después del desbloqueo con su plazo del reloj anterior. TX-C lee la estación con lock compartido antes que cualquier otra fila, en el mismo orden que la purga.
 
 ### Comandos y resultados
 
@@ -1536,13 +1546,17 @@ Comandos, con la máquina en reposo, 2026-10-15:
 
 ### Interbloqueo del barrido con el claim
 
-T12 vencía unas pocas cajas en cada corrida de 40 minutos, siempre juntas, en una pausa de unos 2 s del sender. Tres corridas más de T12, solas, con diagnóstico agregado al reporte (decisión 17):
+T12 vencía cajas en las corridas de 40 minutos: 10 en la compuerta de `4e4dff8`, sin diagnóstico. Tres corridas más de T12, solas, con diagnóstico agregado al reporte (decisión 17):
 
 - **"b"**, de 11:46 a 12:16: falló por backlog 4 en la tasa pactada (máximo 3), antes de escribir el reporte. Desde entonces el reporte va antes de las aserciones.
 - **"c"**, de 12:18 a 12:59: 3008 `CONFIRMED` y 2 `EXPIRED` con `DEADLINE_PASSED`, a los 1487 s. El ciclo 1496 quedó `NOT_SENT` en la segunda comprobación y el 1497 venció sin intento. Hubo 1 transacción reintentada por un 1205, sin caídas de SQL, pausas del sender ni errores.
 - **"d"**, a las 13:05: Docker Desktop se detuvo durante la corrida (código de salida 4, contenedores con 255) y no dejó resultados.
 
-Una sonda temporal en `CartonPrinting.LoadTests` reprodujo la composición de T12 a 10 cajas por segundo durante 2 minutos, con el muestreo de esperas de SQL Server. Se borró antes de la compuerta. Terminada a las 14:07, 1200 cajas: 23 `EXPIRED` y 1 interbloqueo. El muestreo lo ubicó a los 93 s:
+Una sonda temporal en `CartonPrinting.LoadTests` (`DeadlockProbeTests`, `Category=Probe`, borrada antes de la compuerta) reprodujo la composición de T12 a 10 cajas por segundo durante 2 minutos. Se ejecutó con `CARTONPRINTING_PROBE_OUT=<scratchpad>/probe10.xml dotnet test tests/CartonPrinting.LoadTests --no-build --filter "FullyQualifiedName~Capture_deadlocks_at_ten"`; la prueba escribía en ese archivo el conteo de jobs por estado, los 1205 reintentados y los grafos de `system_health`.
+
+- **13:02, sin el muestreo de esperas:** `<!-- cajas 1201; EXPIRED=10, CONFIRMED=1191; 1205 reintentados 0 -->`. Ningún interbloqueo: estas 10 cajas no se explican con SI-21, y Docker Desktop se detuvo a las 13:05.
+- **13:04, otra sonda de TX-C contra TX-D (300 cajas, sin barrido):** `<!-- CONFIRMED=300; 1205 reintentados 0 -->`.
+- **14:07, con el muestreo de esperas (`StallWatch`):** `<!-- cajas 1200; EXPIRED=23, CONFIRMED=1177; 1205 reintentados 1 -->`. El muestreo ubicó el interbloqueo a los 93 s:
 
 ```
 93.0 s: sesión 65 suspended 1905 ms, espera LCK_M_X 1904 ms en KEY: …: UPDATE pj SET Status = 'SENDING', … | bloqueada por la sesión 77 (…): … UPDATE pj SET Status = 'EXPIRED', Reason = 'OUT_OF_ORDER', …
@@ -1552,10 +1566,61 @@ Una sonda temporal en `CartonPrinting.LoadTests` reprodujo la composición de T1
 
 Según el grafo de `system_health`, el claim tenía X en `PK_PrintJob` y esperaba X en `IX_PrintJob_Sweep`; el barrido tenía U en `IX_PrintJob_Sweep` y esperaba U en `PK_PrintJob`. Es SI-21. Corrección: decisión 16.
 
-- Sonda a 10 cajas por segundo con la corrección, terminadas a las 14:14 y a las 14:17: 1200 `CONFIRMED`, ningún 1205 y ninguna espera larga, las dos veces.
-- `SweepLockOrderTests` (dos casos: `OUT_OF_ORDER` y `CLOCK_JUMP`): correctos cuatro veces seguidas con la corrección. Con el `TxsSweep.cs` anterior fallan siempre (mutación, dos veces): `OUT_OF_ORDER: 1 transacciones reintentadas por un 1205 con el claim`, y en `CLOCK_JUMP` la sesión del claim fue la víctima.
-  - Las dos primeras versiones de la prueba no servían. Una reclamaba con todos los jobs `READY`, y SQL Server recorría la clave primaria en lugar del índice. La otra dependía de la carrera y detectó la mutación en 3 de 7 corridas. La versión final fija el orden de los locks.
-- Pruebas del barrido, del salto del reloj y de las sentencias de referencia, con la corrección (`--filter` con `ClockAndRetryTests`, `ClockGuardTests`, `ReferenceStatementTests`, `LateEventTests`, `PrinterFaultTests`, `ErpReviewTests` y `DeadlinePolicyTests`): IntegrationTests 10 de 10, FaultTests 21 de 21 y UnitTests 4 de 4.
+- **Sonda a 10 cajas por segundo con la corrección** (mismo comando), terminadas a las 14:14 y a las 14:17: `<!-- cajas 1200; CONFIRMED=1200; 1205 reintentados 0 -->` las dos veces, y el muestreo no registró ninguna espera larga.
+- **`SweepLockOrderTests`.** Pasó con la corrección en cuatro corridas seguidas: `Correctas! - Con error: 0, Superado: 2, Omitido: 0, Total: 2`. Comando: `dotnet test tests/CartonPrinting.FaultTests --no-build --filter "FullyQualifiedName~SweepLockOrderTests"`. No se anotó la hora de cada corrida.
+  - **Mutación**, con el `TxsSweep.cs` anterior (`git show HEAD:…` sobre el archivo, revertido después), dos veces: `Con error! - Con error: 2, Superado: 0, Total: 2`.
+  - **Las dos primeras versiones de la prueba no servían.**
+    - Una reclamaba con todos los jobs `READY`, y SQL Server recorría la clave primaria en lugar del índice: la mutación pasaba.
+    - La otra dependía de la carrera y detectó la mutación en 3 de 7 corridas.
+
+    La versión final fija el orden de los locks.
+- **Compuerta de `59e6c73`** (`build/ci.ps1 --fase 7 --carga`, 2026-10-15 de 14:40 a 15:36, en reposo). Falló en T12:
+  - UnitTests 176 de 176, IntegrationTests 105 de 105 y FaultTests 119 de 119, con T08 y con `SweepLockOrderTests`;
+  - T12, a los 31 m 14 s: `Las cajas no terminaron 60 s después de la fase.`
+
+  Falló en la primera fase, a una caja por segundo. El drenaje afirmaba antes de escribir el reporte, como había señalado la revisión (ver abajo), así que la corrida no dejó diagnóstico; el TRX tampoco tiene salida. La causa de esa caja sin terminar queda sin identificar hasta la corrida siguiente, que ahora escribe el reporte en cualquier caso: jobs sin `CONFIRMED`, detecciones sin job, huecos de secuencia y el momento de cada falla contada.
+
+### Revisión de `59e6c73`
+
+Workflow de 5 agentes `revisor-adversarial` sobre el diff `4e4dff8..59e6c73`, sin compilar ni ejecutar pruebas porque la compuerta estaba corriendo. Tres revisores (SQL y concurrencia; pruebas y diagnóstico; documentos y clasificación) y un escéptico por cada ALTA o MEDIA.
+
+- **ALTA y MEDIA:** 1 ALTA, bajada a MEDIA y confirmada; 1 MEDIA, bajada a BAJA.
+- **BAJA:** 21, juzgadas una por una.
+
+Las correcciones se prepararon en un worktree aparte mientras corría la compuerta.
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| Un job en `SENDING` durante un `CLOCK_JUMP` no lo veía la purga; un NOT_SENT posterior (J06) lo devolvía a `RETRY_WAIT` y se imprimía después del desbloqueo con el plazo del reloj anterior. Ya existía antes de `59e6c73` | Media | Decisión 18: J08 en TX-C con la estación bloqueada por `CLOCK_JUMP`, extensión de SI-16 aplicada con la autorización general. Prueba `A_send_rejected_after_the_clock_jump_purge_expires_its_job_instead_of_retrying` |
+| T47 ya no ejecutaba la sentencia de referencia de `OUT_OF_ORDER` (reportado tres veces) | Baja | `ExpireOutOfOrderReferenceAsync`, tal cual, con 0 y N filas en `ReferenceStatementTests` |
+| `SET DEADLOCK_PRIORITY HIGH` dentro de `sp_executesql` no regía en la sentencia que cierra el ciclo (reportado dos veces) | Baja | Va en un lote sin parámetros: en la mutación, la víctima es el barrido en los dos casos |
+| `SweepLockOrderTests` con Trait T42, sin comprobar el criterio de T42; el caso `CLOCK_JUMP` es de T37 (reportado dos veces) | Baja | Sin Trait: es la regresión de SI-21. TEST_STATUS lo menciona en T42 |
+| El drenaje de T12 afirmaba antes de escribir el reporte y `StallWatch` no se cerraba en un `finally` (reportado dos veces) | Baja | La falla se afirma después del reporte; el muestreo se cierra siempre y su propio error queda en el reporte. La compuerta de `59e6c73` cayó justo en ese caso |
+| `StallWatch` se truncaba por orden de llegada y leía `blocking_session_id` sin `IsDBNull` | Baja | Conserva todos los eventos y, de las solicitudes, las bloqueadas y las de mayor espera |
+| `BENCHMARK.md`: celdas con barras verticales o saltos de línea, la frase "todas `CONFIRMED`" sin condición y el muestreo de diagnóstico sin declarar | Baja | Celdas escapadas, frase condicionada, el muestreo en la fila "Composición" |
+| El comentario de `ClockJumpAsync` afirmaba un lock exclusivo que no existe si la estación ya estaba bloqueada | Baja | Comentario corregido: con otro bloqueo, el salto se retiene y la purga se repite |
+| SI-21 decía "la misma sentencia" y "sin cambio de comportamiento", con cifras que el registro no respaldaba (reportado tres veces) | Baja | SI-21 y la decisión 16: mismas guardas, motivo y efectos; la diferencia de la instantánea; solo cifras registradas, y lo inferido, marcado como inferido |
+| Resultados con la corrección sin comando, salida ni hora, y un conteo que no cuadraba con las clases nombradas (reportado dos veces) | Baja | Comandos y salidas arriba y abajo. El conteo sí cuadra: `ErpReviewTests` tiene 5 casos en el listado de `dotnet test --list-tests`, no 11 |
+| El CHANGELOG daba la fase "en verde" (reportado dos veces) | Baja | "Pendientes de la compuerta final" |
+| TEST_STATUS de T37, T42 y T47 con evidencia anterior al cambio de mecanismo | Baja | Se revalidan con la compuerta final |
+| La decisión 17 decía que `BENCHMARK.md` ya resumía el diagnóstico | Baja | Corregida: lo escribe el script al regenerarlo con la compuerta final |
+| SI-20 decía que el latido declara la caída con una sola lectura fallida | Baja | SI-20 con la regla vigente |
+
+Comandos de esta ronda, en el worktree de las correcciones, con la máquina en reposo después de la compuerta, 2026-10-15:
+
+```
+[15:38] dotnet test tests/CartonPrinting.FaultTests --no-build --filter "FullyQualifiedName~ClockAndRetryTests|FullyQualifiedName~SweepLockOrderTests|FullyQualifiedName~PrinterFaultTests|FullyQualifiedName~LateEventTests|FullyQualifiedName~ErpReviewTests"
+Correctas! - Con error:     0, Superado:    24, Omitido:     0, Total:    24, Duración: 53 s - CartonPrinting.FaultTests.dll (net10.0)
+[15:39] dotnet test tests/CartonPrinting.IntegrationTests --no-build --filter "FullyQualifiedName~ReferenceStatementTests"
+Correctas! - Con error:     0, Superado:    10, Omitido:     0, Total:    10, Duración: 19 s - CartonPrinting.IntegrationTests.dll (net10.0)
+[15:39] dotnet test tests/CartonPrinting.UnitTests --no-build --filter "FullyQualifiedName~ClockGuardTests|FullyQualifiedName~DeadlinePolicyTests"
+Correctas! - Con error:     0, Superado:     4, Omitido:     0, Total:     4, Duración: 394 ms - CartonPrinting.UnitTests.dll (net10.0)
+```
+
+Mutaciones, cada una revertida:
+
+- **15:40, TX-C sin la condición de `CLOCK_JUMP`:** la prueba nueva falla con `Expected: Tuple ("NOT_SENT", "EXPIRED", "DEADLINE_PASSED")` y `Actual: Tuple ("NOT_SENT", "RETRY_WAIT", null)`.
+- **15:41, `TxsSweep.cs` de `4e4dff8`:** `SweepLockOrderTests` falla en los dos casos, `CLOCK_JUMP: 1 transacciones reintentadas por un 1205 con el claim` y `OUT_OF_ORDER: 1 transacciones reintentadas por un 1205 con el claim`.
 
 La compuerta completa, con `--carga`, se ejecuta después, con la máquina en reposo.
 

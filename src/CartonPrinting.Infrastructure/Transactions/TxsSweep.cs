@@ -37,8 +37,13 @@ public sealed class TxsSweep(SqlDb db)
         {
             var blocked = await StationConfigStore.BlockAsync(conn, tx, siteId, stationId, Contracts.BlockReason.ClockJump, "SYSTEM", null, edgeNowUtc, ct);
 
-            // Por PK_PrintJob, como el barrido de OUT_OF_ORDER (ver ExpireOutOfOrderAsync): la estación ya está bloqueada con su
-            // lock exclusivo, así que ninguna TX-A o TX-E crea un job después de leer los candidatos.
+            // Por PK_PrintJob, como el barrido de OUT_OF_ORDER (ver ExpireOutOfOrderAsync). Los candidatos se fijan con una lectura por
+            // versiones; nada pendiente escapa a la purga:
+            // - si BlockAsync bloqueó, tiene el lock exclusivo de la estación hasta el commit: TX-A y TX-E (que la leen con lock
+            //   compartido) y un NOT_SENT de TX-C (que la lee igual antes de J06) terminaron antes, y sus jobs están entre los
+            //   candidatos, o esperan y ven la estación bloqueada (TX-C aplica J08 en lugar de J06);
+            // - si la estación ya estaba bloqueada por otro motivo, TX-A y TX-E no crean jobs, el salto no se da por confirmado y la
+            //   purga se repite con CLOCK_JUMP cuando el otro bloqueo se levante (ClockGuard).
             var jobs = new List<(Guid Id, string From)>();
             await using (var cmd = conn.Command(tx, $"""
                 {CandidatesByStation}
@@ -187,9 +192,11 @@ public sealed class TxsSweep(SqlDb db)
             """, JobReason.DeadlinePassed, siteId, stationId, c => c.Int("@ActiveSendMarginMs", activeSendMarginMs), edgeNowUtc, ct);
 
     /// <summary>
-    /// J03 y J14 con OUT_OF_ORDER: la impresora ya reclamó un ciclo posterior. Es la sentencia de referencia en dos pasos, con el
-    /// mismo predicado (SI-21): los jobs pendientes de la estación se leen sin locks (RCSI) y cada uno se actualiza buscándolo por
-    /// PK_PrintJob, con el predicado completo evaluado otra vez bajo su lock. Así el barrido bloquea el job primero en la clave
+    /// J03 y J14 con OUT_OF_ORDER: la impresora ya reclamó un ciclo posterior. Mismas guardas, motivo y efectos que la sentencia de
+    /// referencia (<see cref="ExpireOutOfOrderReferenceAsync"/>), en dos pasos (SI-21): los jobs pendientes de la estación se leen
+    /// sin locks (RCSI) y cada uno se actualiza buscándolo por PK_PrintJob, con el predicado completo evaluado otra vez bajo su lock.
+    /// Lo que entra en READY o RETRY_WAIT durante el barrido queda para la pasada siguiente (la guarda de orden del claim lo cubre
+    /// mientras tanto). Así el barrido bloquea el job primero en la clave
     /// primaria y después en IX_PrintJob_Sweep, en el mismo orden que el claim de TX-B (J02) y que toda transición por job. La
     /// sentencia de referencia recorre IX_PrintJob_Sweep con U y busca la fila después: contra el claim de esa misma fila se
     /// interbloqueaba, y el sender quedaba detenido hasta que el monitor de SQL Server detectaba el ciclo (hasta 5 s), con la caja
@@ -204,6 +211,28 @@ public sealed class TxsSweep(SqlDb db)
             OUTPUT inserted.PrintJobId, deleted.Status INTO @expired (PrintJobId, FromStatus)
             FROM @candidates AS c
             INNER JOIN dbo.PrintJob AS pj WITH (FORCESEEK (PK_PrintJob (PrintJobId))) ON pj.PrintJobId = c.PrintJobId
+            INNER JOIN dbo.PrinterSendOrder AS so ON so.PrinterId = pj.PrinterId
+            INNER JOIN dbo.PlcEpochHistory AS eh
+                ON eh.SiteId = pj.SiteId AND eh.StationId = pj.StationId AND eh.PlcEpoch = pj.PlcEpoch
+            WHERE pj.SiteId = @SiteId AND pj.StationId = @StationId
+              AND pj.Status IN ('READY', 'RETRY_WAIT')
+              AND so.LastPrintJobId IS NOT NULL AND so.LastPrintJobId <> pj.PrintJobId
+              AND (   eh.AcceptedAt < so.LastEpochAcceptedAt
+                   OR (pj.PlcEpoch = so.LastPlcEpoch AND pj.CycleId < so.LastCycleId));
+            """, JobReason.OutOfOrder, siteId, stationId, _ => { }, edgeNowUtc, ct);
+
+    /// <summary>
+    /// Sentencia de referencia de J03 y J14 con OUT_OF_ORDER (spec/database/sqlserver_operations_reference.sql), tal cual. Se
+    /// interbloquea con el claim (SI-21): el barrido usa <see cref="ExpireOutOfOrderAsync"/> y esta queda para las pruebas de las
+    /// sentencias de referencia (T47).
+    /// </summary>
+    public Task<IReadOnlyList<SweepTransition>> ExpireOutOfOrderReferenceAsync(string siteId, string stationId, DateTime edgeNowUtc, CancellationToken ct) =>
+        ExpireJobsAsync("""
+            UPDATE pj
+            SET Status = 'EXPIRED', Reason = 'OUT_OF_ORDER', NextAttemptAt = NULL,
+                ResultVersion = pj.ResultVersion + 1, UpdatedAt = @EdgeNowUtc
+            OUTPUT inserted.PrintJobId, deleted.Status INTO @expired (PrintJobId, FromStatus)
+            FROM dbo.PrintJob AS pj
             INNER JOIN dbo.PrinterSendOrder AS so ON so.PrinterId = pj.PrinterId
             INNER JOIN dbo.PlcEpochHistory AS eh
                 ON eh.SiteId = pj.SiteId AND eh.StationId = pj.StationId AND eh.PlcEpoch = pj.PlcEpoch

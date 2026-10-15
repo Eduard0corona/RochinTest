@@ -1,28 +1,33 @@
 using System.Diagnostics;
+using System.Globalization;
 using CartonPrinting.Testing;
 using Microsoft.Data.SqlClient;
 
 namespace CartonPrinting.LoadTests;
 
 /// <summary>
-/// Diagnóstico de T12: muestrea cada 200 ms, con el login de administración, las solicitudes de la base de la prueba que llevan
-/// esperando o ejecutando más de 250 ms (tipo de espera, recurso, sentencia y, si está bloqueada, qué sesión la bloquea, si esa
-/// sesión está inactiva con una transacción abierta y su última sentencia), las pausas del propio proceso de prueba (el muestreo que
-/// despierta tarde: recolección de basura o pool de hilos) y los momentos en que suben los contadores de fallas. Ubica en el tiempo,
-/// con la misma referencia que los picos de backlog, la causa de una pausa del sender.
+/// Diagnóstico de T12: muestrea cada <see cref="IntervalMs"/> ms, con el login de administración, las solicitudes de la base de la
+/// prueba que llevan esperando o ejecutando más de 250 ms (tipo de espera, recurso, sentencia y, si está bloqueada, qué sesión la
+/// bloquea, si esa sesión está inactiva con una transacción abierta y su última sentencia), las pausas del propio proceso de prueba
+/// (el muestreo que despierta tarde: recolección de basura o pool de hilos) y los momentos en que suben los contadores de fallas.
+/// Ubica en el tiempo, con la misma referencia que los picos de backlog, la causa de una pausa del sender.
+/// El reporte conserva todos los eventos y, de las solicitudes, las bloqueadas y las de mayor espera, no las primeras en llegar. Un
+/// fallo del propio muestreo queda en el reporte y nunca hace fallar la prueba.
 /// </summary>
 internal sealed class StallWatch : IAsyncDisposable
 {
-    private const int MaxEntries = 120;
-    private static readonly TimeSpan Interval = TimeSpan.FromMilliseconds(200);
+    public const int IntervalMs = 200;
+    private const int MaxEvents = 200;
+    private const int MaxRequestsKept = 2_000;
+    private const int MaxRequestsReported = 60;
 
     private readonly string _admin;
     private readonly string _database;
     private readonly DateTime _startedAt;
     private readonly Func<IReadOnlyDictionary<string, long>> _counters;
     private readonly CancellationTokenSource _stop = new();
-    private readonly Dictionary<(short Session, DateTime Start), string> _requests = [];
-    private readonly List<string> _events = [];
+    private readonly Dictionary<(short Session, DateTime Start), Entry> _requests = [];
+    private readonly List<Entry> _events = [];
     private readonly Task _loop;
 
     private StallWatch(TestDatabase db, DateTime startedAt, Func<IReadOnlyDictionary<string, long>> counters)
@@ -41,7 +46,8 @@ internal sealed class StallWatch : IAsyncDisposable
     {
         lock (_events)
         {
-            return [.. _events.Concat(_requests.Values).OrderBy(e => double.Parse(e[..e.IndexOf(' ')], System.Globalization.CultureInfo.InvariantCulture)).Take(MaxEntries)];
+            var worst = _requests.Values.OrderByDescending(e => e.Weight).Take(MaxRequestsReported);
+            return [.. _events.Concat(worst).OrderBy(e => e.At).Select(e => e.Text)];
         }
     }
 
@@ -52,22 +58,24 @@ internal sealed class StallWatch : IAsyncDisposable
         {
             await _loop;
         }
-        catch (OperationCanceledException)
+        catch (Exception ex)
         {
+            Add($"el muestreo terminó con un error: {ex.GetType().Name}: {ex.Message}");
         }
 
         _stop.Dispose();
     }
 
-    private string At() => (DateTime.UtcNow - _startedAt).TotalSeconds.ToString("F1", System.Globalization.CultureInfo.InvariantCulture);
+    private double At() => (DateTime.UtcNow - _startedAt).TotalSeconds;
 
-    private void Add(string entry)
+    private void Add(string text)
     {
         lock (_events)
         {
-            if (_events.Count < MaxEntries)
+            if (_events.Count < MaxEvents)
             {
-                _events.Add(entry);
+                var at = At();
+                _events.Add(new Entry(at, int.MaxValue, $"{Seconds(at)} s: {text}"));
             }
         }
     }
@@ -75,51 +83,60 @@ internal sealed class StallWatch : IAsyncDisposable
     private async Task LoopAsync()
     {
         var ct = _stop.Token;
-        var last = new Dictionary<string, long>(_counters());
-        var gcPause = GC.GetTotalPauseDuration();
-        await using var conn = new SqlConnection(_admin);
-        await conn.OpenAsync(ct);
-        while (!ct.IsCancellationRequested)
+        try
         {
-            var slept = Stopwatch.StartNew();
-            await Task.Delay(Interval, ct);
-            var late = slept.Elapsed - Interval;
-            var pause = GC.GetTotalPauseDuration();
-            if (late > TimeSpan.FromMilliseconds(300))
+            var last = new Dictionary<string, long>(_counters());
+            var gcPause = GC.GetTotalPauseDuration();
+            await using var conn = new SqlConnection(_admin);
+            await conn.OpenAsync(ct);
+            while (!ct.IsCancellationRequested)
             {
-                Add($"{At()} s: el proceso de prueba despertó {late.TotalMilliseconds:F0} ms tarde (pausa de GC {(pause - gcPause).TotalMilliseconds:F0} ms, " +
-                    $"trabajo pendiente del pool {ThreadPool.PendingWorkItemCount}, hilos {ThreadPool.ThreadCount})");
-            }
-
-            gcPause = pause;
-            foreach (var (name, value) in _counters())
-            {
-                if (value != last.GetValueOrDefault(name))
+                var slept = Stopwatch.StartNew();
+                await Task.Delay(IntervalMs, ct);
+                var late = slept.Elapsed.TotalMilliseconds - IntervalMs;
+                var pause = GC.GetTotalPauseDuration();
+                if (late > 300)
                 {
-                    Add($"{At()} s: {name} {last.GetValueOrDefault(name)} → {value}");
-                    last[name] = value;
+                    Add($"el proceso de prueba despertó {late:F0} ms tarde (pausa de GC {(pause - gcPause).TotalMilliseconds:F0} ms, " +
+                        $"trabajo pendiente del pool {ThreadPool.PendingWorkItemCount}, hilos {ThreadPool.ThreadCount})");
+                }
+
+                gcPause = pause;
+                foreach (var (name, value) in _counters())
+                {
+                    if (value != last.GetValueOrDefault(name))
+                    {
+                        Add($"{name} {last.GetValueOrDefault(name)} → {value}");
+                        last[name] = value;
+                    }
+                }
+
+                var query = Stopwatch.StartNew();
+                try
+                {
+                    await SampleAsync(conn, ct);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    Add($"el muestreo falló: {ex.GetType().Name}: {ex.Message}");
+                    if (conn.State != System.Data.ConnectionState.Open)
+                    {
+                        return;
+                    }
+                }
+
+                if (query.ElapsedMilliseconds > 500)
+                {
+                    Add($"la consulta de muestreo tardó {query.ElapsedMilliseconds} ms (SQL Server o el contenedor sin responder)");
                 }
             }
-
-            var query = Stopwatch.StartNew();
-            try
-            {
-                await SampleAsync(conn, ct);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                // Un diagnóstico que falla no hace fallar la prueba: queda en el reporte.
-                Add($"{At()} s: el muestreo falló: {ex.GetType().Name}: {ex.Message}");
-                if (conn.State != System.Data.ConnectionState.Open)
-                {
-                    return;
-                }
-            }
-
-            if (query.ElapsedMilliseconds > 500)
-            {
-                Add($"{At()} s: la consulta de muestreo tardó {query.ElapsedMilliseconds} ms (SQL Server o el contenedor sin responder)");
-            }
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+        }
+        catch (Exception ex)
+        {
+            Add($"el muestreo se detuvo: {ex.GetType().Name}: {ex.Message}");
         }
     }
 
@@ -142,28 +159,48 @@ internal sealed class StallWatch : IAsyncDisposable
         while (await r.ReadAsync(ct))
         {
             var key = (r.GetInt16(0), r.GetDateTime(1));
-            var blocker = r.GetInt16(7);
-            var entry = $"{At()} s: sesión {key.Item1} {r.GetString(2)} {r.GetInt32(5)} ms" +
-                (r.IsDBNull(3) ? string.Empty : $", espera {r.GetString(3)} {r.GetInt32(4)} ms en {(r.IsDBNull(6) ? "-" : r.GetString(6))}") +
+            var blocker = r.IsDBNull(7) ? (short)0 : r.GetInt16(7);
+            var waitMs = r.IsDBNull(4) ? 0 : r.GetInt32(4);
+            var elapsedMs = r.GetInt32(5);
+            var text = $"sesión {key.Item1} {r.GetString(2)} {elapsedMs} ms" +
+                (r.IsDBNull(3) ? string.Empty : $", espera {r.GetString(3)} {waitMs} ms en {(r.IsDBNull(6) ? "-" : r.GetString(6))}") +
                 $": {Compact(r.IsDBNull(8) ? "-" : r.GetString(8))}" +
                 (blocker == 0 ? string.Empty
                     : $" | bloqueada por la sesión {blocker} ({(r.IsDBNull(9) ? "?" : r.GetString(9))}, transacciones abiertas {(r.IsDBNull(10) ? 0 : r.GetInt32(10))}, " +
-                      $"inactiva {(r.IsDBNull(11) ? "-" : r.GetInt32(11).ToString(System.Globalization.CultureInfo.InvariantCulture))} ms): " +
+                      $"inactiva {(r.IsDBNull(11) ? "-" : r.GetInt32(11).ToString(CultureInfo.InvariantCulture))} ms): " +
                       Compact(r.IsDBNull(12) ? "-" : r.GetString(12)));
+            // Las bloqueadas primero; después, la mayor espera o duración.
+            var weight = (blocker == 0 ? 0 : 1_000_000) + Math.Min(Math.Max(waitMs, elapsedMs), 999_999);
             lock (_events)
             {
-                // De cada solicitud queda la última observación (la de mayor espera); la marca de tiempo es la de la primera.
+                // De cada solicitud queda la última observación (la de mayor espera), con el momento de la primera.
                 if (_requests.TryGetValue(key, out var previous))
                 {
-                    _requests[key] = previous[..previous.IndexOf(' ')] + entry[entry.IndexOf(' ')..];
+                    _requests[key] = new Entry(previous.At, Math.Max(previous.Weight, weight), $"{Seconds(previous.At)} s: {text}");
                 }
-                else if (_requests.Count < MaxEntries)
+                else
                 {
-                    _requests[key] = entry;
+                    if (_requests.Count >= MaxRequestsKept)
+                    {
+                        var lightest = _requests.MinBy(e => e.Value.Weight);
+                        if (lightest.Value.Weight >= weight)
+                        {
+                            continue;
+                        }
+
+                        _requests.Remove(lightest.Key);
+                    }
+
+                    var at = At();
+                    _requests[key] = new Entry(at, weight, $"{Seconds(at)} s: {text}");
                 }
             }
         }
     }
 
+    private static string Seconds(double at) => at.ToString("F1", CultureInfo.InvariantCulture);
+
     private static string Compact(string sql) => string.Join(' ', sql.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
+
+    private sealed record Entry(double At, int Weight, string Text);
 }

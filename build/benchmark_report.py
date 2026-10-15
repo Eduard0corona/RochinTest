@@ -13,6 +13,11 @@ import argparse
 import json
 import sys
 
+def cell(value) -> str:
+    """Texto de una celda de tabla Markdown: sin '|' ni saltos de línea que partan la fila."""
+    return " ".join(str(value).replace("|", "/").split())
+
+
 SEGMENTS = [
     ("plc_to_opc_receive_ms", "Flanco del PLC → notificación OPC recibida", "Relojes del PLC y del EdgeHost (la misma máquina en el simulador)"),
     ("opc_receive_to_job_ready_ms", "Notificación → commit de TX-A (job READY)", "Monotónico"),
@@ -75,6 +80,9 @@ def main() -> int:
         parts.append(f"barrido TX-S cada {comp['sweepIntervalMs']} ms")
     if comp.get("outboxRelay"):
         parts.append("Outbox Relay con publisher confirms hacia una cola quorum sin consumidor")
+    if comp.get("stallWatchIntervalMs"):
+        parts.append(f"diagnóstico: las esperas de SQL Server se muestrean cada {comp['stallWatchIntervalMs']} ms desde el proceso de prueba, "
+                     "con el login de administración")
     w(f"| Composición | La del EdgeHost, en un proceso de prueba: {'; '.join(parts)} |")
     w("| Evidencia | Impresora (PRINTED), aplicador (APPLIED) y escáner (VERIFIED) simulados, aplicada por TX-D; nivel mínimo VERIFIED |")
     w(f"| Comando | `{args.comando}` |")
@@ -103,8 +111,13 @@ def main() -> int:
     w("")
     w("El backlog es la cantidad de jobs `READY`, `RETRY_WAIT` o `SENDING`, muestreada cada segundo. Un job pasa por esos estados en")
     w("decenas de milisegundos (tramo `opc_receive_to_send_start_ms`), así que una muestra en cero no significa que no hubiera jobs")
-    w("pendientes, sino que la cola no se acumula de una muestra a la siguiente. Lo confirman el máximo de ese tramo, la holgura del plazo")
-    w("y que todas las cajas terminaron `CONFIRMED`, ninguna vencida.")
+    w("pendientes, sino que la cola no se acumula de una muestra a la siguiente. Lo confirman el máximo de ese tramo y la holgura del plazo.")
+    statuses = errors.get("jobsByStatus", {}) if errors else {}
+    if statuses and set(statuses) == {"CONFIRMED"} and not errors.get("notConfirmed"):
+        w("Todas las cajas terminaron `CONFIRMED`, ninguna vencida.")
+    elif statuses:
+        pending = sum(v for k, v in statuses.items() if k != "CONFIRMED")
+        w(f"**{pending} jobs no terminaron `CONFIRMED`** (ver \"Errores y escenarios excluidos\").")
     w("")
     for ph in r["phases"]:
         w(f"## Tramos · {ph['phase']}")
@@ -150,8 +163,8 @@ def main() -> int:
         faults = "; ".join(errors["serviceFaults"]) or "ninguna"
         w("| Error | Cantidad |")
         w("| --- | --- |")
-        w(f"| Jobs por estado final | {jobs} |")
-        w(f"| Detecciones por estado | {detections} |")
+        w(f"| Jobs por estado final | {cell(jobs)} |")
+        w(f"| Detecciones por estado | {cell(detections)} |")
         rejected = errors["opcRecordsRejected"]
         rejected = ", ".join(f"{v} {k}" for k, v in sorted(rejected.items())) if isinstance(rejected, dict) else str(rejected)
         w(f"| Registros OPC rechazados (`opc_records_rejected_total`; el valor inicial vacío del registro es `EMPTY`) | {rejected or '0'} |")
@@ -169,15 +182,22 @@ def main() -> int:
             w(f"| Transacciones reintentadas por un 1205 | {errors['deadlockRetries']} |")
             w(f"| Errores del sender fuera de la escritura; intentos SENDING cerrados por TX-R0 | {errors['senderErrors']}; {errors['recoveredSending']} |")
         for item in errors.get("notConfirmed", []):
-            w(f"| Job sin CONFIRMED | {item} |")
+            w(f"| Job sin CONFIRMED | {cell(item)} |")
+        if "cyclesWithoutDetection" in errors:
+            w(f"| Ciclos publicados sin detección | {errors['cyclesWithoutDetection']} |")
+        for item in errors.get("detectionsWithoutJob", []):
+            w(f"| Detección sin job | {cell(item)} |")
+        for item in errors.get("sequenceGaps", []):
+            w(f"| Hueco de secuencia | {cell(item)} |")
         for item in errors.get("deadlocks", []):
-            w(f"| Interbloqueo (system_health) | {item.replace('|', '/')} |")
+            w(f"| Interbloqueo (system_health) | {cell(item)} |")
         for item in errors.get("backlogPeaks", []):
-            w(f"| Pico de backlog | {item} |")
+            w(f"| Pico de backlog | {cell(item)} |")
         if errors.get("slowestToWrite"):
-            w(f"| Cajas más lentas (notificación a escritura) | {'; '.join(errors['slowestToWrite'][:5])} |")
-        for item in errors.get("stalls", [])[:30]:
-            w(f"| Espera larga o pausa observada | {item.replace('|', '/')} |")
+            w(f"| Cajas más lentas (notificación a escritura) | {cell('; '.join(errors['slowestToWrite'][:5]))} |")
+        stalls = errors.get("stalls", [])
+        for item in stalls:
+            w(f"| Espera larga o pausa observada | {cell(item)} |")
         w("")
     w("Escenarios excluidos de esta medición:")
     w("")

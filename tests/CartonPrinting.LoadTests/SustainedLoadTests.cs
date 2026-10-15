@@ -63,7 +63,7 @@ public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rab
             await Task.Delay(1_000, Ct);
         }
 
-        await DrainAsync(s, cycle - 1);
+        Assert.Null(await DrainAsync(s, cycle - 1));
         var warmUp = Segments.ToDictionary(m => m, m => s.Metrics.Samples(m).Count);
 
         var report = new Dictionary<string, object?>();
@@ -71,6 +71,8 @@ public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rab
         var startedAt = DateTime.UtcNow;
         var backlogPeaks = new List<string>();
         var backlogFailures = new List<string>();
+        var drainFailures = new List<string>();
+        long All(string metric) => s.Metrics.Total(metric) + s.Metrics.Series(metric).Values.Sum();
         var watch = StallWatch.Start(_db, startedAt, () => new Dictionary<string, long>
         {
             ["1205 reintentados"] = s.Sql.DeadlockRetries,
@@ -81,57 +83,75 @@ public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rab
             ["pausas del sender"] = s.Metrics.Total(MetricNames.PrinterSenderPauses),
             ["reintentos de la ingesta"] = s.Metrics.Total(MetricNames.IngestSqlRetries),
             ["caídas de SQL Server"] = p.Ingest.Service.Outage.Declarations,
+            ["registros OPC rechazados"] = All(MetricNames.OpcRecordsRejected),
+            ["reconexiones OPC"] = All(MetricNames.OpcReconnect),
+            ["ciclos sin observar"] = All(MetricNames.CyclesUnobserved),
+            ["anomalías de secuencia"] = All(MetricNames.PlcSequenceAnomaly),
+            ["detecciones vencidas"] = All(MetricNames.DetectionsExpired),
+            ["detecciones bloqueadas"] = All(MetricNames.DetectionsBlocked),
+            ["jobs vencidos"] = All(MetricNames.JobsExpired),
+            ["ventanas de evidencia vencidas"] = All(MetricNames.EvidenceWindowElapsed),
         });
-        foreach (var (name, rate, duration) in Phases)
+        try
         {
-            var firstCycle = cycle;
-            var offsets = Segments.ToDictionary(m => m, m => s.Metrics.Samples(m).Count);
-            var interval = TimeSpan.FromSeconds(1 / rate);
-            var backlog = new List<int>();
-            var oldestReadyMs = new List<double>();
-            var end = DateTime.UtcNow + duration;
-            var next = DateTime.UtcNow;
-            var sampleAt = DateTime.UtcNow;
-            while (DateTime.UtcNow < end)
+            foreach (var (name, rate, duration) in Phases)
             {
-                p.Publish(cycle++);
-                if (DateTime.UtcNow >= sampleAt)
+                var firstCycle = cycle;
+                var offsets = Segments.ToDictionary(m => m, m => s.Metrics.Samples(m).Count);
+                var interval = TimeSpan.FromSeconds(1 / rate);
+                var backlog = new List<int>();
+                var oldestReadyMs = new List<double>();
+                var end = DateTime.UtcNow + duration;
+                var next = DateTime.UtcNow;
+                var sampleAt = DateTime.UtcNow;
+                while (DateTime.UtcNow < end)
                 {
-                    var (pending, oldest) = await BacklogAsync(s);
-                    backlog.Add(pending);
-                    oldestReadyMs.Add(oldest);
-                    if (pending > (int)Math.Ceiling(rate) && backlogPeaks.Count < 50)
+                    p.Publish(cycle++);
+                    if (DateTime.UtcNow >= sampleAt)
                     {
-                        backlogPeaks.Add($"{name} a {(DateTime.UtcNow - startedAt).TotalSeconds:F0} s: {pending} pendientes, el más antiguo de {oldest:F0} ms");
+                        var (pending, oldest) = await BacklogAsync(s);
+                        backlog.Add(pending);
+                        oldestReadyMs.Add(oldest);
+                        if (pending > (int)Math.Ceiling(rate) && backlogPeaks.Count < 50)
+                        {
+                            backlogPeaks.Add($"{name} a {(DateTime.UtcNow - startedAt).TotalSeconds:F0} s: {pending} pendientes, el más antiguo de {oldest:F0} ms");
+                        }
+                        sampleAt = DateTime.UtcNow.AddSeconds(1);
                     }
-                    sampleAt = DateTime.UtcNow.AddSeconds(1);
+
+                    next += interval;
+                    var wait = next - DateTime.UtcNow;
+                    if (wait > TimeSpan.Zero)
+                    {
+                        await Task.Delay(wait, Ct);
+                    }
                 }
 
-                next += interval;
-                var wait = next - DateTime.UtcNow;
-                if (wait > TimeSpan.Zero)
+                // Una fase que no termina se afirma al final, con el reporte escrito: es justo la corrida que el diagnóstico debe explicar.
+                if (await DrainAsync(s, cycle - 1) is { } drainFailure)
                 {
-                    await Task.Delay(wait, Ct);
+                    drainFailures.Add($"{name}: {drainFailure}");
                 }
-            }
 
-            await DrainAsync(s, cycle - 1);
-            var segments = Segments.ToDictionary(m => m, m => Summary(s.Metrics.Samples(m).Skip(offsets[m]).ToArray()));
-            phaseReports.Add(new Dictionary<string, object?>
-            {
-                ["phase"] = name, ["boxesPerSecond"] = rate, ["minutes"] = duration.TotalMinutes, ["boxes"] = (long)(cycle - firstCycle),
-                ["backlogMax"] = backlog.Max(), ["backlogP95"] = Percentile(backlog.Select(b => (double)b).ToArray(), 0.95),
-                ["backlogLastMinuteMax"] = backlog.TakeLast(60).Max(), ["oldestPendingMsMax"] = oldestReadyMs.Max(), ["segments"] = segments,
-            });
+                var segments = Segments.ToDictionary(m => m, m => Summary(s.Metrics.Samples(m).Skip(offsets[m]).ToArray()));
+                phaseReports.Add(new Dictionary<string, object?>
+                {
+                    ["phase"] = name, ["boxesPerSecond"] = rate, ["minutes"] = duration.TotalMinutes, ["boxes"] = (long)(cycle - firstCycle),
+                    ["backlogMax"] = backlog.Max(), ["backlogP95"] = Percentile(backlog.Select(b => (double)b).ToArray(), 0.95),
+                    ["backlogLastMinuteMax"] = backlog.TakeLast(60).Max(), ["oldestPendingMsMax"] = oldestReadyMs.Max(), ["segments"] = segments,
+                });
 
-            // Backlog estable: a la tasa pactada no crece (nunca más de unas pocas cajas en curso). Se afirma al final, con el reporte escrito.
-            if (backlog.Max() > 3 * (int)Math.Ceiling(rate) || backlog.TakeLast(60).Max() > 3 * (int)Math.Ceiling(rate))
-            {
-                backlogFailures.Add($"{name}: backlog máximo {backlog.Max()}, en el último minuto {backlog.TakeLast(60).Max()}");
+                // Backlog estable: a la tasa pactada no crece (nunca más de unas pocas cajas en curso). Se afirma al final, con el reporte escrito.
+                if (backlog.Max() > 3 * (int)Math.Ceiling(rate) || backlog.TakeLast(60).Max() > 3 * (int)Math.Ceiling(rate))
+                {
+                    backlogFailures.Add($"{name}: backlog máximo {backlog.Max()}, en el último minuto {backlog.TakeLast(60).Max()}");
+                }
             }
         }
-
-        await watch.DisposeAsync();
+        finally
+        {
+            await watch.DisposeAsync();
+        }
 
         // El Outbox se publica entero: cada caja deja su CartonDetected y su PrintJobResult.
         var outboxDeadline = DateTime.UtcNow.AddSeconds(60);
@@ -162,9 +182,28 @@ public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rab
             ORDER BY DATEDIFF_BIG(MILLISECOND, cd.ReceivedAt, pa.WriteStartedAt) DESC
             """, c => c.Parameters.Add("@started", System.Data.SqlDbType.DateTime2).Value = startedAt,
             r => $"ciclo {r.GetDecimal(0)}: {r.GetInt64(1)} ms a los {r.GetInt64(2)} s", Ct);
+        // Cajas sin job (vencidas al registrarse, bloqueadas o en espera) y huecos de secuencia: una caja que no termina puede no
+        // tener job.
+        var withoutJob = await s.QueryAsync("""
+            SELECT TOP (30) cd.CycleId, cd.Status, ISNULL(cd.Reason, '-'), cd.Transport, cd.Origin, CAST(cd.QueueOverflow AS INT),
+                DATEDIFF_BIG(SECOND, @started, cd.ReceivedAt)
+            FROM dbo.CartonDetection AS cd
+            WHERE NOT EXISTS (SELECT 1 FROM dbo.PrintJob AS pj WHERE pj.DetectionId = cd.DetectionId)
+            ORDER BY cd.CycleId
+            """, c => c.Parameters.Add("@started", System.Data.SqlDbType.DateTime2).Value = startedAt,
+            r => $"ciclo {r.GetDecimal(0)} {r.GetString(1)}/{r.GetString(2)}, {r.GetString(3)} {r.GetString(4)}, overflow {r.GetInt32(5)}, a los {r.GetInt64(6)} s", Ct);
+        var gaps = await s.QueryAsync("""
+            SELECT TOP (30) FromCycleId, ToCycleId, Status, ISNULL(CAST(UnrecoveredCount AS NVARCHAR(30)), '-'), DATEDIFF_BIG(SECOND, @started, DetectedAt)
+            FROM dbo.SequenceGap ORDER BY FromCycleId
+            """, c => c.Parameters.Add("@started", System.Data.SqlDbType.DateTime2).Value = startedAt,
+            r => $"ciclos {r.GetDecimal(0)} a {r.GetDecimal(1)} {r.GetString(2)}, sin recuperar {r.GetString(3)}, a los {r.GetInt64(4)} s", Ct);
+        var detections = await s.CountAsync("FROM dbo.CartonDetection", null, Ct);
         report["errors"] = new Dictionary<string, object?>
         {
             ["notConfirmed"] = notConfirmed,
+            ["detectionsWithoutJob"] = withoutJob,
+            ["sequenceGaps"] = gaps,
+            ["cyclesWithoutDetection"] = (long)(cycle - 1) - detections,
             ["backlogPeaks"] = backlogPeaks,
             ["slowestToWrite"] = slowest,
             ["stalls"] = watch.Report(),
@@ -216,6 +255,7 @@ public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rab
         report["composition"] = new Dictionary<string, object?>
         {
             ["sweepIntervalMs"] = StationPipeline.SweepIntervalMs, ["outboxRelay"] = p.Relay is not null,
+            ["stallWatchIntervalMs"] = StallWatch.IntervalMs,
             ["rabbitMq"] = await RabbitMqVersionAsync(),
         };
         report["environment"] = new Dictionary<string, object?>
@@ -236,6 +276,7 @@ public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rab
         TestContext.Current.TestOutputHelper?.WriteLine(json);
 
         // Primero el reporte, después las aserciones: una corrida que falla deja su diagnóstico.
+        Assert.True(drainFailures.Count == 0, string.Join("; ", drainFailures));
         Assert.True(backlogFailures.Count == 0, string.Join("; ", backlogFailures) + $". Picos: {string.Join(" | ", backlogPeaks.Take(10))}");
         // Todas las cajas (también las de calentamiento) tienen su job CONFIRMED con VERIFIED y una sola etiqueta.
         Assert.True(notConfirmed.Count == 0, $"{notConfirmed.Count} jobs sin CONFIRMED: {string.Join(" || ", notConfirmed.Take(20))}");
@@ -312,15 +353,25 @@ public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rab
         return rows[0];
     }
 
-    /// <summary>Espera a que todas las cajas publicadas tengan su job terminado (o falla a los 60 s).</summary>
-    private static async Task DrainAsync(StationScenario s, ulong lastCycle)
+    /// <summary>
+    /// Espera a que todas las cajas publicadas tengan su job terminado. Devuelve null, o la falla si a los 60 s no terminaron (una
+    /// caja sin job, por ejemplo un hueco, también cuenta como no terminada).
+    /// </summary>
+    private static async Task<string?> DrainAsync(StationScenario s, ulong lastCycle)
     {
         var deadline = DateTime.UtcNow.AddSeconds(60);
-        while (await s.CountAsync("FROM dbo.PrintJob WHERE Status IN ('CONFIRMED', 'EXPIRED', 'UNKNOWN', 'FAILED')", null, Ct) < (int)lastCycle)
+        int finished;
+        while ((finished = await s.CountAsync("FROM dbo.PrintJob WHERE Status IN ('CONFIRMED', 'EXPIRED', 'UNKNOWN', 'FAILED')", null, Ct)) < (int)lastCycle)
         {
-            Assert.True(DateTime.UtcNow < deadline, "Las cajas no terminaron 60 s después de la fase.");
+            if (DateTime.UtcNow >= deadline)
+            {
+                return $"las cajas no terminaron 60 s después de la fase ({finished} de {lastCycle} jobs terminados)";
+            }
+
             await Task.Delay(250, Ct);
         }
+
+        return null;
     }
 
     private static Dictionary<string, object?> Summary(double[] samples) => samples.Length == 0
