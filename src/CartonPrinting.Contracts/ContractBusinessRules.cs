@@ -8,7 +8,8 @@ namespace CartonPrinting.Contracts;
 /// <summary>
 /// Reglas de los contratos que JSON Schema no puede expresar: port de <c>business_errors</c> de
 /// tools/verify_package.py, con los mismos mensajes y en el mismo orden. Se aplican a documentos
-/// que ya cumplen su schema.
+/// que ya cumplen su schema. Las pruebas diferenciales comparan el resultado con la implementación
+/// de referencia; un surrogate aislado lanza, como lanza Python al codificar en UTF-8.
 /// </summary>
 public static class ContractBusinessRules
 {
@@ -37,7 +38,7 @@ public static class ContractBusinessRules
             errors.Add(IdempotencyKeyMismatch);
         }
 
-        var detectionId = EventIds.CartonDetected(key).ToString();
+        var detectionId = EventIds.CartonDetected(spec, key).ToString();
         if (Text(doc, "eventType") == "CartonDetected")
         {
             if (Text(doc, "eventId") != detectionId)
@@ -93,12 +94,8 @@ public static class ContractBusinessRules
         }
         else
         {
-            var resultVersion = doc.GetProperty("resultVersion");
-            var name = spec.UuidNames["PrintJobResult"]
-                .Replace("{idempotencyKey}", key, StringComparison.Ordinal)
-                .Replace("{labelType}", Text(doc, "labelType"), StringComparison.Ordinal)
-                .Replace("{resultVersion}", NumberText(resultVersion), StringComparison.Ordinal);
-            if (Text(doc, "eventId") != Uuid5.Create(spec.UuidNamespace, name).ToString())
+            var resultId = EventIds.PrintJobResult(spec, key, Text(doc, "labelType"), Text(doc, "resultVersion"));
+            if (Text(doc, "eventId") != resultId.ToString())
             {
                 errors.Add(ResultEventIdMismatch);
             }
@@ -152,14 +149,15 @@ public static class ContractBusinessRules
             doc.TryGetProperty("workOrderId", out var wo) ? JsonValue(wo) : null,
             doc.TryGetProperty("cartonId", out var ca) ? JsonValue(ca) : null,
         ];
-        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(Jcs.Serialize(arr))));
+        return Convert.ToHexStringLower(SHA256.HashData(StrictUtf8.Encoding.GetBytes(Jcs.Serialize(arr))));
     }
 
+    /// <summary>El valor como lo leería <c>json.loads</c>: entero de precisión arbitraria o <c>float</c>.</summary>
     private static object? JsonValue(JsonElement e) => e.ValueKind switch
     {
         JsonValueKind.String => e.GetString(),
-        JsonValueKind.Number when e.TryGetInt64(out var l) => l,
-        JsonValueKind.Number when e.TryGetUInt64(out var u) => u,
+        JsonValueKind.Number when PythonFloat.IsFloatText(e.GetRawText()) => PythonFloat.Parse(e.GetRawText()),
+        JsonValueKind.Number => System.Numerics.BigInteger.Parse(e.GetRawText(), CultureInfo.InvariantCulture),
         JsonValueKind.Null => null,
         JsonValueKind.True => true,
         JsonValueKind.False => false,
@@ -172,8 +170,11 @@ public static class ContractBusinessRules
         return e.ValueKind == JsonValueKind.Number ? NumberText(e) : e.GetString() ?? string.Empty;
     }
 
+    /// <summary><c>str()</c> de Python sobre el número leído por <c>json.loads</c>.</summary>
     private static string NumberText(JsonElement e) =>
-        e.TryGetInt64(out var l) ? l.ToString(CultureInfo.InvariantCulture) : e.GetRawText();
+        PythonFloat.IsFloatText(e.GetRawText())
+            ? PythonFloat.Parse(e.GetRawText()).Repr
+            : System.Numerics.BigInteger.Parse(e.GetRawText(), CultureInfo.InvariantCulture).ToString(CultureInfo.InvariantCulture);
 
     private static string? OptionalString(JsonElement doc, string name) =>
         doc.TryGetProperty(name, out var e) && e.ValueKind == JsonValueKind.String ? e.GetString() : null;

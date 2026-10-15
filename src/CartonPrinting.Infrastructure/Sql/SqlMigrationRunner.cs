@@ -75,6 +75,18 @@ public sealed class SqlMigrationRunner(string specRoot, ILogger<SqlMigrationRunn
 
         await using var conn = new SqlConnection(migratorConnectionString);
         await conn.OpenAsync(ct);
+
+        // Exclusión mutua entre ejecuciones concurrentes (lock de aplicación de sesión).
+        await using (var appLock = new SqlCommand("""
+            DECLARE @result INT;
+            EXEC @result = sys.sp_getapplock @Resource = N'CartonPrinting.Migrations', @LockMode = 'Exclusive',
+                @LockOwner = 'Session', @LockTimeout = 120000;
+            IF @result < 0 THROW 50002, N'No se obtuvo el lock de migraciones.', 1;
+            """, conn) { CommandTimeout = 180 })
+        {
+            await appLock.ExecuteNonQueryAsync(ct);
+        }
+
         await EnsureJournalAsync(conn, ct);
 
         var schemaHash = await AppliedHashAsync(conn, SchemaScript, ct);
@@ -172,7 +184,7 @@ public sealed class SqlMigrationRunner(string specRoot, ILogger<SqlMigrationRunn
     /// <summary>
     /// Permisos del login de la aplicación sobre objetos de la especificación: puede tomar seriales,
     /// no puede escribir en <c>dbo.AllowedTransition</c> (un rol con ese permiso podría saltarse los
-    /// triggers, G17).
+    /// triggers, G17) ni en el registro de migraciones.
     /// </summary>
     private static async Task GrantApplicationAsync(SqlConnection conn, string appLogin, CancellationToken ct)
     {
@@ -182,6 +194,7 @@ public sealed class SqlMigrationRunner(string specRoot, ILogger<SqlMigrationRunn
             GRANT UPDATE ON OBJECT::dbo.LabelSerialSeq TO [{user}];
             DENY INSERT, UPDATE, DELETE ON OBJECT::dbo.AllowedTransition TO [{user}];
             DENY ALTER ON SCHEMA::dbo TO [{user}];
+            DENY INSERT, UPDATE, DELETE, ALTER ON SCHEMA::migrations TO [{user}];
             """;
         await using var cmd = new SqlCommand(sql, conn);
         await cmd.ExecuteNonQueryAsync(ct);

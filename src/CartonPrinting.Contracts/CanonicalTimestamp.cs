@@ -33,8 +33,10 @@ public static partial class CanonicalTimestamp
     public static string ToCanonicalString(DateTimeOffset value) => ToCanonicalString(value.UtcDateTime);
 
     /// <summary>
-    /// Interpreta una fecha RFC 3339 (<c>Z</c> o desplazamiento <c>±HH:MM</c>) con precisión de
-    /// microsegundos, como <c>datetime.fromisoformat</c> en tools/verify_package.py.
+    /// Interpreta una fecha RFC 3339 (<c>Z</c> o desplazamiento <c>±HH:MM</c>) con la semántica de
+    /// <c>datetime.fromisoformat</c> (Python 3.14) que usa tools/verify_package.py: microsegundos
+    /// (las cifras de más se truncan), hora 24 solo como 24:00:00 (medianoche del día siguiente) y
+    /// desplazamientos estrictamente menores que 24 horas. El resultado está en UTC.
     /// </summary>
     public static DateTimeOffset ParseRfc3339(string value)
     {
@@ -70,28 +72,46 @@ public static partial class CanonicalTimestamp
             micro = int.Parse(frac, NumberStyles.None, CultureInfo.InvariantCulture);
         }
 
-        var offset = TimeSpan.Zero;
+        var offsetMinutes = 0;
         if (m.Groups["oh"].Success)
         {
-            var oh = Part("oh");
-            var om = Part("om");
-            if (oh > 23 || om > 59)
+            offsetMinutes = (Part("oh") * 60) + Part("om");
+            if (offsetMinutes >= 24 * 60)
             {
                 return false;
             }
 
-            offset = new TimeSpan(oh, om, 0);
             if (m.Groups["sign"].Value == "-")
             {
-                offset = -offset;
+                offsetMinutes = -offsetMinutes;
             }
+        }
+
+        var hour = Part("h");
+        var minute = Part("mi");
+        var second = Part("s");
+        var nextDay = false;
+        if (hour == 24)
+        {
+            if (minute != 0 || second != 0 || micro != 0)
+            {
+                return false;
+            }
+
+            hour = 0;
+            nextDay = true;
         }
 
         try
         {
-            var local = new DateTime(Part("y"), Part("mo"), Part("d"), Part("h"), Part("mi"), Part("s"), DateTimeKind.Unspecified)
-                .AddTicks(micro * 10L);
-            result = new DateTimeOffset(local, offset);
+            var local = new DateTime(Part("y"), Part("mo"), Part("d"), hour, minute, second, DateTimeKind.Unspecified).AddTicks(micro * 10L);
+            if (nextDay)
+            {
+                local = local.AddDays(1);
+            }
+
+            var utc = DateTime.SpecifyKind(local.AddMinutes(-offsetMinutes), DateTimeKind.Utc);
+            result = new DateTimeOffset(utc, TimeSpan.Zero);
             return true;
         }
         catch (ArgumentOutOfRangeException)
@@ -100,6 +120,6 @@ public static partial class CanonicalTimestamp
         }
     }
 
-    [GeneratedRegex(@"^(?<y>[0-9]{4})-(?<mo>[0-9]{2})-(?<d>[0-9]{2})T(?<h>[0-9]{2}):(?<mi>[0-9]{2}):(?<s>[0-9]{2})(\.(?<frac>[0-9]+))?(Z|(?<sign>[+-])(?<oh>[0-9]{2}):(?<om>[0-9]{2}))$", RegexOptions.CultureInvariant)]
+    [GeneratedRegex(@"^(?<y>[0-9]{4})-(?<mo>[0-9]{2})-(?<d>[0-9]{2})T(?<h>[0-9]{2}):(?<mi>[0-9]{2}):(?<s>[0-9]{2})(\.(?<frac>[0-9]+))?(Z|(?<sign>[+-])(?<oh>[0-9]{2}):(?<om>[0-9]{2}))\z", RegexOptions.CultureInvariant)]
     private static partial Regex Rfc3339();
 }

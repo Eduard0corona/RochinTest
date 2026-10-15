@@ -19,7 +19,7 @@ public static class Uuid5
             throw new InvalidOperationException("No se pudo serializar el namespace UUID.");
         }
 
-        var nameBytes = Encoding.UTF8.GetBytes(name);
+        var nameBytes = StrictUtf8.Encoding.GetBytes(name);
         var input = new byte[16 + nameBytes.Length];
         namespaceBytes.CopyTo(input);
         nameBytes.CopyTo(input, 16);

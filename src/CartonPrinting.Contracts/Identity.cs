@@ -52,19 +52,38 @@ public static class Identity
 }
 
 /// <summary>Identificadores deterministas de los eventos (contracts/state-machine.json, uuidNames).</summary>
-public static class EventIds
+public static partial class EventIds
 {
-    public static Guid CartonDetected(string idempotencyKey) =>
-        Uuid5.Create(StateMachineSpec.Instance.UuidNamespace, Name("CartonDetected", idempotencyKey, null, null));
+    public static Guid CartonDetected(string idempotencyKey) => CartonDetected(StateMachineSpec.Instance, idempotencyKey);
+
+    public static Guid CartonDetected(StateMachineSpec spec, string idempotencyKey) =>
+        Uuid5.Create(spec.UuidNamespace, FormatName(spec.UuidNames["CartonDetected"], new Dictionary<string, string>
+        {
+            ["idempotencyKey"] = idempotencyKey,
+        }));
 
     public static Guid PrintJobResult(string idempotencyKey, string labelType, int resultVersion) =>
-        Uuid5.Create(StateMachineSpec.Instance.UuidNamespace, Name("PrintJobResult", idempotencyKey, labelType, resultVersion));
+        PrintJobResult(StateMachineSpec.Instance, idempotencyKey, labelType, resultVersion.ToString(CultureInfo.InvariantCulture));
 
-    private static string Name(string eventType, string idempotencyKey, string? labelType, int? resultVersion) =>
-        StateMachineSpec.Instance.UuidNames[eventType]
-            .Replace("{idempotencyKey}", idempotencyKey, StringComparison.Ordinal)
-            .Replace("{labelType}", labelType ?? string.Empty, StringComparison.Ordinal)
-            .Replace("{resultVersion}", resultVersion?.ToString(CultureInfo.InvariantCulture) ?? string.Empty, StringComparison.Ordinal);
+    public static Guid PrintJobResult(StateMachineSpec spec, string idempotencyKey, string labelType, string resultVersionText) =>
+        Uuid5.Create(spec.UuidNamespace, FormatName(spec.UuidNames["PrintJobResult"], new Dictionary<string, string>
+        {
+            ["idempotencyKey"] = idempotencyKey,
+            ["labelType"] = labelType,
+            ["resultVersion"] = resultVersionText,
+        }));
+
+    /// <summary>
+    /// Sustituye los marcadores de la plantilla en una sola pasada, como <c>str.format</c> en
+    /// tools/verify_package.py: un valor que contenga <c>{labelType}</c> no se vuelve a sustituir.
+    /// </summary>
+    public static string FormatName(string template, IReadOnlyDictionary<string, string> values) =>
+        Placeholder().Replace(template, m => values.TryGetValue(m.Groups[1].Value, out var v)
+            ? v
+            : throw new InvalidOperationException($"Marcador sin valor en uuidNames: {m.Value}."));
+
+    [System.Text.RegularExpressions.GeneratedRegex(@"\{(\w+)\}", System.Text.RegularExpressions.RegexOptions.CultureInvariant)]
+    private static partial System.Text.RegularExpressions.Regex Placeholder();
 }
 
 /// <summary>
@@ -85,7 +104,7 @@ public static class SourceFingerprint
         string? cartonId)
     {
         var canonical = CanonicalArray(siteId, stationId, plcEpoch, cycleId, detectionTimestampUtc, workOrderId, cartonId);
-        return SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(canonical));
+        return SHA256.HashData(StrictUtf8.Encoding.GetBytes(canonical));
     }
 
     public static string Compute(
@@ -115,3 +134,13 @@ public static class SourceFingerprint
         return Jcs.Serialize(arr);
     }
 }
+
+/// <summary>
+/// UTF-8 estricto: un surrogate aislado lanza en lugar de convertirse en U+FFFD, como
+/// <c>str.encode("utf-8")</c> en Python. Dos valores distintos nunca comparten huella ni UUID.
+/// </summary>
+public static class StrictUtf8
+{
+    public static readonly System.Text.UTF8Encoding Encoding = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+}
+

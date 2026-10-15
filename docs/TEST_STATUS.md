@@ -30,7 +30,7 @@ Estado real de cada prueba del catálogo (`spec/tests/test-catalog.json`). `spec
 | T20 | 6 | NO_EJECUTADA | — | — | — | Perfil extendido (Fase 6). |
 | T21 | 3 | NO_EJECUTADA | — | — | — |  |
 | T22 | 4 | NO_EJECUTADA | — | — | — |  |
-| T23 | 0 | PASA | `UnitTests/Contracts/ContractExamplesTests`, `ContractReferenceDifferentialTests`, `IdentityPrimitivesTests` | proceso | `dotnet test --filter "Category!=Load"` · 2026-10-14 | 19 válidos pasan schema y reglas; 24 inválidos fallan solo por la palabra clave y la ruta de EXPECTED.json; 5 de negocio fallan exactamente su regla; prueba diferencial contra jsonschema y business_errors de Python. |
+| T23 | 0 | PASA | `UnitTests/Contracts/ContractExamplesTests`, `ContractReferenceDifferentialTests`, `IdentityPrimitivesTests` | proceso | `build/ci.ps1` (dotnet test --filter "Category!=Load") · 2026-10-14 19:08 | 19 válidos pasan schema y reglas; 24 inválidos fallan solo por la palabra clave y la ruta de EXPECTED.json; 5 de negocio fallan exactamente su regla; prueba diferencial contra jsonschema y business_errors de Python. |
 | T24 | 2 | NO_EJECUTADA | — | — | — |  |
 | T25 | 2 | NO_EJECUTADA | — | — | — |  |
 | T26 | 2 | NO_EJECUTADA | — | — | — |  |

@@ -6,7 +6,8 @@ using Microsoft.Data.SqlClient;
 namespace CartonPrinting.IntegrationTests.Schema;
 
 /// <summary>
-/// T47 (parte de esquema) · El DDL y la semilla de spec/database se crean en SQL Server 2022 real
+/// T47 (parte de esquema; el resto del criterio está en las pruebas de la Fase 1) · El DDL y la
+/// semilla de spec/database se crean en SQL Server 2022 real
 /// sin error, incluidos índices filtrados y triggers; la migración es reproducible; el login de la
 /// aplicación no tiene DDL ni escritura sobre AllowedTransition.
 /// </summary>
@@ -89,22 +90,36 @@ public sealed class MigrationTests(SqlServerFixture sql) : IAsyncLifetime
     }
 
     [Theory]
-    [InlineData("INSERT INTO dbo.AllowedTransition (Machine, FromStatus, ToStatus, Kind, TransitionId) VALUES ('PrintJob', 'UNKNOWN', 'READY', 'AUTO', 'X99')")]
-    [InlineData("UPDATE dbo.AllowedTransition SET Kind = 'AUTO' WHERE TransitionId = 'J04'")]
-    [InlineData("DELETE FROM dbo.AllowedTransition WHERE TransitionId = 'J02'")]
-    [InlineData("ALTER TABLE dbo.PrintJob DISABLE TRIGGER TR_PrintJob_StateMachine")]
-    [InlineData("DISABLE TRIGGER dbo.TR_PrintJob_Immutable ON dbo.PrintJob")]
-    [InlineData("CREATE TABLE dbo.Intruso (Id INT)")]
-    public async Task Application_login_cannot_change_the_rules(string sqlText)
+    [InlineData("INSERT INTO dbo.AllowedTransition (Machine, FromStatus, ToStatus, Kind, TransitionId) VALUES ('PrintJob', 'UNKNOWN', 'READY', 'AUTO', 'X99')", 229)]
+    [InlineData("UPDATE dbo.AllowedTransition SET Kind = 'AUTO' WHERE TransitionId = 'J04'", 229)]
+    [InlineData("DELETE FROM dbo.AllowedTransition WHERE TransitionId = 'J02'", 229)]
+    [InlineData("ALTER TABLE dbo.PrintJob DISABLE TRIGGER TR_PrintJob_StateMachine", 1088)]
+    [InlineData("DISABLE TRIGGER dbo.TR_PrintJob_Immutable ON dbo.PrintJob", 1088)]
+    [InlineData("ALTER TABLE dbo.PrintJob NOCHECK CONSTRAINT CK_PrintJob_Reason", 1088)]
+    [InlineData("CREATE TABLE dbo.Intruso (Id INT)", 262)]
+    [InlineData("DELETE FROM migrations.AppliedScript", 229)]
+    public async Task Application_login_cannot_change_the_rules(string sqlText, int expectedError)
     {
+        var ct = TestContext.Current.CancellationToken;
+
+        // Control positivo: la misma sentencia funciona con el login de migraciones (y se revierte),
+        // así el error del login de la aplicación es un permiso denegado y no un objeto inexistente.
+        await using (var migrator = new SqlConnection(_db.MigratorConnectionString))
+        {
+            await migrator.OpenAsync(ct);
+            await using var tx = (SqlTransaction)await migrator.BeginTransactionAsync(ct);
+            await using var ok = new SqlCommand(sqlText, migrator, tx);
+            await ok.ExecuteNonQueryAsync(ct);
+            await tx.RollbackAsync(ct);
+        }
+
         await using var conn = new SqlConnection(_db.AppConnectionString);
-        await conn.OpenAsync(TestContext.Current.CancellationToken);
+        await conn.OpenAsync(ct);
         await using var cmd = new SqlCommand(sqlText, conn);
 
-        var ex = await Assert.ThrowsAsync<SqlException>(() => cmd.ExecuteNonQueryAsync(TestContext.Current.CancellationToken));
+        var ex = await Assert.ThrowsAsync<SqlException>(() => cmd.ExecuteNonQueryAsync(ct));
 
-        // 229: permiso denegado sobre el objeto; 1088/4902/262/15151: sin permiso de ALTER o CREATE.
-        Assert.Contains(ex.Number, new[] { 229, 262, 1088, 4902, 15151 });
+        Assert.Equal(expectedError, ex.Number);
     }
 
     [Fact]
