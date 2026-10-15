@@ -802,3 +802,97 @@ Compuerta en verde.
   - Dos procesos reales en el mismo host para el lock (T27).
   - El aislamiento de red de T36 solo se puede simular con el proxy TCP.
   - La identidad de las personas: el proveedor real es una decisión de OT/TI; aquí, claves por persona que la configuración entrega como hash, nunca en el repositorio.
+
+### Lo hecho
+
+- **Propiedad** (`CartonPrinting.PrintAgent`):
+  - `PrinterOsLock`: lock de sistema operativo por archivo en un directorio común de la máquina.
+  - `PrinterOwnership`: lock más lease, con renovación.
+  - `OwnedPrinterRunner`: el ciclo de vida de una impresora propia.
+- **Arranque ordenado** (`CartonPrinting.Recovery`): `StartupCoordinator` con las ocho etapas. Cada módulo del EdgeHost registra sus pasos:
+  - las impresoras: lock, lease y TX-R0;
+  - la ingesta: estado, suscripción y primer latido;
+  - la estación: el barrido.
+- **Operations API** (`CartonPrinting.Operations`):
+  - autenticación por persona;
+  - solicitudes de reimpresión con regla de dos personas;
+  - acciones manuales por TX-M: cancelación, reconciliación negativa, cierre, desbloqueo, confirmación de época, reingreso, aprobación, revocación y retiro de la etiqueta original.
+- **EdgeHost:** impresora de línea (`Printer`) y manual (`ManualPrinter`), cada una con su propiedad y un solo sender. La API se activa solo con personas configuradas.
+- **Sender manual:** lleva las correcciones de la revisión de la Fase 4 (TX-C con reintentos y detención, NOT_SENT sin el token de la operación, espera ante una autorización no ejecutable). Mide `exceptional_reprints_total{risk}` al ejecutar y `{result=UNRESOLVED}` en todo X03: escritura fallida, ventana vencida en el barrido y TX-R0.
+- **Pruebas:**
+  - `OwnershipTests` (T27, T36), `ReprintRestartTests` (T43), `StartupOrderTests`;
+  - `OperationsTests` (T40 y autenticación), `ReprintTests` (T34, T41, T43);
+  - `StartupCoordinatorTests` (unitarias).
+  - El FaultHost tiene dos modos nuevos: `lock` (T27) y `reprint` (T43).
+
+### Decisiones
+
+1. **Lock de sistema operativo por archivo.** Un mutex con nombre pertenece en Windows al hilo que lo toma; con código asíncrono ese hilo puede terminar y dejarlo abandonado mientras el proceso sigue vivo, y otro proceso lo tomaría. El lock es un archivo abierto con `FileShare.None` en `%ProgramData%\CartonPrinting\locks` (en Linux, en el directorio temporal compartido), que el sistema operativo libera cuando el proceso muere.
+2. **Sin propiedad, cero envíos.**
+   - `OwnedPrinterRunner` no invoca el sender sin el lock y el lease.
+   - Reintenta tomar la impresora cada duración del lease, con una alerta por intento (`printer_owner_conflicts_total{cause}`).
+   - Si pierde el lease, detiene el sender, y antes de volver a enviar ejecuta TX-R0.
+   - El lease no impide que un agente que ya validó su token transmita (T36): solo el aislamiento físico del canal lo garantiza (ADR 0010).
+3. **Arranque ordenado.**
+   - Las etapas se ejecutan en orden; un paso que falla se reintenta con espera creciente, sin repetir los que terminaron y sin pasar a la etapa siguiente (falla cerrada).
+   - Los senders arrancan después del barrido inicial; el latido periódico, después del primer `LabelingReady`.
+   - La etapa 4 (vaciar la cola del dispositivo) se registra sin hacer nada: no hay una capacidad confirmada (OT-07).
+4. **Identidad en la Operations API.**
+   - Cabeceras `X-Operator-Id` y `X-Operator-Key`. La configuración guarda solo el SHA-256 de cada clave y se compara en tiempo constante.
+   - La identidad autenticada es la que queda en `OperatorAction` y en `ReprintAuthorization`; el cuerpo nunca la decide.
+   - El proveedor de identidad definitivo es una decisión de OT/TI.
+5. **Reimpresión por la API.**
+   - La solicitud espera en memoria (el esquema solo guarda autorizaciones aprobadas) y la aprueba otra persona (403 si es la misma).
+   - El destino es la `ManualPrinterId` de la revisión activa y la ventana de evidencia la de la revisión.
+   - La API nunca envía bytes: la reimpresión la ejecuta el sender de la impresora manual con su lease.
+   - Un rechazo de TX-M, de un trigger o de una restricción es 409 con el número de error.
+6. **`unknown_resolution_total{result}`** se cuenta en las resoluciones manuales (reconciliación negativa y cierre). La resolución por evidencia (J15) no se cuenta.
+7. **T41 en sucesión.** `UX_ReprintAuthorization_OpenPerJob` admite una sola autorización `APPROVED` por job: las tres autorizaciones del catálogo se aprueban una después de otra.
+
+### Comandos y resultados
+
+Compuerta completa, 2026-10-15 02:38 (`powershell -File build/ci.ps1 --fase 5`, rama con las Fases 3 y 4 corregidas):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   167, Omitido:     0, Total:   167, Duración: 16 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    93, Omitido:     0, Total:    93, Duración: 2 m 50 s - CartonPrinting.IntegrationTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    73, Omitido:     0, Total:    73, Duración: 4 m 16 s - CartonPrinting.FaultTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 62 ejecutadas
+  Fase 2: T11=1 destino(s), 1 ejecutadas, T13=5 destino(s), 5 ejecutadas, T24=1 destino(s), 1 ejecutadas, T25=8 destino(s), 10 ejecutadas, T26=2 destino(s), 3 ejecutadas, T30=2 destino(s), 3 ejecutadas, T35=2 destino(s), 2 ejecutadas, T45=4 destino(s), 12 ejecutadas
+  Fase 3: T03=1 destino(s), 1 ejecutadas, T04=1 destino(s), 1 ejecutadas, T17=1 destino(s), 1 ejecutadas, T18=4 destino(s), 4 ejecutadas, T21=1 destino(s), 1 ejecutadas, T33=1 destino(s), 1 ejecutadas, T37=6 destino(s), 7 ejecutadas, T46=1 destino(s), 1 ejecutadas
+  Fase 5: T27=2 destino(s), 2 ejecutadas, T34=1 destino(s), 1 ejecutadas, T36=1 destino(s), 1 ejecutadas, T40=1 destino(s), 1 ejecutadas, T41=1 destino(s), 1 ejecutadas, T43=2 destino(s), 2 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
+Durante el desarrollo:
+
+- **Tres pruebas que no probaban lo que decían** (corregidas):
+  - En T41, TX-X fallaba con 52001 porque el lease de la impresora manual había vencido con el reloj de prueba, no por la regla que se quería probar. Ahora se renueva el lease y cada rechazo se comprueba con su número exacto.
+  - En T34, el intento ORDINARY lo rechazaba primero el índice `UX_PrintAttempt_OrdinarySent`, no el trigger. Ahora se prueban los dos.
+  - En T41, la lectura anterior la rechazaba el índice de la observación que confirma. Ahora se agrega una lectura nueva anterior al intento, que llega al trigger.
+- La prueba de M3 de la revisión de la Fase 4 quedó colgada en la primera versión: después de la detención, la impresora tenía un intento en `SENDING` y el siguiente claim se rechazaba sin fin. Ese comportamiento es el correcto; la prueba ahora ejecuta el bucle desde el principio.
+
+### Pruebas de la fase
+
+- **T27, T34, T36, T40, T41 y T43: PASA** (detalle en `docs/TEST_STATUS.md`; la revisión independiente está pendiente).
+
+### Lo que no se verificó
+
+- Dos máquinas reales: los "hosts distintos" de T27 y T36 se simulan con directorios de lock separados en una máquina, y el aislamiento del canal de T36 con un proxy TCP.
+- El EdgeHost como proceso con su configuración: `StartupOrderTests` compone las piezas reales a mano (propiedad, TX-R0, ingesta con el PLC simulado, barrido, latido).
+- El proveedor de identidad de planta, TLS y la exposición de la API fuera de la máquina: la API es HTTP local.
+- Las solicitudes de reimpresión pendientes se pierden si el EdgeHost reinicia: hay que volver a pedirlas.
+- La etapa 4 del arranque (vaciar la cola del dispositivo) no tiene implementación.
+- `unknown_resolution_total` no cuenta las resoluciones por evidencia.
+
+### Riesgos
+
+- Un salto del reloj de prueba (`FakeTimeProvider`) mayor que la duración de un lease lo vence: las pruebas que avanzan el reloj renuevan los leases que siguen usando.
+- El directorio de locks debe ser el mismo para todas las instancias de una máquina y escribible por la cuenta del servicio.
+

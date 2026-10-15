@@ -2,6 +2,14 @@
 
 Cambios de la implementación. Los de la especificación están en `spec/CHANGELOG.md`.
 
+## Fase 5 · Propiedad, recuperación y operación (2026-10-15)
+
+- Propiedad por impresora: lock de sistema operativo por archivo, lease con renovación y ciclo de vida (`OwnedPrinterRunner`); sin propiedad, cero envíos y alerta.
+- Arranque ordenado del EdgeHost (`StartupCoordinator`, ocho etapas) con propiedad, TX-R0, estado, barrido, suscripción y `LabelingReady` en orden.
+- Operations API (`CartonPrinting.Operations`): autenticación por persona con claves de hash en la configuración, acciones manuales por TX-M y reimpresión con regla de dos personas; el sender de la impresora manual ejecuta TX-X.
+- Métricas `exceptional_reprints_total{risk,result}` y `unknown_resolution_total{result}`.
+- Pruebas: T27, T34, T36, T40, T41 y T43 en verde contra SQL Server real, la impresora simulada, el PLC simulado y procesos reales.
+
 ## Fase 4 · Print Agent (2026-10-15)
 
 - Impresora simulada por TCP (rechazo de conexiones, corte a mitad de la escritura, impresión sin acuse, cola retenida, cancelación según capacidades) y simulador de evidencia (impresora, aplicador y escáner por ciclo).
