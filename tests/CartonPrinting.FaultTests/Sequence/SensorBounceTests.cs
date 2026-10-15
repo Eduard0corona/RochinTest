@@ -25,7 +25,7 @@ public sealed class SensorBounceTests(SqlServerFixture sql) : IAsyncLifetime
         var s = await StationScenario.CreateAsync(_db, r => r with { MinCycleIntervalMs = 200 }, ct);
         var ingest = s.Ingest();
         await ingest.ReloadAsync(ct);
-        var t = s.Clock.UtcNow.AddMilliseconds(-300);
+        var t = s.Clock.UtcNow.AddMilliseconds(-600);   // todos los timestamps en el pasado (un DetectionTimestamp futuro sería CLOCK_SKEW)
 
         var first = await ingest.ProcessRecordAsync(s.Cycle(100, detectionTimestamp: t), ct);
         Assert.Equal(DetectionStatus.JobCreated, first.Result!.FinalStatus);

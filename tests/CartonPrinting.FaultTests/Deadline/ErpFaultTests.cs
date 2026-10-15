@@ -48,12 +48,15 @@ public sealed class ErpFaultTests(SqlServerFixture sql) : IAsyncLifetime
     [Trait("Spec", "T03")]
     public async Task Slow_erp_within_the_deadline_creates_the_job_without_blocking_ingest()
     {
-        var s = await StationScenario.CreateAsync(_db, ct: Ct, time: TimeProvider.System);
+        // TransitBudgetMs mayor que el retraso del ERP (precondición del catálogo) y con margen para el ruido de la
+        // máquina de pruebas; el cliente HTTP y el ERP simulado se calientan antes del ciclo medido.
+        var s = await StationScenario.CreateAsync(_db, r => r with { TransitBudgetMs = 3_000 }, Ct, TimeProvider.System);
         await using var erp = await ErpSimulatorServer.StartAsync(Ct);
         erp.DelayMs = 300;
         erp.Set(Order("WO-1", DateTime.UtcNow));
         var (sync, http) = Sync(s, erp);
         using var _ = http;
+        await new HttpErpClient(http, s.Clock).GetSnapshotAsync("WO-CALENTAMIENTO", Ct);
         var ingest = new StationIngestService(s.Settings, s.Registration, s.Stations, s.Epochs, new Infrastructure.Data.SequenceStore(s.Sql), s.Txs, s.Txm,
             s.Clock, s.Metrics, erpDemand: sync);
         await ingest.ReloadAsync(Ct);
