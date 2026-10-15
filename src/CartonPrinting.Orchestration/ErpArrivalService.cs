@@ -1,6 +1,7 @@
 using CartonPrinting.Contracts;
 using CartonPrinting.Infrastructure.Data;
 using CartonPrinting.Infrastructure.Observability;
+using CartonPrinting.Infrastructure.Signals;
 using CartonPrinting.Infrastructure.Time;
 using CartonPrinting.Infrastructure.Transactions;
 
@@ -13,7 +14,8 @@ namespace CartonPrinting.Orchestration;
 /// barrido aplica D07. Devuelve null si TX-E no hizo ninguna transición.
 /// </summary>
 public sealed class ErpArrivalService(
-    TxeErpArrival txe, StationConfigStore stations, LabelSerialSource serials, StationSettings station, EdgeClock clock, CartonMetrics metrics)
+    TxeErpArrival txe, StationConfigStore stations, LabelSerialSource serials, StationSettings station, EdgeClock clock, CartonMetrics metrics,
+    ReadyJobSignal? readySignal = null)
 {
     public async Task<ErpArrivalResult?> ProcessAsync(DetectionRecord detection, ErpSnapshot snapshot, CancellationToken ct)
     {
@@ -38,13 +40,15 @@ public sealed class ErpArrivalService(
         var plan = new ErpArrivalPlan(detection.DetectionId,
             new JobInsert(Guid.NewGuid(), frozen.LabelType, frozen.PrinterId, snapshot.WorkOrderId, snapshot.Revision, snapshot.ProductId,
                 snapshot.LotId, serial, frozen.TemplateRevision, label.Payload, label.PayloadHash, detection.DeadlineAt),
-            frozen.RequiresCartonId, effectiveDeadline, margin, frozen.LabelType, now, snapshot.Gtin, active.Active.ConfigRevisionId);
+            DeadlinePolicy.EffectiveRequiresCartonId(frozen, active.Active), effectiveDeadline, margin, frozen.LabelType, now, snapshot.Gtin,
+            active.Active.ConfigRevisionId);
         var result = await txe.ExecuteAsync(plan, ct);
 
         // Solo una transición se mide: una TX-E sin efecto devuelve el estado que ya tenía la detección.
         if (result.PrintJobId is not null)
         {
             metrics.Record(MetricNames.ErpSnapshotWaitMs, (clock.UtcNow - detection.ReceivedAt).TotalMilliseconds);
+            readySignal?.Notify();
         }
         else if (result.Published is not null && result.FinalStatus == DetectionStatus.Blocked)
         {

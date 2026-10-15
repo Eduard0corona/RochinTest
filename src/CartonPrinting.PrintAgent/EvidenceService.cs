@@ -20,9 +20,14 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
     /// </summary>
     public static readonly TimeSpan StartupHorizon = TimeSpan.FromHours(24);
 
-    private readonly ConcurrentDictionary<Guid, DateTime> _printedAt = new();
-    private readonly ConcurrentDictionary<Guid, DateTime> _appliedAt = new();
-    private readonly ConcurrentDictionary<Guid, ConcurrentQueue<(string Level, DateTime ObservedAt)>> _pending = new();
+    // Tramos de la sección 10.4, monotónicos: marcas del reloj del EdgeHost al recibir cada observación, nunca el ObservedAt del
+    // dispositivo (otro reloj, que en planta puede ir adelantado o atrasado). Incluyen la latencia de la integración: es la cota
+    // conservadora para DeviceLeadTimeMs.
+    private readonly ConcurrentDictionary<Guid, long> _printedAt = new();
+    private readonly ConcurrentDictionary<Guid, long> _appliedAt = new();
+    private readonly ConcurrentDictionary<Guid, long> _appliedForVerified = new();
+    private readonly ConcurrentDictionary<Guid, long> _verifiedFirst = new();
+    private readonly ConcurrentDictionary<Guid, ConcurrentQueue<(string Level, long ReceivedTs)>> _pending = new();
 
     /// <summary>
     /// Registra la observación y la aplica junto con lo pendiente de su job o de su ciclo desde el último claim, en orden
@@ -32,6 +37,7 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
     /// </summary>
     public async Task<EvidenceOutcome> SubmitAsync(ObservationInput observation, CancellationToken ct)
     {
+        var receivedTs = clock.GetTimestamp();
         var id = await txd.RecordAsync(observation, clock.UtcNow, ct);
         EvidenceOutcome? outcome = null;
         if (await JobForAsync(observation, ct) is { } job && await LastClaimAsync(job.PrintJobId, ct) is { } since)
@@ -50,7 +56,7 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
         }
 
         outcome ??= await txd.ApplyAsync(id, clock.UtcNow, ct);
-        await MeasureAsync(id, observation, outcome, ct);
+        await MeasureAsync(id, observation, outcome, receivedTs, ct);
         return outcome;
     }
 
@@ -179,7 +185,7 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
         }
     }
 
-    private async Task MeasureAsync(long observationId, ObservationInput o, EvidenceOutcome outcome, CancellationToken ct)
+    private async Task MeasureAsync(long observationId, ObservationInput o, EvidenceOutcome outcome, long receivedTs, CancellationToken ct)
     {
         CountAlerts(outcome);
 
@@ -189,14 +195,14 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
         }
 
         var attempts = await db.ReadAsync(conn => JobQueries.GetAttemptsAsync(conn, null, jobId, ct), ct);
-        if (SentAt(attempts) is { } sent)
+        if (SentAt(attempts) is not null)
         {
             // Lo que quedó pendiente durante SENDING se mide antes, en su orden. La confirmación cuenta aunque la haya
             // aplicado la reaplicación del sender antes que este pase (segunda revisión de la Fase 4, B-5).
             await MeasurePendingAsync(jobId, ct);
             var confirmed = outcome.Action is EvidenceAction.Confirmed or EvidenceAction.ExceptionalConfirmed
                 || attempts.Any(a => a.ConfirmingObservationId == observationId);
-            Measure(jobId, sent, o.EvidenceLevel, o.ObservedAt, confirmed);
+            Measure(jobId, o.EvidenceLevel, receivedTs, confirmed);
         }
         else
         {
@@ -208,7 +214,7 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
                 _pending.Clear();
             }
 
-            _pending.GetOrAdd(jobId, _ => new ConcurrentQueue<(string, DateTime)>()).Enqueue((o.EvidenceLevel, o.ObservedAt));
+            _pending.GetOrAdd(jobId, _ => new ConcurrentQueue<(string, long)>()).Enqueue((o.EvidenceLevel, receivedTs));
             await MeasurePendingAsync(jobId, ct);
         }
     }
@@ -216,7 +222,7 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
     /// <summary>Mide la evidencia que llegó mientras el intento estaba en SENDING, ya con la escritura registrada.</summary>
     private async Task MeasurePendingAsync(Guid jobId, CancellationToken ct)
     {
-        if (!_pending.ContainsKey(jobId) || await SentAtAsync(jobId, ct) is not { } sent || !_pending.TryRemove(jobId, out var queue))
+        if (!_pending.ContainsKey(jobId) || await SentAtAsync(jobId, ct) is null || !_pending.TryRemove(jobId, out var queue))
         {
             return;
         }
@@ -224,45 +230,82 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
         var confirmed = await db.ReadAsync(async conn => (await JobQueries.GetJobAsync(conn, null, jobId, ct))?.Status == JobStatus.Confirmed, ct);
         while (queue.TryDequeue(out var item))
         {
-            Measure(jobId, sent, item.Level, item.ObservedAt, confirmed);
+            Measure(jobId, item.Level, item.ReceivedTs, confirmed);
         }
     }
 
-    private void Measure(Guid jobId, DateTime sent, string level, DateTime observedAt, bool confirmed)
+    /// <summary>
+    /// Un tramo de evidencia con el reloj monotónico del EdgeHost: desde las marcas de la escritura del sender (si la hizo este
+    /// proceso) hasta la recepción de la observación, y entre recepciones de niveles sucesivos. Una observación recibida antes de que
+    /// la llamada de escritura volviera cuenta 0 ms. Sin las marcas (el job lo escribió otro proceso), el tramo desde la escritura no
+    /// se mide.
+    /// </summary>
+    private void Measure(Guid jobId, string level, long receivedTs, bool confirmed)
     {
-        // Solo para métricas: si los pares sin completar se acumulan (jobs que nunca llegan a APPLIED), se descartan.
-        if (_printedAt.Count > 10_000 || _appliedAt.Count > 10_000)
-        {
-            _printedAt.Clear();
-            _appliedAt.Clear();
-        }
+        CartonMetrics.EvictOldest(_printedAt, ts => ts);
+        CartonMetrics.EvictOldest(_appliedAt, ts => ts);
+        CartonMetrics.EvictOldest(_appliedForVerified, ts => ts);
+        CartonMetrics.EvictOldest(_verifiedFirst, ts => ts);
+        var write = metrics.WriteOf(jobId);
+        double Ms(long from, long to) => Math.Max(0, clock.GetElapsedTime(from, to).TotalMilliseconds);
 
         switch (level)
         {
             case EvidenceLevel.Printed:
-                _printedAt[jobId] = observedAt;
-                metrics.Record(MetricNames.SendToPrintedMs, (observedAt - sent).TotalMilliseconds);
+                _printedAt[jobId] = receivedTs;
+                if (write?.Completed is { } completed)
+                {
+                    metrics.Record(MetricNames.SendToPrintedMs, Ms(completed, receivedTs));
+                }
+
                 if (_appliedAt.TryRemove(jobId, out var appliedFirst))
                 {
-                    metrics.Record(MetricNames.PrintedToAppliedMs, (appliedFirst - observedAt).TotalMilliseconds);
+                    metrics.Record(MetricNames.PrintedToAppliedMs, Ms(receivedTs, appliedFirst));
                 }
 
                 break;
             case EvidenceLevel.Applied:
-                // PRINTED (por job) y APPLIED (por ciclo) pueden medirse en cualquier orden: el par se registra cuando
-                // se conocen los dos instantes observados.
+                if (write is { } w)
+                {
+                    metrics.Record(MetricNames.SendStartToAppliedMs, Ms(w.Started, receivedTs));
+                }
+
+                // PRINTED (por job) y APPLIED (por ciclo) pueden llegar en cualquier orden: el par se registra cuando se conocen los dos.
                 if (_printedAt.TryRemove(jobId, out var printed))
                 {
-                    metrics.Record(MetricNames.PrintedToAppliedMs, (observedAt - printed).TotalMilliseconds);
+                    metrics.Record(MetricNames.PrintedToAppliedMs, Ms(printed, receivedTs));
                 }
                 else
                 {
-                    _appliedAt[jobId] = observedAt;
+                    _appliedAt[jobId] = receivedTs;
+                }
+
+                // APPLIED y VERIFIED (los dos por ciclo) también en cualquier orden.
+                if (_verifiedFirst.TryRemove(jobId, out var verifiedEarlier))
+                {
+                    metrics.Record(MetricNames.AppliedToVerifiedMs, Ms(receivedTs, verifiedEarlier));
+                }
+                else
+                {
+                    _appliedForVerified[jobId] = receivedTs;
                 }
 
                 break;
-            case EvidenceLevel.Verified when confirmed:
-                metrics.Record(MetricNames.SendToVerifiedMs, (observedAt - sent).TotalMilliseconds);
+            case EvidenceLevel.Verified:
+                if (confirmed && write?.Completed is { } done)
+                {
+                    metrics.Record(MetricNames.SendToVerifiedMs, Ms(done, receivedTs));
+                }
+
+                if (_appliedForVerified.TryRemove(jobId, out var applied))
+                {
+                    metrics.Record(MetricNames.AppliedToVerifiedMs, Ms(applied, receivedTs));
+                }
+                else
+                {
+                    _verifiedFirst[jobId] = receivedTs;
+                }
+
                 break;
         }
     }

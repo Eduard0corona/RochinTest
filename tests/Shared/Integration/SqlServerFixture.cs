@@ -35,6 +35,9 @@ public sealed class SqlServerFixture : IAsyncLifetime
 
     public string AdminConnectionString => _container.GetConnectionString();
 
+    /// <summary>El contenedor, para detenerlo y volver a arrancarlo (T19 con un servidor real). Al volver cambia su puerto publicado.</summary>
+    public MsSqlContainer Container => _container;
+
     public async ValueTask InitializeAsync() => await _container.StartAsync();
 
     public async ValueTask DisposeAsync()

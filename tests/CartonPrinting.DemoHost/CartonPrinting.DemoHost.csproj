@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>CartonPrinting.DemoHost</RootNamespace>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- No es un proyecto de pruebas: sin el using global de xUnit de tests/Directory.Build.props. -->
+    <Using Remove="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\CartonPrinting.Contracts\CartonPrinting.Contracts.csproj" />
+    <ProjectReference Include="..\..\src\CartonPrinting.Infrastructure\CartonPrinting.Infrastructure.csproj" />
+    <ProjectReference Include="..\..\src\CartonPrinting.PrintAgent\CartonPrinting.PrintAgent.csproj" />
+    <ProjectReference Include="..\..\src\CartonPrinting.Simulators\CartonPrinting.Simulators.csproj" />
+  </ItemGroup>
+
+</Project>

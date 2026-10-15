@@ -15,9 +15,10 @@ public sealed class SenderRecovery(Txr0Recovery txr0, EdgeClock clock, CartonMet
 {
     private readonly ILogger _logger = logger ?? NullLogger<SenderRecovery>.Instance;
 
-    public async Task<RecoveryResult> RecoverAsync(string printerId, CancellationToken ct)
+    /// <summary>TX-R0 de la impresora; con <paramref name="leaseToken"/>, solo lo reclamado con ese lease (el sender en marcha, SI-20).</summary>
+    public async Task<RecoveryResult> RecoverAsync(string printerId, CancellationToken ct, long? leaseToken = null)
     {
-        var result = await txr0.ExecuteAsync(printerId, clock.UtcNow, ct);
+        var result = await txr0.ExecuteAsync(printerId, clock.UtcNow, ct, leaseToken);
         var recovered = result.OrdinaryJobs.Count + result.ExceptionalJobs.Count;
         if (recovered > 0)
         {

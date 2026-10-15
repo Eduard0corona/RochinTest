@@ -2,6 +2,58 @@
 
 Cambios de la implementación. Los de la especificación están en `spec/CHANGELOG.md`.
 
+## Fase 7 · Hardening y demo (2026-10-15)
+
+- SQL Server caído en la ingesta: falla cerrada, sin detección, con `opc_records_rejected_total{cause=SQL_UNAVAILABLE}`; al volver SQL, el hueco de los ciclos perdidos (T19).
+- Recirculación: solo cuentan las detecciones anteriores de la caja, con el modo de identidad más restrictivo (SI-17, decidido por la persona; T16 y T32).
+- `outbox_pending_age_seconds` se actualiza también cuando la publicación falla (T08).
+- Tramos de latencia de la sección 10.4 que faltaban (`plc_to_opc_receive_ms`, `opc_receive_to_send_start_ms`, `print_deadline_slack_ms`, `send_start_to_applied_ms`, `applied_to_verified_ms`), con muestras acotadas por serie.
+- `ReadyJobSignal`: TX-A, TX-E y el barrido despiertan al sender de línea; el sondeo queda como respaldo.
+- Carga sostenida (T12) en `CartonPrinting.LoadTests` y `docs/BENCHMARK.md` generado por `build/benchmark_report.py`, como hipótesis declarada.
+- Seguridad: RabbitMQ con TLS configurable (`RabbitMq__Tls__*` o `amqps://`), `build/check_secrets.py` en la compuerta y `OpcSecurityTests` (SignAndEncrypt con validación estricta contra el PLC simulado).
+- Demo con el EdgeHost real como proceso (`tests/CartonPrinting.DemoHost`, `docs/DEMO.md`) y lista de aceptación en planta (`docs/FAT_CHECKLIST.md`).
+- Compuerta: paso de secretos y opción `--carga`.
+- Revisión independiente:
+  - la falla cerrada con SQL caído se decide por la recepción del ciclo: intentos acotados, una sola caída para la ingesta y el latido, vigilancia de la recuperación y `LabelingReady` en falso hasta recargar el estado (T19 con SQL congelado y con ciclos procesados después de volver);
+  - T16 concurrente, con el 1205 forzado y reintentado;
+  - T08 con el plazo nominal;
+  - el benchmark con barrido, Outbox Relay y SignAndEncrypt, y la sección de errores y escenarios excluidos;
+  - prerrequisitos de planta en `FAT_CHECKLIST.md`;
+  - la revocación del certificado TLS de RabbitMQ;
+  - logs sin el endpoint OPC.
+- Segunda revisión independiente:
+  - una sola caída de SQL Server por proceso (`SqlOutage`) para la ingesta, el latido y el sender de línea (TX-B);
+  - la vigilancia la levanta solo si no quedan operaciones colgadas, si recarga el estado y si toma el rango de TX-A, con histéresis;
+  - errores de un servidor real clasificados; pool sin periodo de bloqueo; código de salida 71 si la ingesta se detiene;
+  - interino de SI-04 en TX-E; SI-20 registrado;
+  - T19 con escrituras bloqueadas, con la recarga y con un SQL Server real detenido y vuelto a arrancar.
+- Verificación final por dimensiones (14 agentes, con refutación adversarial):
+  - `LabelingReady` exige la impresora de línea tomada con TX-R0 y su sender sin pausa;
+  - tres fallos seguidos del dispositivo ponen el sender en pausa, y vuelve cuando la impresora acepta conexiones;
+  - TX-R0 antes del claim siguiente a un error de TX-B;
+  - TX-A y TX-E leen la estación con lock compartido (frente a la purga de `CLOCK_JUMP`);
+  - tramos de evidencia monotónicos;
+  - alerta del Outbox medida aparte y publicación acotada a 10 s;
+  - T08 con el criterio del catálogo primero y los vencidos comparados por ventana;
+  - revisión de secretos ampliada y `.env.example` sin contraseñas;
+  - SI-19 corregido (la variante de T16 es alcanzable).
+- Verificación de esas correcciones (10 agentes):
+  - pausa heredada por el sender nuevo, con espera mínima y período de prueba;
+  - TX-E toma la estación antes que la detección;
+  - TX-R0 del sender en marcha solo con su token de lease, y TX-R0 otra vez si el lease cambió antes del primer envío;
+  - impresora en servicio solo con el sender corriendo;
+  - marcas de escritura de las reimpresiones;
+  - ventanas de T08 acotadas;
+  - contraseñas en cadenas de conexión dentro de código.
+- Los barridos de `OUT_OF_ORDER` y `CLOCK_JUMP` bloquean cada job por su clave primaria, en el mismo orden que el claim: la sentencia de referencia se interbloqueaba con él y la caja vencía (SI-21, `SweepLockOrderTests`).
+- Diagnóstico de T12 en el reporte: jobs sin confirmar, picos de backlog, interbloqueos y esperas largas de SQL Server con su momento.
+- Revisión de esa corrección:
+  - un NOT_SENT con la estación bloqueada por `CLOCK_JUMP` vence el job (J08), extensión de SI-16;
+  - la sentencia de referencia de `OUT_OF_ORDER` se conserva para T47;
+  - T12 escribe su reporte aunque una fase no termine y aunque falle su diagnóstico;
+  - `BENCHMARK.md` escapa las celdas y solo dice "todas `CONFIRMED`" si lo están.
+- Pruebas: T08, T12, T16, T19 y T32 en verde contra SQL Server y RabbitMQ reales y simuladores, en la compuerta final de `e0812b0` (`build/ci.ps1 --fase 7 --carga`, 2026-10-15 16:47); T37, T42 y T47 revalidadas en la misma compuerta. `docs/BENCHMARK.md` se regeneró de esa corrida.
+
 ## Fase 6 · Perfil extendido (2026-10-15)
 
 - Sin código: `PERFIL_EXTENDIDO=NO` y OT-14 abierta. T09 y T20 quedan `NO_APLICA (OT-14 abierta)`.

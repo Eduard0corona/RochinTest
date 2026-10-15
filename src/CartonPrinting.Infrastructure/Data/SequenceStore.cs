@@ -83,6 +83,32 @@ public sealed class SequenceStore(SqlDb db)
             return list;
         }, ct);
 
+    /// <summary>
+    /// Prueba del camino de TX-A para la vigilancia de la falla cerrada: toma con UPDLOCK, HOLDLOCK el rango de
+    /// UQ_CartonDetection_Identity donde TX-A insertará el ciclo siguiente a la marca alta, con LOCK_TIMEOUT, en una transacción que
+    /// no escribe nada. Si otra sesión retiene ese rango o la tabla, falla con 1222, como fallaría TX-A. LOCK_TIMEOUT vuelve a -1
+    /// también si falla: la conexión vuelve al pool sin él.
+    /// </summary>
+    public Task ProbeRegistrationRangeAsync(string siteId, string stationId, long plcEpoch, ulong afterCycleId, int lockTimeoutMs, CancellationToken ct) =>
+        db.InTransactionAsync(async (conn, tx) =>
+        {
+            await using var cmd = conn.Command(tx, $"""
+                SET LOCK_TIMEOUT {lockTimeoutMs};
+                BEGIN TRY
+                    SELECT TOP (1) CycleId FROM dbo.CartonDetection WITH (UPDLOCK, HOLDLOCK, INDEX (UQ_CartonDetection_Identity))
+                    WHERE SiteId = @site AND StationId = @station AND PlcEpoch = @epoch AND CycleId > @after
+                    ORDER BY CycleId;
+                    SET LOCK_TIMEOUT -1;
+                END TRY
+                BEGIN CATCH
+                    SET LOCK_TIMEOUT -1;
+                    THROW;
+                END CATCH
+                """);
+            cmd.NVarChar("@site", siteId, 64).NVarChar("@station", stationId, 64).BigInt("@epoch", plcEpoch).Cycle("@after", afterCycleId);
+            await cmd.ExecuteNonQueryAsync(ct);
+        }, ct);
+
     /// <summary>Huecos OPEN de la estación (indicador sequence_gaps_open).</summary>
     public Task<int> CountOpenGapsAsync(string siteId, string stationId, CancellationToken ct) =>
         db.ReadAsync(async conn =>

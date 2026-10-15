@@ -1,6 +1,7 @@
 using CartonPrinting.Contracts;
 using CartonPrinting.Infrastructure.Data;
 using CartonPrinting.Infrastructure.Observability;
+using CartonPrinting.Infrastructure.Signals;
 using CartonPrinting.Infrastructure.Time;
 using CartonPrinting.Infrastructure.Transactions;
 
@@ -33,7 +34,8 @@ public sealed class RegistrationService(
     ErpCacheStore erpCache,
     LabelSerialSource serials,
     EdgeClock clock,
-    CartonMetrics metrics)
+    CartonMetrics metrics,
+    ReadyJobSignal? readySignal = null)
 {
     public async Task<RegistrationResult> RegisterAsync(
         CycleRecord record, StationSettings station, StationRevision revision, SequenceDecision sequence, CancellationToken ct)
@@ -53,6 +55,7 @@ public sealed class RegistrationService(
         {
             activity?.SetTag(CartonTelemetry.Tags.PrintJobId, jobId);
             activity?.SetTag(CartonTelemetry.Tags.LabelSerial, plan.Job?.LabelSerial);
+            readySignal?.Notify();
         }
 
         return result;
@@ -85,12 +88,6 @@ public sealed class RegistrationService(
                 ? (DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot)
                 : (DetectionStatus.Expired, DetectionReason.LateArrival);
         }
-        else if (terminalStatus is null && revision.RequiresCartonId && record.CartonId is null)
-        {
-            // SI-04 (vacío, clase B): CARTON_ID_REQUIRED sin CartonId. Interino de falla cerrada, solo para
-            // un registro que de otro modo sería candidato; no pasa por encima de D04 ni de la secuencia.
-            (terminalStatus, terminalReason) = (DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot);
-        }
 
         var detection = new DetectionInsert
         {
@@ -113,8 +110,10 @@ public sealed class RegistrationService(
             OpcNodeId = record.OpcNodeId,
         };
 
+        // SI-04 (vacío, clase B): con CARTON_ID_REQUIRED y sin CartonId no hay job posible. El interino de falla cerrada lo aplica
+        // TX-A después de las guardas de plazo y de estación (ClassifyCandidateAsync); aquí solo no se reserva un serial.
         JobInsert? job = null;
-        if (terminalStatus is null && now < detection.DeadlineAt.AddMilliseconds(-revision.SendMarginMs)
+        if (terminalStatus is null && !(revision.RequiresCartonId && record.CartonId is null) && now < detection.DeadlineAt.AddMilliseconds(-revision.SendMarginMs)
             && await erpCache.FindValidAsync(record.WorkOrderId!, now, ct) is { } snapshot)
         {
             // El serial se obtiene antes de TX-A; si TX-A termina en duplicado o rollback, queda como hueco.
@@ -140,6 +139,13 @@ public sealed class RegistrationService(
 
     private void Record(RegistrationResult result, CycleRecord record, RegistrationPlan plan)
     {
+        // Flanco a notificación (sección 10.4): solo una notificación en vivo, y válido solo con los relojes del PLC y del
+        // EdgeHost sincronizados (lo vigila clock_skew_ms).
+        if (record is { Transport: Transport.Subscription, QueueOverflow: false, DetectionTimestamp: { } flank } && result.Outcome != RegistrationOutcome.Duplicate)
+        {
+            metrics.Record(MetricNames.PlcToOpcReceiveMs, (record.ReceivedAt - flank).TotalMilliseconds);
+        }
+
         switch (result.Outcome)
         {
             case RegistrationOutcome.Duplicate:
@@ -160,6 +166,11 @@ public sealed class RegistrationService(
                 break;
             case DetectionStatus.JobCreated when record.ReceivedTimestamp is { } received:
                 metrics.Record(MetricNames.OpcReceiveToJobReadyMs, clock.GetElapsedTime(received).TotalMilliseconds);
+                metrics.MarkReceived(result.DetectionId, received);
+                break;
+            case DetectionStatus.WaitingErp when record.ReceivedTimestamp is { } waiting:
+                // Su job lo crea TX-E: la marca permite medir también estos envíos, los más lentos, en opc_receive_to_send_start_ms.
+                metrics.MarkReceived(result.DetectionId, waiting);
                 break;
         }
 

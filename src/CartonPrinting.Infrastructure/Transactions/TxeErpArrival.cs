@@ -36,17 +36,23 @@ public sealed class TxeErpArrival(SqlDb db)
     public Task<ErpArrivalResult> ExecuteAsync(ErpArrivalPlan plan, CancellationToken ct) =>
         db.InTransactionAsync(async (conn, tx) =>
         {
+            var peek = await DetectionQueries.GetAsync(conn, tx, plan.DetectionId, ct);
+            if (peek is null || peek.Status != DetectionStatus.WaitingErp)
+            {
+                return new ErpArrivalResult(peek?.Status, peek?.Reason, null, null);
+            }
+
+            // La estación se lee con lock compartido hasta el commit, y antes de tomar la detección: el mismo orden que CLOCK_JUMP
+            // (bloquea la estación y después vence las detecciones), así un bloqueo concurrente queda antes o después de TX-E, nunca en
+            // medio y sin un ciclo de locks (SI-16; verificación de las correcciones de la Fase 7). Compartido y no UPDLOCK, para no
+            // serializar TX-E con TX-A.
+            var station = await StationConfigStore.GetActiveAsync(conn, tx, peek.SiteId, peek.StationId, ct, holdShared: true)
+                ?? throw new InvalidOperationException($"La estación {peek.SiteId}/{peek.StationId} no tiene StationConfig.");
             var d = await DetectionQueries.GetAsync(conn, tx, plan.DetectionId, ct, updLock: true);
             if (d is null || d.Status != DetectionStatus.WaitingErp)
             {
                 return new ErpArrivalResult(d?.Status, d?.Reason, null, null);
             }
-
-            // Con RCSI se lee la versión confirmada de la estación: TX-E equivale a ejecutarse antes de una activación o
-            // de un bloqueo concurrentes. Sin UPDLOCK, para no formar un ciclo con TX-A, que inserta su detección y
-            // después bloquea la estación.
-            var station = await StationConfigStore.GetActiveAsync(conn, tx, d.SiteId, d.StationId, ct)
-                ?? throw new InvalidOperationException($"La estación {d.SiteId}/{d.StationId} no tiene StationConfig.");
             if (station.Active.ConfigRevisionId != plan.ActiveConfigRevisionId)
             {
                 return new ErpArrivalResult(d.Status, d.Reason, null, null);
@@ -64,8 +70,16 @@ public sealed class TxeErpArrival(SqlDb db)
                 return await FinishAsync(conn, tx, d, DetectionStatus.Blocked, DetectionReason.StationDisabled, plan, ct);
             }
 
+            if (plan.RequiresCartonId && d.CartonId is null)
+            {
+                // SI-04 (clase B, abierto): con CARTON_ID_REQUIRED efectivo y sin CartonId no se puede validar la recirculación, y D08
+                // no tiene un motivo para eso. Interino de falla cerrada, como en TX-A: no se crea el job; la detección sigue en
+                // WAITING_ERP y el barrido la vence con D07 a su plazo.
+                return new ErpArrivalResult(d.Status, d.Reason, null, null);
+            }
+
             if (plan.RequiresCartonId && d.CartonId is not null
-                && await TxaRegisterDetection.IsRecirculatedAsync(conn, tx, d.SiteId, d.CartonId, d.DetectionId, ct))
+                && await TxaRegisterDetection.IsRecirculatedAsync(conn, tx, d.SiteId, d.CartonId, d.DetectionId, d.ReceivedAt, d.PlcEpoch, d.CycleId, ct))
             {
                 return await FinishAsync(conn, tx, d, DetectionStatus.Blocked, DetectionReason.RecirculatedCarton, plan, ct);
             }

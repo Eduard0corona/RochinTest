@@ -1,5 +1,6 @@
 using CartonPrinting.Infrastructure.Data;
 using CartonPrinting.Infrastructure.Observability;
+using CartonPrinting.Infrastructure.Signals;
 using CartonPrinting.Infrastructure.Time;
 using CartonPrinting.Infrastructure.Transactions;
 using CartonPrinting.PrintAgent;
@@ -50,11 +51,24 @@ public sealed class PrinterHostedService : BackgroundService
     private readonly PrinterOwnership _ownership;
     private readonly OwnedPrinterRunner _runner;
     private readonly ILogger _logger;
+    private readonly ReadyJobSignal? _readySignal;
+
+    // Solo la impresora de línea participa de la falla cerrada de la estación; la manual (reimpresiones) no depende de LabelingReady.
+    private readonly SqlOutage? _sqlOutage;
+    private readonly LinePrinterReadiness? _readiness;
+    private readonly SenderRecovery _recovery;
+
+    // El sender de línea corriendo: sin la fila de PrinterSendOrder no arranca, y la estación no se anuncia lista.
+    private volatile bool _senderRunning;
 
     public PrinterHostedService(
         PrinterRole role, PrinterHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers, StartupCoordinator startup,
-        ClockGuard? stationClockGuard = null)
+        ClockGuard? stationClockGuard = null, ReadyJobSignal? readySignal = null, SqlOutage? sqlOutage = null,
+        LinePrinterReadiness? readiness = null)
     {
+        _readySignal = readySignal;
+        _sqlOutage = role == PrinterRole.Line ? sqlOutage : null;
+        _readiness = role == PrinterRole.Line ? readiness : null;
         _role = role;
         _options = options;
         _db = db;
@@ -67,8 +81,9 @@ public sealed class PrinterHostedService : BackgroundService
         // Único por arranque: dos contenedores con el mismo nombre de host y el mismo PID no son el mismo dueño.
         _ownership = new PrinterOwnership(options.PrinterId, $"{Environment.MachineName}:{Environment.ProcessId}:{Guid.NewGuid():N}", Environment.MachineName,
             new PrinterLeaseStore(db), clock, metrics, options.LeaseDurationMs, options.LeaseGraceMs, loggers.CreateLogger<PrinterOwnership>());
-        _runner = new OwnedPrinterRunner(_ownership, new SenderRecovery(new Txr0Recovery(db), clock, metrics, loggers.CreateLogger<SenderRecovery>()),
-            clock, loggers.CreateLogger<OwnedPrinterRunner>());
+        _recovery = new SenderRecovery(new Txr0Recovery(db), clock, metrics, loggers.CreateLogger<SenderRecovery>());
+        _runner = new OwnedPrinterRunner(_ownership, _recovery, clock, loggers.CreateLogger<OwnedPrinterRunner>());
+        _readiness?.Attach(() => _runner.InService && _senderRunning);
 
         // Sin la impresora de línea el arranque no sigue (se reintenta); la manual no detiene la estación: la toma el ciclo
         // de propiedad, con TX-R0, antes de su primera reimpresión.
@@ -142,15 +157,17 @@ public sealed class PrinterHostedService : BackgroundService
                 _logger.LogError(ex, "Arranque de {Printer}: no se pudo reaplicar la evidencia pendiente", _options.PrinterId);
             }
         }, ct);
+        _senderRunning = true;
         try
         {
             var sender = new PrinterSenderService(_options.PrinterId, _db, new ClaimService(_db, new TxbClaim(_db), _metrics, _clock, _clockGuard),
                 new TxcWriteResult(_db), new StationConfigStore(_db), lease, transport, _clock, _metrics,
-                logger: _loggers.CreateLogger<PrinterSenderService>(), evidence: evidence);
-            await sender.RunAsync(poll, _clock.TimeProvider, null, ct);
+                logger: _loggers.CreateLogger<PrinterSenderService>(), evidence: evidence, sqlOutage: _sqlOutage, recovery: _recovery, readiness: _readiness);
+            await sender.RunAsync(poll, _clock.TimeProvider, _readySignal is null ? null : _readySignal.WaitAsync, ct);
         }
         finally
         {
+            _senderRunning = false;
             await reapply.ContinueWith(_ => { }, TaskScheduler.Default);
         }
     }

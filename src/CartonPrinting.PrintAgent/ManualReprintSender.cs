@@ -109,6 +109,7 @@ public sealed class ManualReprintSender(
         }
 
         var writeStartedAt = clock.UtcNow;
+        var writeTs = clock.GetTimestamp();
         DateTime? accepted;
         try
         {
@@ -117,6 +118,8 @@ public sealed class ManualReprintSender(
         }
         catch (Exception ex)
         {
+            // Los tramos de evidencia se miden desde la escritura más reciente del job, también de una reimpresión.
+            metrics.MarkWrite(execution.PrintJobId, writeTs, null);
             transport.Reset();
             metrics.Increment(MetricNames.PrinterUnknown, ("printer", printerId));
             metrics.Increment(MetricNames.ExceptionalReprints, ("result", "UNRESOLVED"));
@@ -125,6 +128,7 @@ public sealed class ManualReprintSender(
             return new ReprintSendResult(authorizationId, execution, unknown, true);
         }
 
+        metrics.MarkWrite(execution.PrintJobId, writeTs, clock.GetTimestamp());
         if (faults is not null)
         {
             await faults.OnPointAsync(SenderPoint.AfterWriteBeforeResult, attemptId, ct);

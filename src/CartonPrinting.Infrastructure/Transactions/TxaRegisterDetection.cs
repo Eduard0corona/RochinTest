@@ -254,15 +254,24 @@ public sealed class TxaRegisterDetection(SqlDb db)
             return (DetectionStatus.Expired, DetectionReason.LateArrival, null);
         }
 
-        var station = await StationConfigStore.GetActiveAsync(conn, tx, d.SiteId, d.StationId, ct)
+        // Con lock compartido hasta el commit: un bloqueo de la estación en curso (CLOCK_JUMP y su purga, SI-16) espera a esta TX-A o
+        // esta TX-A lo espera y lo ve (verificación final de la Fase 7).
+        var station = await StationConfigStore.GetActiveAsync(conn, tx, d.SiteId, d.StationId, ct, holdShared: true)
             ?? throw new InvalidOperationException($"La estación {d.SiteId}/{d.StationId} no tiene StationConfig.");
         if (!station.State.LabelingEnabled)
         {
             return (DetectionStatus.Blocked, DetectionReason.StationDisabled, null);
         }
 
+        if (plan.Revision.RequiresCartonId && d.CartonId is null)
+        {
+            // SI-04 (vacío, clase B): CARTON_ID_REQUIRED sin CartonId. Interino de falla cerrada después de las guardas de plazo (D04)
+            // y de estación, como dice el registro: sin CartonId no se valida la recirculación y no se crea el job.
+            return (DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot, null);
+        }
+
         if (plan.Revision.RequiresCartonId && d.CartonId is not null
-            && await IsRecirculatedAsync(conn, tx, d.SiteId, d.CartonId, d.DetectionId, ct))
+            && await IsRecirculatedAsync(conn, tx, d.SiteId, d.CartonId, d.DetectionId, d.ReceivedAt, d.PlcEpoch, d.CycleId, ct))
         {
             return (DetectionStatus.Blocked, DetectionReason.RecirculatedCarton, null);
         }
@@ -278,10 +287,16 @@ public sealed class TxaRegisterDetection(SqlDb db)
     }
 
     /// <summary>
-    /// Recirculación (H8, CARTON_ID_REQUIRED): bloqueo de rango sobre IX_PrintJob_Carton e
-    /// IX_CartonDetection_Carton con UPDLOCK, HOLDLOCK. La comparten TX-A y TX-E.
+    /// Recirculación (H8, CARTON_ID_REQUIRED), compartida por TX-A y TX-E con bloqueo de rango (UPDLOCK, HOLDLOCK) sobre
+    /// IX_PrintJob_Carton e IX_CartonDetection_Carton: un job vivo de la caja, o una detección anterior de la caja que espera
+    /// snapshot. "Anterior" por ReceivedAt y, si empatan al milisegundo, por número de época y ciclo. De dos detecciones de la
+    /// misma caja en WAITING_ERP solo la posterior es recirculación (SI-17, decidido por la persona; catálogo de T16). Un registro
+    /// reingresado (ANOMALY_REINGEST) conserva su ReceivedAt y puede ser anterior a una detección ya registrada: si esa tiene job,
+    /// el reingreso queda bloqueado; si espera snapshot, es la posterior la que queda bloqueada en TX-E. En ningún orden hay dos jobs.
     /// </summary>
-    public static async Task<bool> IsRecirculatedAsync(SqlConnection conn, SqlTransaction tx, string siteId, string cartonId, Guid detectionId, CancellationToken ct)
+    public static async Task<bool> IsRecirculatedAsync(
+        SqlConnection conn, SqlTransaction tx, string siteId, string cartonId, Guid detectionId, DateTime receivedAt, long plcEpoch, ulong cycleId,
+        CancellationToken ct)
     {
         await using var cmd = conn.Command(tx, $"""
             SELECT TOP (1) pj.PrintJobId
@@ -295,9 +310,12 @@ public sealed class TxaRegisterDetection(SqlDb db)
             WHERE cd.SiteId = @SiteId
               AND cd.CartonId = @CartonId
               AND cd.Status = 'WAITING_ERP'
-              AND cd.DetectionId <> @DetectionId;
+              AND cd.DetectionId <> @DetectionId
+              AND (cd.ReceivedAt < @ReceivedAt
+                   OR (cd.ReceivedAt = @ReceivedAt AND (cd.PlcEpoch < @PlcEpoch OR (cd.PlcEpoch = @PlcEpoch AND cd.CycleId < @CycleId))));
             """);
-        cmd.NVarChar("@SiteId", siteId, 64).NVarChar("@CartonId", cartonId, 128).Guid("@DetectionId", detectionId);
+        cmd.NVarChar("@SiteId", siteId, 64).NVarChar("@CartonId", cartonId, 128).Guid("@DetectionId", detectionId).DateTime2("@ReceivedAt", receivedAt)
+            .BigInt("@PlcEpoch", plcEpoch).Cycle("@CycleId", cycleId);
         await using var r = await cmd.ExecuteReaderAsync(ct);
         var liveJob = await r.ReadAsync(ct);
         await r.NextResultAsync(ct);

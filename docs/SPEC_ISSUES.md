@@ -22,7 +22,12 @@ Clasificación de `CLAUDE.md`:
 | SI-13 | B (vacío) | 2 | `DOCUMENTO_PRINCIPAL.md` secciones 4 y 9.2, ADR 0001 (registro incoherente frente a la secuencia) | Abierto: la persona decidió mantener el interino de falla cerrada |
 | SI-14 | B (contradicción entre fuentes) | 3 | `spec/database/sqlserver_operations_reference.sql` (J03, J14 y D07 en TX-S) frente a `contracts/state-machine.json` | Abierto: la persona decidió mantener el plazo efectivo (gana la máquina de estados) |
 | SI-15 | B (vacío) | 3 | `DOCUMENTO_PRINCIPAL.md` sección 10.2 (`CLOCK_SKEW`) | Abierto (OT): la persona decidió mantener el interino y declararlo |
-| SI-16 | B (vacío) | 3 | `DOCUMENTO_PRINCIPAL.md` secciones 10.2 y 645; `docs/ESTRATEGIA_RECUPERACION.md` (trabajo pendiente tras `CLOCK_JUMP`) | Resuelto por decisión de la persona: lo pendiente vence al confirmar el salto |
+| SI-16 | B (vacío) | 3 | `DOCUMENTO_PRINCIPAL.md` secciones 10.2 y 645; `docs/ESTRATEGIA_RECUPERACION.md` (trabajo pendiente tras `CLOCK_JUMP`) | Resuelto por decisión de la persona: lo pendiente vence al confirmar el salto. Extensión a un envío en curso durante el salto (J08 en TX-C) aplicada con la autorización general, pendiente de su confirmación |
+| SI-17 | B (contradicción entre fuentes) | 7 | `spec/database/sqlserver_operations_reference.sql` (recirculación en TX-E) frente al catálogo de T16 | Resuelto por decisión de la persona: solo cuentan las detecciones anteriores, con la identidad más restrictiva |
+| SI-18 | B (vacío) | 4 | `contracts/state-machine.json` (J06: un error o un apagado entre el claim y la escritura) | Resuelto por decisión de la persona: NOT_SENT sin consumir intento |
+| SI-19 | Observación (la clase A se retiró) | 7 | `spec/tests/test-catalog.json` (T16, variante) | Cerrado sin cambio en `spec/`: la variante es alcanzable tal como está escrita y una prueba la ejercita |
+| SI-20 | B (vacío) | 7 | `docs/ESTRATEGIA_RECUPERACION.md` §3 ("Al volver: arranque completo") y `DOCUMENTO_PRINCIPAL.md` §15 (SQL caído, TX-A o TX-B) | Interino recomendado aplicado con la autorización general de la persona; pendiente de su confirmación |
+| SI-21 | Observación (concurrencia) | 7 | `spec/database/sqlserver_operations_reference.sql` (J03 y J14 con `OUT_OF_ORDER`) frente al claim J02 | Abierto: el barrido usa una forma en dos pasos con las mismas guardas, motivo y efectos; la sentencia de referencia se conserva para T47 |
 
 ## SI-01 · Rango de códigos de error en el criterio de T47
 
@@ -50,6 +55,10 @@ Clasificación de `CLAUDE.md`:
 - **Vacío.** Con `CartonIdentityMode = CARTON_ID_REQUIRED`, la especificación exige identidad física leída antes de etiquetar (sección 12, ADR 0013) y valida la recirculación con `CartonId`, pero no dice qué hacer con un registro que llega sin `CartonId`.
 - **Trabajo afectado detenido.** Como corresponde a un defecto de clase B, ese camino no se implementa con una salida propia: queda en falla cerrada. Un registro que de otro modo sería candidato a job queda `BLOCKED` con `INCOHERENT_SNAPSHOT` (el registro no trae un dato que la revisión declara obligatorio y sin él no se puede validar la recirculación), no imprime y nunca se inventa un `CartonId` (I07). Elegir `INCOHERENT_SNAPSHOT` es una decisión interina de la implementación (el motivo de bloqueo más cercano a "registro incompleto"), no algo que diga la especificación. El interino no pasa por encima de otras clasificaciones: un registro sin plazo confiable sigue D04 (`EXPIRED` con `LATE_ARRIVAL`) y uno que la secuencia ya bloqueó conserva su motivo (`ReferenceCoverageTests.Review2_b5_…`).
 - **Por qué clase B.** Elegir el motivo definitivo (u otra salida, por ejemplo esperar un lector) es una decisión de comportamiento. Pendiente de la persona. El resto de las fases no depende de este caso borde.
+- **Extensión encontrada en la Fase 7 (revisión independiente, BAJA-4).** El mismo vacío aparece en TX-E. Una detección registrada con `CYCLE_ONLY` y sin `CartonId` puede esperar snapshot mientras la revisión activa pasa a `CARTON_ID_REQUIRED`. Al llegar el snapshot, el modo más restrictivo (SI-17) es `CARTON_ID_REQUIRED`, pero D08 solo admite `STATION_DISABLED` o `RECIRCULATED_CARTON`: no hay un motivo para bloquear por falta de `CartonId`, y TX-E crea el job. TX-A, en cambio, bloquea un registro así (el interino de arriba). No se rodea en el código: queda como parte de la decisión pendiente de SI-04, que debe decir también qué hace D08 en ese caso.
+- **Orden del interino en TX-A (verificación final de la Fase 7, BAJA-4).** El interino se aplicaba al armar el plan, antes de las guardas de TX-A: con un plazo calculado pero ya vencido o con la estación bloqueada, se publicaba `BLOCKED` con `INCOHERENT_SNAPSHOT` en lugar de `EXPIRED` con `LATE_ARRIVAL` o `BLOCKED` con `STATION_DISABLED`. Ahora va en TX-A, después de las guardas de plazo y de estación, como dice este registro. Prueba: `RecirculationTests.Without_its_carton_id_the_deadline_and_station_guards_still_decide_first`.
+- **Interino en TX-E (segunda revisión de la Fase 7, BAJA-8).** Se aplicó el mismo interino de falla cerrada que en TX-A, la opción recomendada, con la autorización general de la persona para seguir las recomendaciones. Con `CARTON_ID_REQUIRED` efectivo y sin `CartonId`, TX-E no crea el job: la detección sigue en `WAITING_ERP` y el barrido la vence con D07 a su plazo. Así no hace falta un motivo nuevo. Prueba: `RecirculationTests.Without_its_carton_id_a_waiting_detection_gets_no_job_once_carton_id_required_is_effective`. La decisión definitiva sigue pendiente de la persona.
+  - **Costo (verificación final, BAJA-15).** D07 publica `EXPIRED` con `ERP_UNAVAILABLE`, el único motivo que tiene, aunque el ERP respondió. Eso contradice el significado de `WAITING_ERP` ("no hay snapshot válido") y difiere de TX-A, que publica `BLOCKED` con `INCOHERENT_SNAPSHOT` en el acto. La prueba fija ese motivo, para que la decisión de la persona lo cambie a la vista.
 
 ## SI-05 · Registro `GATEWAY_RECEIPT` en vivo que abre un hueco: regla de negocio del verificador
 
@@ -156,6 +165,28 @@ Clasificación de `CLAUDE.md`:
 
   Nada anterior al salto se imprime. El salto solo se da por confirmado cuando el bloqueo vigente es `CLOCK_JUMP`. Con otro bloqueo vigente se vence lo pendiente y el salto se retiene; al levantarse ese bloqueo, la estación queda bloqueada con `CLOCK_JUMP`.
 - **Costo aceptado.** Un job vence con `DEADLINE_PASSED` aunque su plazo real no haya pasado: falla cerrada, como el `UNKNOWN` del reinicio.
+- **Extensión: un envío en curso durante el salto** (revisión del commit `59e6c73`, MEDIA). Aplicada con la autorización general de la persona; pendiente de su confirmación.
+  - **El caso.** Un job en `SENDING` no es pendiente para la purga. Si después de la purga la segunda comprobación rechaza el envío (estación bloqueada, con el plazo monotónico vigente) o la conexión falla, J06 lo devolvía a `RETRY_WAIT`. J13 lo liberaba y, después del desbloqueo, el claim lo aceptaba con su plazo del reloj anterior: el EXP1 de arriba por otro camino.
+  - **Qué se hace.** Con la estación bloqueada por `CLOCK_JUMP`, TX-C aplica J08 (`EXPIRED` con `DEADLINE_PASSED`) en lugar de J06. Es la misma regla que la purga: un plazo calculado con el reloj anterior al salto se da por vencido.
+  - **Orden.** TX-C lee la estación con lock compartido hasta el commit, antes que cualquier otra fila. La purga, que bloquea la estación primero, espera a ese NOT_SENT y ve su `RETRY_WAIT`; o el NOT_SENT espera a la purga y ve el bloqueo.
+  - **Otros bloqueos.** Con la estación bloqueada por otro motivo, el rechazo sigue siendo J06. El salto, si lo hubo, no se da por confirmado, y la purga se repite con `CLOCK_JUMP` cuando ese bloqueo se levante.
+  - **Prueba.** `ClockAndRetryTests.A_send_rejected_after_the_clock_jump_purge_expires_its_job_instead_of_retrying`.
+
+## SI-17 · Recirculación al llegar el snapshot (TX-E)
+
+- **Contradicción.** TX-E repite la validación de recirculación de TX-A (D08) cuando llega el snapshot de una detección en `WAITING_ERP`. La sentencia de referencia, aplicada al pie de la letra, cuenta como recirculación cualquier otra detección de la misma caja en `WAITING_ERP`, también las posteriores. Con dos ciclos de la caja C-77 esperando snapshot, el primero queda `BLOCKED` con `RECIRCULATED_CARTON` y el segundo crea el job. El catálogo de T16 espera lo contrario: el primer paso de la caja se etiqueta y el segundo es la recirculación.
+- **Segundo vacío.** Si la revisión cambió entre TX-A y TX-E, la especificación no dice qué `CartonIdentityMode` aplica: el congelado en la detección o el de la revisión activa.
+- **Decisión de la persona (2026-10-15).** Solo cuentan las detecciones anteriores de la caja: por `ReceivedAt` y, si empatan, por época y ciclo, que es el orden en que pasó la caja. El modo de identidad es el más restrictivo entre el congelado y el activo (`DeadlinePolicy.EffectiveRequiresCartonId`), como el plazo efectivo (SI-09, SI-14).
+- **Corrección de este registro (revisión independiente de la Fase 7, BAJA-3).** Una versión anterior decía que en TX-A la detección nueva es siempre la última. No es así: un registro reingresado (`ANOMALY_REINGEST`) conserva su `ReceivedAt` original y puede ser anterior a una detección ya registrada de la misma caja. El resultado sigue siendo un solo job: si la detección registrada tiene job, el reingreso queda `BLOCKED` con `RECIRCULATED_CARTON`; si espera snapshot, las dos esperan y TX-E bloquea la posterior. El empate de `ReceivedAt` al milisegundo se desempata por el número de época y luego por ciclo; dos pasos de la misma caja en el mismo milisegundo no son físicamente posibles.
+- **Pruebas.** T16 en `RecirculationTests`:
+  - la variante de dos ciclos de la misma caja en `WAITING_ERP`;
+  - dos TX-A concurrentes de la misma caja, con el 1205 forzado y reintentado;
+  - TX-A y TX-E concurrentes.
+
+  Además, la cobertura de D08 en TX-E (`ReferenceCoverageTests`).
+- **Orden por `ReceivedAt` (verificación final de la Fase 7, BAJA-5).** `RecirculationTests.ReceivedAt_decides_which_pass_of_the_carton_came_first_not_the_cycle_number` recibe el ciclo 151 antes que el 150, y el 151 lleva el job. Las mutaciones que comparan solo el ciclo, o que invierten la comparación de `ReceivedAt`, la hacen fallar.
+- **Hueco de prueba registrado (verificación final, BAJA-13).** El bloqueo de rango de TX-E solo decide el resultado en una intercalación: TX-E lee, luego un TX-A de un reingreso anterior de la misma caja lee y crea su job, y recién entonces TX-E inserta el suyo. Sin el bloqueo de TX-E habría dos jobs. Las pruebas concurrentes no fuerzan ese orden: retener el rango deja que cualquiera de las dos siga primero.
+- **Límite con concurrencia (segunda revisión de la Fase 7, BAJA-4).** Puede ocurrir que dos TX-A de la misma caja se superpongan y la víctima del 1205 sea la del ciclo anterior. Entonces la posterior confirma primero con job, y la anterior queda `BLOCKED` por ese job vivo: la comprobación del job vivo no mira el orden, porque un job ya creado no se le quita a nadie. El resultado sigue siendo un solo job y una detección bloqueada, pero la etiqueta queda en el segundo paso. Para la misma caja física es imposible (dos pasos en el mismo instante); puede ocurrir con un reingreso que coincide con un ciclo en vivo. La prueba concurrente afirma lo que sí se garantiza: un job y la otra detección `BLOCKED`.
 
 ## SI-18 · Un error o un apagado entre el claim y la escritura
 
@@ -167,3 +198,68 @@ Clasificación de `CLAUDE.md`:
   - Dejar el intento en `SENDING` hasta TX-R0: un `UNKNOWN` falso y la impresora ocupada hasta reiniciar.
 - **Clase B. Decisión de la persona (2026-10-15): sin consumir intento**, el interino. Queda como está en el código.
 
+## SI-19 · Variante de T16 con `CARTON_ID_REQUIRED` desde el principio
+
+- **Registro original (primera revisión de la Fase 7, BAJA-5).** Decía que la variante de T16 ("dos ciclos de C-77 llegan sin snapshot y quedan WAITING_ERP", con `CARTON_ID_REQUIRED`) no se alcanza, porque TX-A bloquearía el segundo ciclo como recirculación, y proponía un parche de clase A al catálogo.
+- **Corrección (verificación final de la Fase 7).** La premisa era falsa. Con la regla de SI-17, una detección solo cuenta como recirculación si es anterior. Si el paso posterior de la caja queda registrado primero, el anterior no lo ve y las dos detecciones esperan snapshot. Ocurre con un reingreso, que conserva su `ReceivedAt`, o con dos TX-A cuya víctima del 1205 es la del ciclo anterior. Al llegar el snapshot, en cualquier orden, la primera crea el job (D06) y la segunda queda `BLOCKED` con `RECIRCULATED_CARTON` (D08).
+- **Estado.** Se retira el parche de clase A: el catálogo no necesita cambios. `RecirculationTests.The_catalog_variant_with_carton_id_required_from_the_start_is_reachable_and_the_first_pass_gets_the_job` ejercita la variante tal como está escrita. La prueba anterior (registro con `CYCLE_ONLY` y activación posterior de `CARTON_ID_REQUIRED`) se mantiene como un caso más.
+
+## SI-20 · Qué es "arranque completo" al volver SQL Server, y TX-B en la falla cerrada
+
+- **Vacío.** ESTRATEGIA_RECUPERACION §3 dice "Al volver: arranque completo (sección 1)", sin decir si es reiniciar el proceso o repetir las etapas. Tampoco dice cuándo SQL "volvió": un servidor que responde lecturas puede seguir sin aceptar escrituras (locks, commit síncrono detenido). DOCUMENTO_PRINCIPAL §15 lista "Error en TX-A o TX-B" como síntoma de SQL caído en el perfil mínimo, pero la estrategia solo describe la ingesta.
+- **Evidencia.** Las dos revisiones independientes de la Fase 7 (A1, M1; M-1, M-2, M-3, BAJA-1 y BAJA-7): sin una regla, los ciclos encolados durante la caída se registraban al volver, `LabelingReady` oscilaba con escrituras bloqueadas y una sola conexión colgada, y un error de TX-B no bajaba la señal.
+- **Interino recomendado, aplicado con la autorización general de la persona** (decisión 7 del registro de la Fase 7):
+  - **Una sola caída por proceso** (`SqlOutage`). La declaran:
+    - la ingesta, cuando TX-A agota sus intentos dentro del plazo de la caja;
+    - el latido, con SQL no disponible o con su lectura de la estación todavía sin respuesta en el latido siguiente (una sola lectura lenta solo baja la señal en ese latido);
+    - el sender de línea, con un error de SQL no disponible en TX-B.
+  - **Mientras está declarada:** `LabelingReady` en falso, ningún ciclo se registra y el sender de línea no reclama.
+  - **Quién la levanta.** Solo la vigilancia de la ingesta, y en este orden:
+    1. espera, sin ninguna operación de SQL abandonada pendiente;
+    2. recarga el estado (etapa 5);
+    3. toma, con `LOCK_TIMEOUT`, el rango donde TX-A insertará el ciclo siguiente;
+    4. marca la recuperación.
+
+    El latido levanta `LabelingReady` después (etapa 8). El barrido sigue con su intervalo (etapa 6).
+  - **TX-R0 (etapa 3).** Se repite en dos casos:
+    - cuando el ciclo de propiedad vuelve a tomar la impresora, si el lease se perdió durante la caída;
+    - en el sender, antes del claim siguiente a un error fuera de la escritura, solo sobre los intentos de su propio token de lease.
+
+    El segundo es una extensión del disparador de J09, que la máquina de estados describe para el arranque: el resultado (`UNKNOWN` con `RESTART_DURING_SEND`) y la guarda son los mismos. Un intento que quedó en `SENDING` porque TX-C no pudo registrarse detiene el sender (código 70), y el reinicio del proceso lo cierra.
+  - **Ciclos de la caída.** Un ciclo recibido antes de la recuperación es parte del hueco.
+  - **La impresora de línea también cuenta (verificación final de la Fase 7).** `LabelingReady` exige la impresora de línea tomada (lock y lease), con TX-R0 hecho desde que se tomó (etapas 2 y 3) y con su sender corriendo. Si la caída dura más que la cobertura del lease, la impresora se vuelve a tomar con TX-R0 antes de que la estación se anuncie lista.
+  - **La pausa del sender.** Tres fallos seguidos del dispositivo la activan, con `LabelingReady` en falso, como dice §3, Impresora. Sale cuando la impresora acepta una conexión, después de al menos 5 s, y con un período de prueba: el primer fallo vuelve a pausar con la espera duplicada. "Vuelve a estar disponible" no tiene una prueba definida en la especificación sin una consulta de estado de la impresora (OT-07): el interino es este.
+  - **Después de un error del claim** el sender ejecuta TX-R0 de su impresora, con su propio token de lease, antes de reclamar otra vez: un commit de TX-B cuya respuesta se perdió no deja la impresora ocupada.
+  - **La recuperación es atómica.** No se levanta si alguien informó una falla después de que empezó la prueba. Una recaída dentro de 60 s (más que el `CommandTimeout` de 30 s de SqlClient) duplica la espera.
+- **Límites declarados.**
+  - TX-B esperando un lock no se abandona: un claim confirmado después de abandonarlo dejaría un `SENDING` sin escritura. Mientras espera, sus jobs pueden vencer; al agotar el `CommandTimeout` (30 s) recibe un −2, que declara la caída, y `LabelingReady` baja.
+  - La prueba del camino de TX-A no comprueba un commit (no escribe): un commit síncrono detenido se descubre en el primer TX-A después de levantar la caída. Las recaídas seguidas alargan la espera.
+  - Si la pausa del sender o la caída se declaran a mitad de una caja, esa caja ya pasó con `LabelingReady` en verdadero: la señal avisa al PLC para las siguientes.
+- **Alternativa.** Reiniciar el proceso al volver SQL, con el arranque ordenado completo. Es más simple de razonar, pero corta la sesión OPC UA y el sender en cada caída.
+
+## SI-21 · El barrido de `OUT_OF_ORDER` de referencia se interbloquea con el claim
+
+- **Evidencia (T12 y una sonda de 10 cajas por segundo, 2026-10-15).** La sentencia de referencia de J03 y J14 con `OUT_OF_ORDER` actualiza los jobs pendientes de la estación recorriendo `IX_PrintJob_Sweep` (`SiteId, StationId, Status, DeadlineAt`, filtrado por `READY` y `RETRY_WAIT`). Toma U en la entrada del índice y después busca la fila en `PK_PrintJob`. El claim J02 actualiza el job por su clave primaria: X en `PK_PrintJob` y después X en `IX_PrintJob_Sweep`, porque el job sale de `READY`. Cuando el barrido pasa por el job que se está reclamando, cada uno espera lo que tiene el otro. `system_health` registró el ciclo: el claim con X en `PK_PrintJob` esperando X en `IX_PrintJob_Sweep`, y el barrido con U en `IX_PrintJob_Sweep` esperando U en `PK_PrintJob`.
+- **Impacto.** No hay un estado incorrecto: la víctima se reintenta (1205). Pero el sender queda detenido hasta que el monitor de interbloqueos de SQL Server detecta el ciclo, hasta 5 s, y con `TransitBudgetMs` de 1500 ms la caja vence (`DEADLINE_PASSED` en el claim o en la segunda comprobación).
+  - **Medido** en la sonda a 10 cajas por segundo (14:07): 23 de 1200 cajas vencidas, con un interbloqueo que el muestreo ubicó y `system_health` registró.
+  - **Inferido**, sin el grafo, en T12:
+    - la corrida "c": 2 cajas juntas, a los 1487 s, con un 1205;
+    - la compuerta de `4e4dff8`: 10 cajas, sin diagnóstico.
+  - **Sin explicar**: una sonda anterior (13:02), con 10 cajas vencidas y ningún 1205; Docker Desktop se detuvo tres minutos después.
+- **Por qué observación.** No impide ejecutar nada (clase A) ni cambia una regla (clase B): las guardas, el motivo y los efectos son los de la sentencia de referencia. Es su forma frente a la concurrencia del claim, y el ciclo se forma entre dos sentencias de la propia referencia (J02 y este barrido), que el archivo declara diseño y no código productivo.
+- **Qué se hace.** `TxsSweep.ExpireOutOfOrderAsync` hace el mismo barrido en dos pasos, en una transacción:
+  1. lee por versiones (RCSI, sin locks) los jobs `READY` y `RETRY_WAIT` de la estación;
+  2. actualiza cada uno buscándolo por `PK_PrintJob` (`FORCESEEK`), con el predicado completo evaluado otra vez bajo su lock.
+
+  Así el barrido bloquea el job primero en la clave primaria y después en el índice, en el mismo orden que el claim y que toda transición por job.
+  - **La diferencia con la referencia.** Los candidatos se fijan con una instantánea. Lo que entra en `READY` o `RETRY_WAIT` en una transacción sin confirmar mientras corre el barrido queda para la pasada siguiente (200 ms); la referencia lo esperaba con su lock U. Para `OUT_OF_ORDER` la guarda de orden del claim (I23) lo cubre mientras tanto.
+  - **`ClockJumpAsync` (SI-16)**, que también recorría los pendientes de la estación, sigue el mismo orden. La completitud de su purga la dan los locks de la estación, como se describe en SI-16.
+  - **El barrido de plazos** ya actualizaba por job (`ExpireEffectiveDeadlineAsync`, SI-14).
+  - **La sentencia de referencia, tal cual**, queda en `ExpireOutOfOrderReferenceAsync` para T47, como `ExpireDeadlinesAsync` con SI-14.
+- **Pruebas.** `SweepLockOrderTests`, la regresión de SI-21, sin Trait de la especificación, fija el orden:
+  1. una sesión toma el job como el claim, primero en la clave primaria;
+  2. el barrido real queda esperando;
+  3. la sesión pide el job en `IX_PrintJob_Sweep`.
+
+  Con la sentencia de referencia es un interbloqueo seguro: la mutación se detectó en `OUT_OF_ORDER` y en `CLOCK_JUMP`. La sonda a 10 cajas por segundo, con la corrección, no venció ninguna caja en dos corridas.
+- **Propuesta para la especificación.** Una nota en la sentencia de referencia sobre el orden de locks frente a J02, o la forma en dos pasos. Pendiente de la persona; no bloquea nada.

@@ -37,13 +37,23 @@ public sealed class TxsSweep(SqlDb db)
         {
             var blocked = await StationConfigStore.BlockAsync(conn, tx, siteId, stationId, Contracts.BlockReason.ClockJump, "SYSTEM", null, edgeNowUtc, ct);
 
+            // Por PK_PrintJob, como el barrido de OUT_OF_ORDER (ver ExpireOutOfOrderAsync). Los candidatos se fijan con una lectura por
+            // versiones; nada pendiente escapa a la purga:
+            // - si BlockAsync bloqueó, tiene el lock exclusivo de la estación hasta el commit: TX-A y TX-E (que la leen con lock
+            //   compartido) y un NOT_SENT de TX-C (que la lee igual antes de J06) terminaron antes, y sus jobs están entre los
+            //   candidatos, o esperan y ven la estación bloqueada (TX-C aplica J08 en lugar de J06);
+            // - si la estación ya estaba bloqueada por otro motivo, TX-A y TX-E no crean jobs, el salto no se da por confirmado y la
+            //   purga se repite con CLOCK_JUMP cuando el otro bloqueo se levante (ClockGuard).
             var jobs = new List<(Guid Id, string From)>();
-            await using (var cmd = conn.Command(tx, """
+            await using (var cmd = conn.Command(tx, $"""
+                {CandidatesByStation}
                 DECLARE @expired TABLE (PrintJobId UNIQUEIDENTIFIER NOT NULL, FromStatus VARCHAR(20) NOT NULL);
-                UPDATE dbo.PrintJob
-                SET Status = 'EXPIRED', Reason = 'DEADLINE_PASSED', NextAttemptAt = NULL, ResultVersion = ResultVersion + 1, UpdatedAt = @EdgeNowUtc
+                UPDATE pj
+                SET Status = 'EXPIRED', Reason = 'DEADLINE_PASSED', NextAttemptAt = NULL, ResultVersion = pj.ResultVersion + 1, UpdatedAt = @EdgeNowUtc
                 OUTPUT inserted.PrintJobId, deleted.Status INTO @expired (PrintJobId, FromStatus)
-                WHERE SiteId = @SiteId AND StationId = @StationId AND Status IN ('READY', 'RETRY_WAIT');
+                FROM @candidates AS c
+                INNER JOIN dbo.PrintJob AS pj WITH (FORCESEEK (PK_PrintJob (PrintJobId))) ON pj.PrintJobId = c.PrintJobId
+                WHERE pj.Status IN ('READY', 'RETRY_WAIT');
                 SELECT PrintJobId, FromStatus FROM @expired;
                 """))
             {
@@ -181,8 +191,42 @@ public sealed class TxsSweep(SqlDb db)
                   @EdgeNowUtc);
             """, JobReason.DeadlinePassed, siteId, stationId, c => c.Int("@ActiveSendMarginMs", activeSendMarginMs), edgeNowUtc, ct);
 
-    /// <summary>J03 y J14 con OUT_OF_ORDER: la impresora ya reclamó un ciclo posterior.</summary>
+    /// <summary>
+    /// J03 y J14 con OUT_OF_ORDER: la impresora ya reclamó un ciclo posterior. Mismas guardas, motivo y efectos que la sentencia de
+    /// referencia (<see cref="ExpireOutOfOrderReferenceAsync"/>), en dos pasos (SI-21): los jobs pendientes de la estación se leen
+    /// sin locks (RCSI) y cada uno se actualiza buscándolo por PK_PrintJob, con el predicado completo evaluado otra vez bajo su lock.
+    /// Lo que entra en READY o RETRY_WAIT durante el barrido queda para la pasada siguiente (la guarda de orden del claim lo cubre
+    /// mientras tanto). Así el barrido bloquea el job primero en la clave
+    /// primaria y después en IX_PrintJob_Sweep, en el mismo orden que el claim de TX-B (J02) y que toda transición por job. La
+    /// sentencia de referencia recorre IX_PrintJob_Sweep con U y busca la fila después: contra el claim de esa misma fila se
+    /// interbloqueaba, y el sender quedaba detenido hasta que el monitor de SQL Server detectaba el ciclo (hasta 5 s), con la caja
+    /// vencida (T12).
+    /// </summary>
     public Task<IReadOnlyList<SweepTransition>> ExpireOutOfOrderAsync(string siteId, string stationId, DateTime edgeNowUtc, CancellationToken ct) =>
+        ExpireJobsAsync($"""
+            {CandidatesByStation}
+            UPDATE pj
+            SET Status = 'EXPIRED', Reason = 'OUT_OF_ORDER', NextAttemptAt = NULL,
+                ResultVersion = pj.ResultVersion + 1, UpdatedAt = @EdgeNowUtc
+            OUTPUT inserted.PrintJobId, deleted.Status INTO @expired (PrintJobId, FromStatus)
+            FROM @candidates AS c
+            INNER JOIN dbo.PrintJob AS pj WITH (FORCESEEK (PK_PrintJob (PrintJobId))) ON pj.PrintJobId = c.PrintJobId
+            INNER JOIN dbo.PrinterSendOrder AS so ON so.PrinterId = pj.PrinterId
+            INNER JOIN dbo.PlcEpochHistory AS eh
+                ON eh.SiteId = pj.SiteId AND eh.StationId = pj.StationId AND eh.PlcEpoch = pj.PlcEpoch
+            WHERE pj.SiteId = @SiteId AND pj.StationId = @StationId
+              AND pj.Status IN ('READY', 'RETRY_WAIT')
+              AND so.LastPrintJobId IS NOT NULL AND so.LastPrintJobId <> pj.PrintJobId
+              AND (   eh.AcceptedAt < so.LastEpochAcceptedAt
+                   OR (pj.PlcEpoch = so.LastPlcEpoch AND pj.CycleId < so.LastCycleId));
+            """, JobReason.OutOfOrder, siteId, stationId, _ => { }, edgeNowUtc, ct);
+
+    /// <summary>
+    /// Sentencia de referencia de J03 y J14 con OUT_OF_ORDER (spec/database/sqlserver_operations_reference.sql), tal cual. Se
+    /// interbloquea con el claim (SI-21): el barrido usa <see cref="ExpireOutOfOrderAsync"/> y esta queda para las pruebas de las
+    /// sentencias de referencia (T47).
+    /// </summary>
+    public Task<IReadOnlyList<SweepTransition>> ExpireOutOfOrderReferenceAsync(string siteId, string stationId, DateTime edgeNowUtc, CancellationToken ct) =>
         ExpireJobsAsync("""
             UPDATE pj
             SET Status = 'EXPIRED', Reason = 'OUT_OF_ORDER', NextAttemptAt = NULL,
@@ -198,6 +242,17 @@ public sealed class TxsSweep(SqlDb db)
               AND (   eh.AcceptedAt < so.LastEpochAcceptedAt
                    OR (pj.PlcEpoch = so.LastPlcEpoch AND pj.CycleId < so.LastCycleId));
             """, JobReason.OutOfOrder, siteId, stationId, _ => { }, edgeNowUtc, ct);
+
+    /// <summary>
+    /// Los jobs READY y RETRY_WAIT de la estación, leídos sin locks (RCSI) en @candidates. El UPDATE que sigue los busca por
+    /// PK_PrintJob y vuelve a evaluar su predicado bajo el lock de cada fila: nunca recorre IX_PrintJob_Sweep con U.
+    /// </summary>
+    private const string CandidatesByStation = """
+        DECLARE @candidates TABLE (PrintJobId UNIQUEIDENTIFIER NOT NULL PRIMARY KEY);
+        INSERT INTO @candidates (PrintJobId)
+        SELECT PrintJobId FROM dbo.PrintJob
+        WHERE SiteId = @SiteId AND StationId = @StationId AND Status IN ('READY', 'RETRY_WAIT');
+        """;
 
     /// <summary>
     /// J13: RETRY_WAIT → READY de un job cuando se cumple NextAttemptAt, con su plazo efectivo vigente con el margen

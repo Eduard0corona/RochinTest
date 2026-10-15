@@ -135,10 +135,16 @@ public sealed class StationConfigStore(SqlDb db)
     public Task<(StationState State, StationRevision Active)?> GetActiveAsync(string siteId, string stationId, CancellationToken ct) =>
         db.ReadAsync(conn => GetActiveAsync(conn, null, siteId, stationId, ct), ct);
 
+    /// <summary>
+    /// Estado y revisión activa dentro de una transacción. <paramref name="holdShared"/> lee con lock compartido hasta el commit
+    /// (REPEATABLEREAD): un bloqueo de la estación en curso (por ejemplo, el de CLOCK_JUMP, que vence lo pendiente en la misma
+    /// transacción) espera a quien leyó, o quien lee lo espera y lo ve. Con RCSI, sin ese lock, una TX-A o TX-E concurrente vería la
+    /// estación habilitada y su job escaparía a la purga (verificación final de la Fase 7).
+    /// </summary>
     public static async Task<(StationState State, StationRevision Active)?> GetActiveAsync(
-        SqlConnection conn, SqlTransaction? tx, string siteId, string stationId, CancellationToken ct, bool updLock = false)
+        SqlConnection conn, SqlTransaction? tx, string siteId, string stationId, CancellationToken ct, bool updLock = false, bool holdShared = false)
     {
-        var hint = updLock ? "WITH (UPDLOCK, HOLDLOCK)" : string.Empty;
+        var hint = updLock ? "WITH (UPDLOCK, HOLDLOCK)" : holdShared ? "WITH (REPEATABLEREAD)" : string.Empty;
         await using var cmd = conn.Command(tx, $"""
             SELECT sc.SiteId, sc.StationId, sc.ActiveConfigRevisionId, sc.LabelingEnabled, sc.BlockReason, sc.BlockedAt, sc.BlockedBy,
                    sc.BlockedByAnomalyId, sc.LastOperatorActionId,

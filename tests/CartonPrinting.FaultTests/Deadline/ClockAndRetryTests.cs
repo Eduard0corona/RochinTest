@@ -295,6 +295,49 @@ public sealed class ClockAndRetryTests(SqlServerFixture sql) : IAsyncLifetime
     }
 
     /// <summary>
+    /// Revisión de 59e6c73 (MEDIA, extensión de SI-16): un job en SENDING durante el salto. La purga no lo ve (no está pendiente),
+    /// y la segunda comprobación del sender rechaza el envío con la estación ya bloqueada (compuerta o estación, con el plazo
+    /// monotónico vigente). TX-C lo vence con DEADLINE_PASSED (J08) en lugar de devolverlo a RETRY_WAIT (J06): después del
+    /// desbloqueo no queda nada anterior al salto que reclamar. Con la estación bloqueada por otro motivo, el mismo rechazo sigue
+    /// siendo J06.
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T37")]
+    public async Task A_send_rejected_after_the_clock_jump_purge_expires_its_job_instead_of_retrying()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        var (sending, attempt) = await s.SendingJobAsync(640, Ct);
+
+        var manual = new ManualTimeProvider(new DateTimeOffset(s.Clock.UtcNow, TimeSpan.Zero));
+        var clock = new EdgeClock(manual);
+        var guard = new ClockGuard(clock);
+        var sweep = new StationSweepService(s.Settings, s.Txs, s.Stations, guard, clock, s.Metrics);
+        var claims = new ClaimService(s.Sql, s.Txb, s.Metrics, clock, guard);
+        manual.Advance(TimeSpan.FromMilliseconds(100));
+        manual.JumpWall(TimeSpan.FromHours(-1));
+        Assert.True((await sweep.SweepOnceAsync(Ct)).ClockJump);
+        Assert.Equal(JobStatus.Sending, (await s.JobAsync(sending, Ct)).Status);   // la purga no toca un envío en curso
+
+        var outcome = await s.Txc.NotSentAsync(attempt, clock.UtcNow, "estación bloqueada", NotSentCause.GateOrStation, 200, 3, clock.UtcNow, Ct);
+        Assert.Equal((AttemptOutcome.NotSent, JobStatus.Expired, JobReason.DeadlinePassed), (outcome.AttemptOutcome, outcome.JobStatus, outcome.JobReason));
+        Assert.Equal((JobStatus.Expired, JobReason.DeadlinePassed), ((await s.JobAsync(sending, Ct)).Status, (await s.JobAsync(sending, Ct)).Reason));
+        Assert.Equal("EXPIRED", (await s.ResultsAsync(sending, Ct)).Last().GetProperty("outcome").GetString());
+
+        manual.Advance(TimeSpan.FromMinutes(5));
+        await s.Txm.UnblockStationAsync(StationScenario.SiteId, s.StationId, "supervisor.ramos", "Reloj corregido", clock.UtcNow, Ct);
+        Assert.False((await sweep.SweepOnceAsync(Ct)).ClockJump);
+        Assert.False((await claims.TryClaimAsync(sending, s.Lease, Ct))!.Claimed);
+        Assert.Single(await s.AttemptsAsync(sending, Ct));
+
+        // Con la estación bloqueada por otro motivo, el rechazo de la segunda comprobación sigue siendo J06 (no consume intento).
+        var (other, otherAttempt) = await s.SendingJobAsync(641, Ct);
+        await s.Stations.BlockAsync(StationScenario.SiteId, s.StationId, BlockReason.Operator, "supervisor.ramos", null, clock.UtcNow, Ct);
+        var retried = await s.Txc.NotSentAsync(otherAttempt, clock.UtcNow, "estación bloqueada", NotSentCause.GateOrStation, 200, 3, clock.UtcNow, Ct);
+        Assert.Equal(JobStatus.RetryWait, retried.JobStatus);
+        Assert.Equal(JobStatus.RetryWait, (await s.JobAsync(other, Ct)).Status);
+    }
+
+    /// <summary>
     /// Segunda revisión de la Fase 3, MEDIA-1 (EXP2): con la estación ya bloqueada por otro motivo, el salto vence lo
     /// pendiente pero no se da por confirmado (el bloqueo vigente no es CLOCK_JUMP); el barrido no evalúa plazos mientras
     /// tanto. Al levantarse el otro bloqueo, la estación queda bloqueada con CLOCK_JUMP y solo entonces el salto se

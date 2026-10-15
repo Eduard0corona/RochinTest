@@ -1,6 +1,7 @@
 using CartonPrinting.Contracts;
 using CartonPrinting.Infrastructure.Data;
 using CartonPrinting.Infrastructure.Observability;
+using CartonPrinting.Infrastructure.Signals;
 using CartonPrinting.Infrastructure.Time;
 using CartonPrinting.Infrastructure.Transactions;
 using Microsoft.Extensions.Logging;
@@ -48,9 +49,34 @@ public sealed class SenderHaltedException(string message, Exception inner) : Exc
 public sealed class PrinterSenderService(
     string printerId, SqlDb db, ClaimService claims, TxcWriteResult txc, StationConfigStore stations, LeaseGrant lease, IPrinterTransport transport,
     EdgeClock clock, CartonMetrics metrics, ISenderFaults? faults = null, IPhysicalGate? gate = null, ILogger<PrinterSenderService>? logger = null,
-    EvidenceService? evidence = null)
+    EvidenceService? evidence = null, SqlOutage? sqlOutage = null, SenderRecovery? recovery = null, LinePrinterReadiness? readiness = null)
 {
+    /// <summary>ESTRATEGIA_RECUPERACION §3, Impresora: "Tres fallos seguidos | Sender en pausa, LabelingReady en falso, alerta".</summary>
+    public const int MaxConsecutiveDeviceFailures = 3;
+
+    /// <summary>Con el sender en pausa, cada cuánto se prueba si la impresora vuelve a aceptar conexiones.</summary>
+    public static readonly TimeSpan PausedProbeInterval = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Pausa mínima, que el latido (500 ms) llega a ver. Una recaída en el período de prueba la duplica, hasta <see cref="MaxPause"/>:
+    /// una impresora que acepta conexiones pero corta la escritura cuesta un intento por vuelta, cada vez más espaciados.
+    /// </summary>
+    public static readonly TimeSpan MinPause = TimeSpan.FromSeconds(5);
+
+    public static readonly TimeSpan MaxPause = TimeSpan.FromSeconds(60);
+
     private readonly ILogger _logger = logger ?? NullLogger<PrinterSenderService>.Instance;
+    private int _deviceFailures;
+
+    // Un sender nuevo (al volver a tomar la impresora) hereda la pausa de la estación: la sigue probando y la levanta él.
+    private volatile bool _paused = readiness?.Paused ?? false;
+    private long _pausedAt = clock.GetTimestamp();
+    private TimeSpan _pauseHold = MinPause;
+    private bool _probation = readiness?.Paused ?? false;
+    private bool _recoverBeforeClaim;
+
+    /// <summary>En pausa por fallos seguidos del dispositivo: no reclama hasta que la impresora vuelva a aceptar conexiones.</summary>
+    public bool Paused => _paused;
 
     public string PrinterId => printerId;
 
@@ -122,6 +148,7 @@ public sealed class PrinterSenderService(
             {
                 transport.Reset();
                 (rejection, cause) = ($"Conexión fallida: {ex.Message}", NotSentCause.ConnectionFailed);
+                NoteDeviceFailure("no acepta la conexión");
             }
 
             // Lo que necesita I/O va justo antes de la comprobación final (DOCUMENTO_PRINCIPAL §10.2, paso 2), ya con el
@@ -164,7 +191,18 @@ public sealed class PrinterSenderService(
         // Desde aquí la escritura está invocada: cualquier error es UNKNOWN.
         var writeStartedAt = clock.UtcNow;
         var writeTs = clock.GetTimestamp();
-        metrics.Record(MetricNames.PresendCheckToWriteMs, clock.GetElapsedTime(checkTs, writeTs).TotalMilliseconds);
+
+        // Los tramos se registran después de escribir: nada se interpone entre la comprobación y la escritura.
+        void RecordWriteStart()
+        {
+            metrics.Record(MetricNames.PresendCheckToWriteMs, clock.GetElapsedTime(checkTs, writeTs).TotalMilliseconds);
+            metrics.Record(MetricNames.PrintDeadlineSlackMs, clock.GetElapsedTime(writeTs, deadlineTs).TotalMilliseconds + context.EffectiveSendMarginMs);
+            if (metrics.TakeReceived(context.Job.DetectionId) is { } received)
+            {
+                metrics.Record(MetricNames.OpcReceiveToSendStartMs, clock.GetElapsedTime(received, writeTs).TotalMilliseconds);
+            }
+        }
+
         DateTime? deviceAcceptedAt;
         try
         {
@@ -173,7 +211,10 @@ public sealed class PrinterSenderService(
         }
         catch (Exception ex)
         {
+            RecordWriteStart();
+            metrics.MarkWrite(printJobId, writeTs, null);
             transport.Reset();
+            NoteDeviceFailure("escritura interrumpida");
             metrics.Increment(MetricNames.PrinterUnknown, ("printer", printerId));
             metrics.Increment(MetricNames.PrintAttempts, ("outcome", AttemptOutcome.Unknown));
             _logger.LogWarning("Escritura interrumpida en {Printer} para {Job}: {Error}. Intento UNKNOWN, sin reintento automático.",
@@ -185,10 +226,13 @@ public sealed class PrinterSenderService(
         }
 
         var writeCompletedAt = clock.UtcNow;
+        metrics.MarkWrite(printJobId, writeTs, clock.GetTimestamp());
         if (deviceAcceptedAt is not null)
         {
             metrics.Record(MetricNames.SendStartToDeviceAcceptMs, clock.GetElapsedTime(writeTs).TotalMilliseconds);
         }
+
+        RecordWriteStart();
 
         if (faults is not null)
         {
@@ -198,8 +242,69 @@ public sealed class PrinterSenderService(
         var transmitted = await RecordResultAsync(attemptId, () => txc.TransmittedAsync(attemptId, writeStartedAt, writeCompletedAt, preSendCheckAt,
             deviceAcceptedAt is { } accepted ? CanonicalTimestamp.Truncate(accepted) : null, clock.UtcNow, CancellationToken.None));
         metrics.Increment(MetricNames.PrintAttempts, ("outcome", AttemptOutcome.Transmitted));
+        _deviceFailures = 0;
+        _probation = false;
         await ReapplyEvidenceAsync(context, claim.ClaimedAtUtc);
         return new SendResult(printJobId, claim, transmitted, true);
+    }
+
+    /// <summary>
+    /// Un fallo del dispositivo (no acepta la conexión o corta la escritura). Al tercero seguido el sender entra en pausa: deja de
+    /// reclamar, LabelingReady baja (<see cref="LinePrinterReadiness"/>) y queda la alerta. Un envío transmitido reinicia la cuenta.
+    /// </summary>
+    private void NoteDeviceFailure(string what)
+    {
+        if (++_deviceFailures < MaxConsecutiveDeviceFailures || _paused)
+        {
+            return;
+        }
+
+        // Una recaída en el período de prueba (sin un envío transmitido desde la última vuelta) alarga la pausa.
+        _pauseHold = _probation ? TimeSpan.FromTicks(Math.Min(_pauseHold.Ticks * 2, MaxPause.Ticks)) : MinPause;
+        _pausedAt = clock.GetTimestamp();
+        _paused = true;
+        readiness?.SetPaused(true);
+        metrics.SetGauge(MetricNames.PrinterSenderPaused, 1, ("printer", printerId));
+        metrics.Increment(MetricNames.PrinterSenderPauses, ("printer", printerId));
+        _logger.LogError("Impresora {Printer}: {Count} fallos seguidos del dispositivo (el último: {What}). Sender en pausa al menos {Hold}, LabelingReady en falso; después se prueba la conexión",
+            printerId, _deviceFailures, what, _pauseHold);
+    }
+
+    /// <summary>
+    /// Con el sender en pausa, prueba si la impresora acepta una conexión. Si vuelve (ESTRATEGIA_RECUPERACION §3: "Vaciar cola si se
+    /// puede; descartar vencidos; seguir con la siguiente caja"), el sender sigue: los vencidos los descartan el claim (J03) y el barrido.
+    /// La cola del dispositivo no se vacía porque la capacidad no está confirmada (OT-07), como en el arranque.
+    /// </summary>
+    private async Task<bool> ResumeIfPrinterAnswersAsync(CancellationToken ct)
+    {
+        if (clock.GetElapsedTime(_pausedAt) < _pauseHold)
+        {
+            return false;
+        }
+
+        try
+        {
+            transport.Reset();
+            using var limit = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            limit.CancelAfter(TimeSpan.FromSeconds(2));
+            await transport.ConnectAsync(limit.Token);
+        }
+        catch (Exception) when (!ct.IsCancellationRequested)
+        {
+            transport.Reset();
+            return false;
+        }
+
+        // Período de prueba: aceptar una conexión no prueba que la impresora imprima (puede cortar la escritura). El primer fallo
+        // vuelve a pausar, con la espera duplicada; un envío transmitido termina la prueba.
+        _paused = false;
+        _probation = true;
+        _deviceFailures = MaxConsecutiveDeviceFailures - 1;
+        readiness?.SetPaused(false);
+        metrics.SetGauge(MetricNames.PrinterSenderPaused, 0, ("printer", printerId));
+        _logger.LogWarning("Impresora {Printer}: vuelve a aceptar conexiones; el sender sigue con la siguiente caja (la cola del dispositivo no se vacía, OT-07)",
+            printerId);
+        return true;
     }
 
     /// <summary>La evidencia que llegó mientras el intento estaba en SENDING se aplica ahora (después de TX-C).</summary>
@@ -242,23 +347,58 @@ public sealed class PrinterSenderService(
     private Task<WriteOutcome> RecordResultAsync(Guid attemptId, Func<Task<WriteOutcome>> txcCall) =>
         ResultRecorder.RecordAsync(txcCall, printerId, attemptId, _logger);
 
-    /// <summary>Bucle del sender: envía mientras haya jobs READY; si no, espera una señal o el intervalo de sondeo.</summary>
+    /// <summary>
+    /// Bucle del sender: envía mientras haya jobs READY; si no, espera una señal o el intervalo de sondeo.
+    /// <list type="bullet">
+    /// <item>Con la caída de SQL Server declarada (<c>sqlOutage</c> del constructor) no reclama nada: sin árbitro no se imprime
+    /// (ESTRATEGIA_RECUPERACION §3). Un error de SQL no disponible fuera de la escritura (TX-B) declara la caída para toda la estación
+    /// (DOCUMENTO_PRINCIPAL §15: "Error en TX-A o TX-B"), y el latido baja LabelingReady.</item>
+    /// <item>Después de un error fuera de la escritura, antes de reclamar otro job ejecuta TX-R0 de esta impresora: si el commit del
+    /// claim se confirmó y la respuesta se perdió, el intento quedó en SENDING sin escritura y la impresora ocupada (PrinterBusy). TX-R0
+    /// lo cierra como UNKNOWN (RESTART_DURING_SEND, ESTRATEGIA_RECUPERACION §2), como haría un reinicio. El sender tiene el lease y no
+    /// está escribiendo.</item>
+    /// <item>En pausa por fallos seguidos del dispositivo, no reclama y prueba la conexión cada <see cref="PausedProbeInterval"/>.</item>
+    /// </list>
+    /// </summary>
     public async Task RunAsync(TimeSpan pollInterval, TimeProvider loopTime, Func<CancellationToken, Task>? waitForSignal, CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                // Solo un claim obtenido sigue de inmediato; un rechazo (estación bloqueada, lease, orden, etc.) espera el
-                // intervalo de sondeo en lugar de volver a reclamar el mismo job en bucle.
-                if (await SendNextAsync(ct) is { Claim.Claimed: true })
+                if (_paused && !await ResumeIfPrinterAnswersAsync(ct))
                 {
+                    await Task.Delay(PausedProbeInterval, loopTime, ct);
                     continue;
+                }
+
+                if (sqlOutage is not { Declared: true })
+                {
+                    if (_recoverBeforeClaim && recovery is not null)
+                    {
+                        // Solo lo reclamado con este lease: nunca el SENDING de otra instancia que haya tomado la impresora.
+                        await recovery.RecoverAsync(printerId, ct, lease.FencingToken);
+                    }
+
+                    _recoverBeforeClaim = false;
+
+                    // Solo un claim obtenido sigue de inmediato; un rechazo (estación bloqueada, lease, orden, etc.) espera el
+                    // intervalo de sondeo en lugar de volver a reclamar el mismo job en bucle.
+                    if (await SendNextAsync(ct) is { Claim.Claimed: true })
+                    {
+                        continue;
+                    }
                 }
             }
             catch (Exception ex) when (ex is not OperationCanceledException and not SenderHaltedException)
             {
-                _logger.LogError(ex, "Sender de {Printer}: error fuera de la escritura; se reintenta", printerId);
+                _recoverBeforeClaim = true;
+                metrics.Increment(MetricNames.SenderErrors, ("printer", printerId));
+                _logger.LogError(ex, "Sender de {Printer}: error fuera de la escritura; TX-R0 de la impresora antes del próximo claim", printerId);
+                if (SqlAvailability.IsUnavailable(ex) && sqlOutage?.Declare() == true)
+                {
+                    _logger.LogError("SQL Server no disponible en el claim de {Printer}: falla cerrada para la estación", printerId);
+                }
             }
 
             using var interval = new CancellationTokenSource(pollInterval, loopTime);

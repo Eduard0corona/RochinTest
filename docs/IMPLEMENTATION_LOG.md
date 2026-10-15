@@ -1137,3 +1137,558 @@ Compuerta en verde.
 
 - Todo el perfil extendido: journal SQLite, `AckCycleId`, reproducción tardía del journal, I21 y G09. La FIFO simulada de T11 (Fase 2) es solo la recuperación de ciclos tras reconectar del perfil mínimo.
 
+## Fase 7 · Hardening y demo (T08, T12, T16, T19, T32)
+
+### Plan
+
+- **Entregables:**
+  - **Fallas:** RabbitMQ detenido 10 minutos con carga nominal (T08) y SQL Server caído mientras pasan cajas (T19).
+  - **Recirculación** con identidad física (T16) y sin ella (T32).
+  - **Carga (T12)** con simuladores en `CartonPrinting.LoadTests`, con la duración del catálogo. Se corre aparte (`Category=Load`) y se reporta en `docs/BENCHMARK.md`.
+  - **Seguridad:** OPC UA con SignAndEncrypt en la configuración, secretos fuera del repositorio y RabbitMQ con TLS configurable.
+  - **Demo y FAT:** `docs/DEMO.md` y `docs/FAT_CHECKLIST.md`.
+- **Pruebas que la cierran:** T08, T12, T16, T19 y T32.
+- **Riesgos previstos:**
+  - La tasa y el payload de T12 no están acordados con OT. La persona decidió usar una hipótesis declarada: una caja por segundo con el payload del simulador, 30 minutos a esa tasa y 10 al doble. `BENCHMARK.md` lo dice como hipótesis, no como aceptación en planta.
+  - Las pruebas largas (T08 y T12) comparan latencias y son sensibles a la carga de la máquina.
+
+### Lo hecho
+
+- **SQL Server caído en la ingesta (T19).** `SqlAvailability` distingue "SQL no disponible" de cualquier otro error de SQL.
+  - Con SQL caído, la ingesta reintenta dos veces y rechaza el ciclo (`opc_records_rejected_total{cause=SQL_UNAVAILABLE}`): falla cerrada, sin detección.
+  - Al volver SQL, recarga el estado de la estación, y el ciclo siguiente abre el hueco de los ciclos de la caída.
+  - Cualquier otro error de SQL sigue deteniendo el consumidor.
+- **Recirculación (T16, T32; SI-17 decidido por la persona).** TX-A y TX-E cuentan como recirculación solo las detecciones anteriores de la caja, con el modo de identidad más restrictivo entre el congelado y el activo.
+- **RabbitMQ caído (T08).** El Outbox Relay actualiza `outbox_pending_age_seconds` también cuando la publicación falla. Antes, con el broker caído, la métrica quedaba congelada en su último valor: justo la alerta de esa caída.
+- **Tramos de latencia de la sección 10.4.** De los tramos, solo `opc_receive_to_job_ready_ms` se medía. Ahora también se miden:
+  - `plc_to_opc_receive_ms`, en el registro, solo para notificaciones en vivo;
+  - `opc_receive_to_send_start_ms`: la marca monotónica de recepción viaja de TX-A al sender en `CartonMetrics`;
+  - `print_deadline_slack_ms`, en el sender;
+  - `send_start_to_applied_ms` y `applied_to_verified_ms`, en la evidencia.
+  
+  Las muestras en memoria quedan acotadas a 50 000 por serie, para no crecer sin fin en un proceso de larga duración.
+- **Señal en proceso (G11).** `ReadyJobSignal` (`System.Threading.Channels`): TX-A, TX-E y el barrido, cuando liberan un `RETRY_WAIT`, despiertan al sender de línea sin esperar su sondeo de 50 ms, que queda como respaldo. El EdgeHost lo registra como singleton.
+- **T12.** `StationPipeline` compone la estación como el EdgeHost:
+  - PLC simulado por OPC UA, ingesta real, señal, sender con sondeo de respaldo, impresora, aplicador y escáner simulados;
+  - nivel VERIFIED;
+  - una caja cada segundo durante 30 minutos y dos por segundo durante 10;
+  - 10 cajas de calentamiento fuera de la muestra.
+  
+  Escribe un reporte JSON que `build/benchmark_report.py` convierte en `docs/BENCHMARK.md`. `LatencySegmentsTests`, en la compuerta, comprueba que cada tramo tiene una muestra por caja y que la señal despierta al sender: con un sondeo de 2 s, sin señal la espera supera 500 ms y con señal no.
+- **Seguridad.**
+  - `RabbitMqOptions.CreateConnectionFactory`, que usan el publicador y los consumidores: TLS 1.2 o 1.3 con un Uri `amqps://` o con `Tls.Enabled`, el nombre esperado del broker y un certificado de cliente desde los secretos, sin errores de política aceptados.
+  - `build/check_secrets.py`, en la compuerta: ningún certificado, clave ni contraseña literal versionados fuera de `tests/` y `spec/`.
+  - `OpcSecurityTests`: el PLC simulado solo con SignAndEncrypt; el cliente con los valores por defecto (SignAndEncrypt, sin autoaceptar) rechaza un servidor que no es de confianza y se conecta cifrado cuando lo es.
+- **Demo.** `tests/CartonPrinting.DemoHost`:
+  - siembra una estación y arranca los simuladores (PLC, impresora, ERP, aplicador y escáner);
+  - lanza el EdgeHost real como proceso, configurado solo con variables de entorno, y hace pasar cajas hasta CONFIRMED.
+  
+  `DemoTests` lo ejecuta en la compuerta: es la primera prueba de composición del EdgeHost de punta a punta. `docs/DEMO.md` es el guion; `docs/FAT_CHECKLIST.md` lista lo que solo acepta la planta.
+- **Compuerta.** `build/ci.ps1` y `build/ci.sh`:
+  - agregan el paso de secretos;
+  - con `--carga`, corren además las pruebas de carga (`Category=Load`), para que la trazabilidad de la Fase 7 vea T12.
+
+### Decisiones
+
+1. **SQL caído: falla cerrada en el perfil mínimo** (ESTRATEGIA_RECUPERACION §3, OT-13 por defecto). Un ciclo que no se puede registrar no se registra: al volver SQL es parte de un hueco (`SequenceGap`), nunca una detección inventada (I07, I16). Cómo se decide qué ciclos son de la caída, después de la revisión: decisión 7.
+2. **RabbitMQ caído: simulado con un proxy TCP** entre el Outbox Relay y el broker, que corta las conexiones y no acepta nuevas. Detener el contenedor cambiaría su puerto en Testcontainers.
+   - El consumidor se conecta al broker directamente: lo que se prueba es la independencia del EdgeHost.
+   - T08 corre sin otras pruebas del ensamblado en paralelo, porque compara la latencia de impresión antes y durante la caída.
+3. **La señal en proceso es solo una señal.** El sender siempre lee de SQL qué enviar. Una señal perdida la cubre el sondeo de respaldo; varias seguidas lo despiertan una vez.
+4. **T12 con valores de laboratorio** (OT-03 abierta): `TransitBudgetMs` 1500, `DeviceLeadTimeMs` 400, `SendMarginMs` 250 y `ClockSkewToleranceMs` 50.
+   - El margen por defecto de las pruebas (100) no cubría p99(`presend_check_to_write_ms`) + `ClockJumpToleranceMs` (200), como pide la sección 17. La corrida corta lo mostró, y T12 lo comprueba junto con la desigualdad y con `DeviceLeadTimeMs` ≥ p99 medido.
+   - El PLC simulado negocia la publicación en 100 ms aunque se pidan 20: está en el reporte.
+5. **La demo hace de integración de evidencia.** El EdgeHost no tiene una entrada de evidencia propia (Fase 4), así que la demo aplica por TX-D la evidencia que informan la impresora, el aplicador y el escáner simulados. El PLC simulado va sin cifrado en la demo (laboratorio); la seguridad de planta la prueba `OpcSecurityTests`.
+6. **Secretos.** La revisión excluye `tests/`, porque las credenciales de los contenedores efímeros no son de planta, y `spec/`. Las variables de sqlcmd, de entorno y de plantilla no cuentan como contraseñas.
+7. **Falla cerrada decidida por la recepción, con una sola caída por proceso** (revisiones independientes: A1 y M1; M-1, M-2, M-3, BAJA-1 y BAJA-9; SI-20).
+   - **Quién la declara.** `SqlOutage` es una sola caída para la ingesta, el latido y el sender de línea. La declaran:
+     - la ingesta, cuando un ciclo agota sus intentos: hasta 1 s cada uno (`SqlAttemptTimeoutMs`), con reintentos solo dentro del plazo de la caja (tres si el registro no tiene plazo vigente);
+     - el latido, con SQL no disponible o cuando su lectura sigue sin respuesta en el latido siguiente (una sola lectura lenta solo baja la señal en ese latido: la especificación ata la caída a TX-A);
+     - el sender de línea, ante un error de SQL no disponible en TX-B;
+     - la recarga con que la ingesta empieza a consumir, si SQL no responde justo entonces.
+   - **Mientras está declarada:** `LabelingReady` en falso, cada ciclo se rechaza sin ir a SQL y el sender de línea no reclama.
+   - **Vigilancia.** Corre cada segundo, sin esperar ciclos. Levanta la caída solo si se cumple todo esto:
+     - lleva declarada al menos el intervalo de prueba, duplicado por cada recaída dentro de 30 s (hasta 64 veces);
+     - no queda ninguna operación de SQL abandonada pendiente: una lectura del latido, un intento de TX-A o una prueba anteriores;
+     - recarga el estado (etapa 5);
+     - toma con `LOCK_TIMEOUT` el rango donde TX-A insertará el ciclo siguiente, porque una lectura que funciona no alcanza si las escrituras siguen bloqueadas.
+
+     Cualquier error en la prueba, también uno no clasificado como SQL no disponible, significa "todavía no". La ingesta no se detiene por eso. Si se detiene por un defecto, el proceso sale con el código 71.
+   - **Al volver.** El latido levanta `LabelingReady` recién con la caída levantada (etapa 8); el barrido sigue con su intervalo (etapa 6).
+   - **Regla de recepción.** Un ciclo recibido antes de la marca de recuperación se rechaza aunque se procese después: es parte del hueco, nunca una detección.
+   - **Tiempos.** Los tiempos de los intentos son de E/S, en tiempo real, y no deciden plazos. Un intento que vence se abandona, porque SqlClient no siempre corta enseguida una conexión que dejó de responder. Conserva el lock del consumidor hasta terminar, y si al final registra su ciclo queda en el log.
+   - **SqlClient.** Los errores de un servidor que se detiene y vuelve (6005, 4060, 18456 y 18401) cuentan como SQL no disponible. El pool no tiene periodo de bloqueo (`PoolBlockingPeriod=NeverBlock`).
+   - **Costos aceptados.**
+     - Tras volver SQL, los ciclos que llegan antes de que la vigilancia lo note también son hueco, todavía con `LabelingReady` en falso. Eso dura al menos 1 s, y más si una conexión colgada tarda en soltarse: hasta el `CommandTimeout` de 30 s de SqlClient.
+     - Un TX-A abandonado que sí alcanzó a confirmar deja registrada una detección real; el claim vuelve a comprobar su plazo.
+     - TX-B esperando un lock no se abandona: sus jobs vencen por el barrido (SI-20).
+8. **Benchmark con la composición declarada** (M4). `StationPipeline` agrega:
+   - el barrido cada 200 ms;
+   - OPC UA con SignAndEncrypt y validación estricta, con el certificado del PLC en el almacén de confianza;
+   - en T12, el Outbox Relay con publisher confirms hacia RabbitMQ.
+
+   El reporte declara la composición, los errores de la corrida y los escenarios excluidos: fallas, ERP en caché, operación, propiedad, consumidor y hardware.
+9. **T08 con el plazo nominal** (M3): `TransitBudgetMs` 1500, `DeviceLeadTimeMs` 400 y `SendMarginMs` 250, como T12.
+   - Una caja demorada durante la caída vence, y la prueba falla.
+   - "Latencias de impresión sin cambio" no tiene un número en el catálogo. Los márgenes son de ruido de una sola máquina:
+     - p50 durante la caída ≤ p50 antes + 20 ms;
+     - p95 ≤ el mayor entre 1,5 veces y + 50 ms;
+     - p99 ≤ el mayor entre 2 veces y + 100 ms.
+   - El máximo lo acota el plazo.
+   - Diez cajas de calentamiento quedan fuera de la medición.
+   - **Corregida por la verificación final (MEDIA 7).** El conteo absoluto ("ninguna caja vencida en toda la corrida") era más estricto que el catálogo y falló en la compuerta por una caja vencida 9 s antes del corte, sin relación con RabbitMQ. T08 ahora evalúa primero el criterio del catálogo: cero eventos perdidos, mismo EventId, orden de `OutboxSequence` e Inbox. Después, las latencias. Al final, lo que no terminó `CONFIRMED`:
+     - ningún job sin `CONFIRMED` llegó a escribirse (I04: nada se imprimió tarde);
+     - durante la caída y al volver el broker hay, como mucho, la proporción de vencidos de antes más una caja;
+     - en toda la corrida, como mucho el 1 % de las cajas, y al menos 2.
+10. **LabelingReady con la impresora de línea** (verificación final, MEDIA 1 y 4; SI-20). `LinePrinterReadiness` está en verdadero solo con la impresora de línea tomada (lock y lease), con TX-R0 hecho desde que se tomó y con su sender sin pausa. El latido la combina con lo demás.
+    - **La pausa.** Tres fallos seguidos del dispositivo (no acepta la conexión o corta la escritura) ponen el sender en pausa (ESTRATEGIA_RECUPERACION §3, Impresora): no reclama, `LabelingReady` baja, el gauge `printer_sender_paused` queda en 1 y se registra la alerta.
+    - **La vuelta.** El sender espera al menos 5 s (el latido llega a ver la pausa) y prueba la conexión cada segundo. Cuando la impresora acepta una, sigue con la siguiente caja: los vencidos los descartan J03 y el barrido, y la cola del dispositivo no se vacía (OT-07, como en el arranque).
+    - **Período de prueba.** Aceptar una conexión no prueba que la impresora imprima: puede cortar cada escritura. Después de la pausa, el primer fallo vuelve a pausar con la espera duplicada, hasta 60 s. Un envío transmitido termina la prueba. Una impresora que corta cada escritura cuesta un intento `UNKNOWN` por vuelta, cada vez más espaciados.
+    - **Herencia.** Un sender nuevo hereda la pausa de la estación y la levanta él. El ciclo de propiedad crea uno al volver a tomar la impresora, por ejemplo después de perder el lease estando en pausa.
+    - **El sender corriendo.** La impresora en servicio exige que el sender esté corriendo: sin su fila de `PrinterSendOrder` no arranca, y la estación no se anuncia lista.
+11. **TX-R0 después de un error del claim** (MEDIA 3). Un error fuera de la escritura pudo llegar después del commit de TX-B, con la respuesta perdida. Entonces el intento quedó en `SENDING` sin escritura y la impresora ocupada (PrinterBusy).
+    - Antes del claim siguiente, el sender ejecuta TX-R0 de su impresora, solo sobre los intentos reclamados con su propio token de lease: nunca toca el `SENDING` en curso de otra instancia que haya tomado la impresora. Ese intento pasa a `UNKNOWN` con `RESTART_DURING_SEND`, como en un reinicio. Es una extensión del disparador de J09, que la máquina de estados describe para el arranque (SI-20).
+    - Sin errores, no hay TX-R0 extra.
+    - **Verificación previa al primer envío.** Si el lease se volvió a tomar con otro token entre el arranque y el primer envío, se repite TX-R0.
+12. **TX-A y TX-E leen la estación con lock compartido hasta el commit** (`REPEATABLEREAD`; MEDIA 2). Así un bloqueo en curso (CLOCK_JUMP vence lo pendiente en la misma transacción, SI-16) queda en orden con ellas: lo esperan y lo ven, o él las espera y su purga ve sus jobs.
+    - **Orden de locks.** TX-E lee la estación antes de tomar la detección, el mismo orden que CLOCK_JUMP: estación y después las filas. Así no hay un ciclo de locks que, además de un 1205, haría esperar a la ingesta hasta declarar una caída falsa.
+    - **TX-A.** Inserta su detección antes de leer la estación, como manda "inserción primero". La purga no ve una detección sin confirmar y no la espera.
+13. **Tramos de evidencia monotónicos** (MEDIA 5). El sender guarda las marcas monotónicas de la escritura de cada job (invocación y escritura completa). `EvidenceService` mide hasta la recepción de cada observación en el EdgeHost, nunca con el `ObservedAt` del dispositivo, que viene de otro reloj.
+    - Incluyen la latencia de la integración: es la cota conservadora para `DeviceLeadTimeMs`.
+    - Sin las marcas (el job lo escribió otro proceso), el tramo desde la escritura no se mide.
+    - Una reimpresión excepcional también deja sus marcas: la evidencia posterior se mide desde la escritura más reciente del job.
+14. **Alerta del Outbox independiente** (MEDIA 6). `outbox_pending_age_seconds` se mide cada segundo, aparte de la publicación, y cada publicación espera su confirm como máximo 10 s (`PublishTimeout`). Un broker bloqueado o colgado hace crecer la alerta, cuenta como falla y se republica con el mismo EventId (I22).
+15. **Revisión de secretos ampliada** (BAJA-14).
+    - **Qué busca.** Valores literales en cualquier clave que nombre una contraseña, una frase de paso o un secreto, con `=` o `:` y también entre comillas JSON, en todos los archivos de texto salvo `spec/` y `tests/`.
+    - **Qué no cuenta.** En código solo cuenta una cadena literal. Las variables y los marcadores (`<...>`) no cuentan.
+    - **`.env.example`.** Tenía contraseñas de ejemplo; ahora van vacías, y `docker compose` no arranca hasta completarlas.
+16. **El barrido bloquea los jobs en el mismo orden que el claim** (SI-21).
+    - **Cómo.** Los barridos que recorren los pendientes de la estación (`OUT_OF_ORDER` y `CLOCK_JUMP`) leen los candidatos por versiones y los actualizan por `PK_PrintJob`, con el predicado completo bajo el lock de cada fila.
+    - **Por qué.** La sentencia de referencia recorría `IX_PrintJob_Sweep` con U antes de la clave primaria, al revés que el claim J02, y se interbloqueaban. El sender quedaba detenido hasta 5 s y la caja vencía.
+    - **Qué no cambia.** Las guardas, el motivo y los efectos son los mismos.
+    - **La diferencia.** Lo que entra en `READY` o `RETRY_WAIT` durante el barrido queda para la pasada siguiente.
+    - **T47.** La sentencia de referencia se conserva tal cual para T47 (`ExpireOutOfOrderReferenceAsync`).
+
+    Ver "Interbloqueo del barrido con el claim".
+17. **Diagnóstico de T12.** El reporte se escribe antes de las aserciones. Incluye:
+    - los jobs sin `CONFIRMED` con sus intentos;
+    - los picos de backlog con su momento;
+    - las cajas más lentas;
+    - los interbloqueos de `system_health`;
+    - las esperas largas de SQL Server muestreadas cada 200 ms (`StallWatch`): sentencia, recurso y quién bloquea;
+    - las pausas del propio proceso;
+    - el momento de cada falla contada.
+
+    `build/benchmark_report.py` lo escribe en "Errores y escenarios excluidos" al regenerar `docs/BENCHMARK.md` con la compuerta final. El `BENCHMARK.md` versionado todavía es el de la corrida de las 06:46, con la composición anterior (sin barrido ni Outbox Relay).
+    - Un fallo del propio diagnóstico queda en el reporte y no hace fallar T12.
+    - Una fase que no termina de drenar se afirma después de escribir el reporte.
+18. **Un NOT_SENT con la estación bloqueada por `CLOCK_JUMP` vence el job (J08)** en lugar de J06, extensión de SI-16 (revisión de `59e6c73`, MEDIA). Un envío en curso durante el salto no lo veía la purga, y J06 lo devolvía a `RETRY_WAIT` para imprimirlo después del desbloqueo con su plazo del reloj anterior. TX-C lee la estación con lock compartido antes que cualquier otra fila, en el mismo orden que la purga.
+
+### Comandos y resultados
+
+T08, corrida completa con la máquina en reposo, 2026-10-15 06:00 (`dotnet test tests/CartonPrinting.FaultTests --filter FullyQualifiedName~BrokerOutageTests`):
+
+```
+T08 latencia recepción→escritura (ms): antes p50=38 p95=41 máx=80; durante p50=39 p95=108 máx=3941; cajas=690
+Correctas CartonPrinting.FaultTests.Hardening.BrokerOutageTests.Ten_minutes_without_rabbitmq_change_nothing_in_printing_and_lose_no_event [11 m 31 s]
+```
+
+Durante el desarrollo:
+
+- **Las dos primeras corridas completas de T08 fallaron** con los jobs de los últimos 60 segundos de la caída vencidos (`DEADLINE_PASSED`). La causa estaba en la prueba: el lease de la impresora del escenario dura 10 minutos y nadie lo renovaba, así que TX-B rechazaba cada claim. `StationScenario.KeepLeaseAsync` lo renueva, como el ciclo de propiedad del EdgeHost; `StationPipeline` también lo usa.
+- **La tercera corrida pasó** las comprobaciones funcionales (690 cajas, ninguna perdida ni duplicada), pero no la de latencia (p95 de 509 ms durante la caída frente a 46 ms antes). La caída coincidió con las compilaciones y mutaciones de las revisiones de las Fases 4 y 5. Desde entonces T08 corre sola y se repitió con la máquina en reposo.
+- **`LatencySegmentsTests`** falló dos veces bajo la carga de esas revisiones. La primera caja en frío tardaba 1,7 s, con conexión y JIT, y el resto arrastraba el backlog. Además, un job venció sin la señal con un plazo de 5 s. Ahora tiene tres cajas de calentamiento, un plazo de 15 s y la comparación sobre diez cajas a una por segundo: tres corridas seguidas en verde.
+- **La corrida corta de T12** (1 minuto y 30 segundos) mostró que la desigualdad se cumplía y el margen no. Ver la decisión 4.
+
+T12, corrida completa con la máquina en reposo, terminada el 2026-10-15 a las 06:46 hora local (13:46 UTC). Usó la composición anterior a la revisión: sin barrido, sin Outbox Relay y con OPC UA sin cifrado.
+
+```
+CARTONPRINTING_BENCHMARK_OUT=<scratchpad>/benchmark-t12.json dotnet test tests/CartonPrinting.LoadTests --no-build --filter "Category=Load"
+  Correctas CartonPrinting.LoadTests.SustainedLoadTests.Thirty_minutes_at_the_agreed_rate_and_ten_at_double_keep_the_backlog_stable_and_the_deadline_feasible [40 m 18 s]
+Pruebas totales: 1
+     Correcto: 1
+ Tiempo total: 40.4510 Minutos
+```
+
+- **Carga:** 3010 cajas, 10 de calentamiento, 1800 a una por segundo y 1200 a dos por segundo. Todas `CONFIRMED` con VERIFIED, una etiqueta cada una. El backlog, muestreado cada segundo, quedó en 0 en ambas fases.
+- **Notificación → invocación de la escritura:**
+  - a la tasa pactada: p50 20,6 ms, p99 59,9 ms y máximo 267 ms;
+  - al doble: p99 61,1 ms.
+- **Desigualdad de factibilidad (PLC_TIMESTAMP):** 110 + 60 + 250 + 50 + 37 = 507 ms < 1500 ms.
+  - `SendMarginMs` 250 ≥ 0 + 200.
+  - `DeviceLeadTimeMs` 400 ≥ 37 medido.
+- **OPC UA:** publicación pedida en 20 ms y negociada en 100 ms, muestreo en 10 ms.
+
+Con ella se generó la primera versión de `docs/BENCHMARK.md`; la versión final sale de la corrida de T12 de la compuerta final.
+
+Después de la revisión independiente, con la máquina en reposo:
+
+- **T19, las tres pruebas** (`--filter FullyQualifiedName~SqlOutageTests`): correctas en 18, 26 y 44 s.
+- **T16 y T32** (`--filter FullyQualifiedName~RecirculationTests`): las cuatro correctas.
+- **`OpcSecurityTests`, `DemoTests` y `LatencySegmentsTests`** con la composición nueva (SignAndEncrypt y barrido): correctas.
+- **T12, corrida corta** (fases de 1 minuto y 30 s, revertidas después) con el Outbox Relay y SignAndEncrypt: correcta. 130 jobs `CONFIRMED`, 260 eventos publicados, ninguna falla de servicio.
+- **T08 con el plazo nominal**, sin calentamiento, 2026-10-15 07:41: falló, con 2 de 750 jobs sin `CONFIRMED` (`Expected: 750, Actual: 748`).
+- **T08 con calentamiento y diagnóstico**, 2026-10-15 07:58:
+
+```
+  Correctas CartonPrinting.FaultTests.Hardening.BrokerOutageTests.Ten_minutes_without_rabbitmq_change_nothing_in_printing_and_lose_no_event [12 m 41 s]
+ T08 latencia recepción→escritura (ms): antes p50=39 p95=41 p99=43 máx=63; durante p50=39 p95=43 p99=64 máx=141; cajas=750
+   ciclo 1539 a 419.0 s del corte: recepción→claim 34 ms, claim→escritura 107 ms, intentos 1
+```
+
+- **Compuerta de `bac67f1`** (`build/ci.ps1 --fase 7 --carga`, 2026-10-15 de 08:00 a 08:18). Falló en las pruebas sin carga:
+  - UnitTests 171 de 171 e IntegrationTests 101 de 101;
+  - FaultTests 103 de 104: `A_cycle_received_during_the_outage_and_processed_after_sql_returns_is_part_of_the_gap` esperó 30 s la notificación del ciclo 500.
+
+  Con la máquina cargada, la primera notificación del monitored item llegó ya con el ciclo 500, como READ, y la prueba solo aceptaba SUBSCRIPTION. Ahora espera el valor inicial antes de publicar y acepta cualquier transporte (`5c91cf0`); pasó dos veces seguidas.
+
+Después de la segunda revisión, con la máquina en reposo:
+
+- **T19, las siete pruebas** (`--filter FullyQualifiedName~SqlOutageTests`): correctas. Entre ellas:
+  - escrituras bloqueadas con lecturas que responden;
+  - la recarga de la vigilancia;
+  - TX-B;
+  - el contenedor de SQL Server detenido y vuelto a arrancar (51 s).
+- **`RecirculationTests`:** las cinco correctas, con la de SI-04 en TX-E.
+- **`SqlOutageTests` de la unidad `Signals`:** las tres correctas.
+- **Compuerta de `c790f7e`** (`build/ci.ps1 --fase 7 --carga`, 2026-10-15 de 08:48 a 09:06), en paralelo con la verificación final. Falló en las pruebas sin carga:
+  - UnitTests 174 de 174 e IntegrationTests 102 de 102;
+  - FaultTests 107 de 108: T08 con `Expected: 750, Actual: 749`.
+
+  El diagnóstico de T08: "ciclo 1111 EXPIRED/DEADLINE_PASSED a -9.0 s del corte", con latencias antes p50=44 p95=67 p99=122 y durante p50=44 p95=68 p99=114. La causa es la carga de la máquina (ver "Verificación final por dimensiones").
+
+Después de la verificación final, con la máquina en reposo:
+
+- **`FinalVerificationTests`:** las cinco correctas.
+- **`BrokerStallTests`:** correcta (49 s).
+- **`A_short_cut_is_absorbed_by_the_retries_within_the_deadline`:** correcta dos veces seguidas.
+- **`RecirculationTests`:** las ocho correctas.
+- **Unidades de `SqlOutage`:** las cinco correctas.
+- **Las seis mutaciones** de la verificación final: todas detectadas.
+
+
+### Pruebas de la fase
+
+- **T08, T12, T16, T19 y T32: PASA** en la compuerta final de `e0812b0` (detalle en `docs/TEST_STATUS.md`). T37, T42 y T47, cuyos mecanismos cambiaron en esta fase (SI-21 y la extensión de SI-16), quedan revalidadas en la misma compuerta.
+- Cinco rondas de revisión:
+  - dos revisiones independientes;
+  - la verificación final por dimensiones;
+  - la verificación de sus correcciones;
+  - la revisión de `59e6c73`.
+
+  La última no dejó hallazgos ALTA: su única ALTA se bajó a MEDIA y se corrigió.
+
+### Revisión independiente
+
+Subagente `revisor-adversarial` sobre `4b06425` (2026-10-15). No ejecutó `dotnet build` ni `dotnet test`, porque la compuerta de la fase corría en la misma máquina y sus pruebas comparan latencias. Ejecutó el verificador, la revisión de secretos y la trazabilidad de la fase, y contrastó `docs/BENCHMARK.md` con el JSON de la corrida. Resultado: 1 ALTA, 6 MEDIA y 10 BAJA.
+
+La compuerta de `4b06425` corría a la par y se detuvo para corregir. Antes de detenerla había pasado las pruebas sin carga: 171, 99 y 102, entre ellas T08, T16, T19 y T32. Esa corrida no cuenta como evidencia de la fase, porque el código cambió después.
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| A1: la falla cerrada se decidía al procesar el registro, no al recibirlo. Con SQL colgado (sin cortar conexiones), los ciclos encolados durante la caída se registraban al volver SQL, algunos con job e impresión, sin hueco | Alta | Decisión 7. Pruebas `Sql_that_stops_answering_with_pooled_connections_…` (proxy congelado, pool y tiempos por defecto) y `A_cycle_received_during_the_outage_and_processed_after_sql_returns_is_part_of_the_gap` (la prueba entrega al consumidor, después de la recuperación, ciclos recibidos durante la caída) |
+| M1: `LabelingReady` no dependía de la ingesta: con TX-A sin respuesta y lecturas que funcionan seguía en verdadero; con SQL colgado el latido quedaba bloqueado; al volver subía con la primera lectura, sin la recarga | Media | Decisión 7. La prueba anterior incluye un latido que lee SQL sin el proxy: en falso mientras la ingesta tiene la caída declarada, en verdadero después de la recarga. T19 comprueba además el gauge `labeling_ready` en cada muestra de la caída |
+| M2: T16 no ejercitaba el bloqueo de rango ni el reintento del 1205 | Media | Pruebas `Two_cycles_of_the_same_carton_registered_at_once_end_with_one_job_after_a_deadlock_retry`, con el 1205 forzado (contador `SqlDb.DeadlockRetries`), y `A_snapshot_arrival_and_a_new_cycle_of_the_same_carton_at_once_end_with_one_job` (TX-A contra TX-E) |
+| M3: T08 usaba un plazo de 5 s y una tolerancia de p95 amplia; la corrida registrada tuvo un máximo de 3941 ms durante la caída | Media | Decisión 9. La primera corrida con el plazo nominal falló: 2 de 750 jobs sin `CONFIRMED`, fuera de la caída (la espera de los jobs de la caída se había cumplido), y la prueba no decía cuáles. Se atribuyó al arranque en frío, sin demostrarlo; la compuerta de `c790f7e` lo desmintió con una caja vencida en plena fase anterior, ya con el calentamiento. El criterio se corrigió en la verificación final (MEDIA 7). Se agregaron diez cajas de calentamiento fuera de la medición y un diagnóstico antes de las aserciones (las cajas sin `CONFIRMED` y las cinco más lentas de la caída). En la segunda corrida, todas `CONFIRMED`. La pausa de 3,9 s de la corrida anterior no se repitió |
+| M4: `docs/BENCHMARK.md` decía "la composición del EdgeHost" sin barrido, sin Outbox Relay y con OPC UA sin cifrado; no tenía la sección de errores y escenarios excluidos | Media | Decisión 8 |
+| M5: pruebas dadas por pasadas sin evidencia registrada; la corrida de T08 era anterior al commit que cambió la fábrica de conexiones de RabbitMQ | Media | `TEST_STATUS.md` se llena con la compuerta final de la fase, que corre T08 y T12 sobre el código final. El registro dice qué corrida respalda cada resultado |
+| M6: `FAT_CHECKLIST.md` no decía que el EdgeHost no tiene entrada de evidencia | Media | Nueva sección 0, de prerrequisitos que el MVP no implementa: la integración de evidencia y la compuerta física |
+| BAJA 1: el EdgeHost no pasaba la señal a TX-E | Baja | `StationServicesHostedService` pasa `ReadyJobSignal` a `ErpArrivalService` |
+| BAJA 2: el registro de tres métricas quedaba entre `writeTs` y la escritura | Baja | Se registran después de invocar la escritura (también si falla) |
+| BAJA 3: SI-17 afirmaba que en TX-A la detección nueva es siempre la última; resumen duplicado | Baja | SI-17 corregido (el reingreso conserva su `ReceivedAt` y sigue habiendo un solo job) y un solo resumen |
+| BAJA 4: con `CARTON_ID_REQUIRED` activa y una detección sin `CartonId`, TX-E crea el job y TX-A la bloquea | Baja | Registrado como extensión de SI-04 (clase B, abierto): D08 no tiene un motivo para ese caso. No se rodea en el código |
+| BAJA 5: la variante de T16 del catálogo es inalcanzable | Baja | SI-19 (clase A), con el parche propuesto; pendiente de aprobación. La prueba ejercita el escenario alcanzable |
+| BAJA 6: con una época nueva después de la caída, los ciclos descartados no abren hueco | Baja | Registrado en `FAT_CHECKLIST.md` (sección 3) y en los riesgos: solo los cuenta `opc_records_rejected_total{cause=SQL_UNAVAILABLE}` |
+| BAJA 7: endpoint OPC en los logs; contraseña en la línea de comandos de la demo; TLS sin comprobar revocación | Baja | Los logs nombran la estación, no el endpoint. La demo toma la cadena de conexión de una variable de entorno. `RabbitMqTlsOptions.CheckCertificateRevocation`, activa por defecto, en `FAT_CHECKLIST.md` |
+| BAJA 8: las marcas de recepción se vaciaban todas al llegar a 10 000 | Baja | Se descartan las más antiguas |
+| BAJA 9: T19 afirmaba al menos un rechazo, no 25 | Baja | Exactamente 25 (y 20 y 5 en las variantes) |
+| BAJA 10: T08 no fuerza una entrega duplicada | Baja | La deduplicación por `InboxMessage` la ejercita T14 (Fase 1). T08 comprueba que cada `EventId` se aplica una vez |
+
+Mutaciones ejecutadas después de las correcciones, cada una revertida:
+
+- **Sin la regla de recepción (solo el estado declarado):** la variante con el proxy congelado sigue pasando, porque el canal se vacía durante la caída. La prueba que entrega los ciclos después de la recuperación falla: 4 detecciones de 502 a 505.
+- **Sin `UPDLOCK, HOLDLOCK` sobre `CartonDetection`:** falla la prueba concurrente de T16, porque no hay interbloqueo que reintentar. Con el rango de `PrintJob` solo, el resultado igual es un job.
+
+### Segunda revisión independiente
+
+Subagente `revisor-adversarial` sobre `bac67f1`, sin compilar ni ejecutar pruebas, porque la compuerta corría en la misma máquina. Resultado: ninguna ALTA, 3 MEDIA y 9 BAJA. De la primera revisión, dio por resueltos A1, M2, M6 y las BAJA, y M1 y M5 como parciales.
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| M-1: con escrituras bloqueadas y lecturas que responden, la vigilancia levantaba la caída con una lectura y `LabelingReady` oscilaba | Media | Decisión 7: la vigilancia prueba el rango de TX-A con `LOCK_TIMEOUT`; reintentos solo dentro del plazo de la caja; histéresis por recaídas. Prueba `Blocked_writes_keep_the_outage_declared_although_reads_answer` (otra sesión retiene el rango, sin proxy) |
+| M-2: el latido y la vigilancia no compartían el criterio; una conexión colgada hacía oscilar la caída | Media | Decisión 7: `SqlOutage`, una sola caída. La vigilancia no la levanta mientras quede una operación abandonada pendiente. Pruebas unitarias de `SqlOutage`. Corregidas las frases del registro que prometían "hasta 1 s" |
+| M-3: la vigilancia detenía la ingesta ante errores no clasificados de un servidor real que se detiene y vuelve; la ingesta no fijaba código de salida | Media | Cualquier error de la vigilancia mantiene la caída; 6005, 4060, 18456 y 18401 clasificados; código de salida 71. Prueba `Stopping_the_real_sql_server_fails_closed_and_the_ingest_survives_its_restart`, con un contenedor propio detenido y vuelto a arrancar |
+| BAJA 1: TX-B no participaba en la falla cerrada | Baja | El sender de línea declara la caída ante un error de SQL no disponible y no reclama mientras dura. Prueba `A_claim_without_sql_declares_the_outage_and_the_line_sender_claims_nothing_while_it_lasts`. TX-B esperando un lock queda registrado en SI-20 |
+| BAJA 2: el desenlace de un intento abandonado no se veía | Baja | Si termina registrando su ciclo, queda un aviso en el log con la clave |
+| BAJA 3: ninguna prueba verificaba la recarga | Baja | Prueba `Recovery_reloads_the_station_state_before_lifting_the_outage` (otro escritor registra el ciclo 510 durante la caída) |
+| BAJA 4: T16 concurrente acepta el resultado invertido | Baja | Registrado en SI-17: un job vivo bloquea a cualquier otra detección de la caja; la prueba afirma un job y la otra bloqueada |
+| BAJA 5: la variante del catálogo no usaba el pool | Baja | `SqlDb` conecta sin periodo de bloqueo del pool. La variante congelada y la del servidor real usan el pool por defecto |
+| BAJA 6: "en verde" en el CHANGELOG y el bloque de T12 sin rótulo | Baja | El bloque dice que es la composición anterior a la revisión. `TEST_STATUS.md`, `BENCHMARK.md` y el CHANGELOG salen de la compuerta final |
+| BAJA 7: la desviación del "arranque completo" no estaba registrada | Baja | SI-20 |
+| BAJA 8: el interino de SI-04 en TX-E no cerraba | Baja | Interino de falla cerrada recomendado, aplicado con la autorización general de la persona: sin job, D07 a su plazo. Prueba en `RecirculationTests`; SI-04 actualizado |
+| BAJA 9: la recarga al empezar a consumir no estaba acotada | Baja | Acotada; si SQL no responde, declara la caída |
+
+Mutaciones después de las correcciones, cada una revertida:
+
+- **Sin la prueba del rango de TX-A en la vigilancia:** falla la prueba de escrituras bloqueadas; `LabelingReady` y la caída oscilan.
+- **Sin la recarga en la vigilancia:** falla la prueba de la recarga (marca alta 500 en lugar de 510).
+- **La vigilancia solo tolera tiempos agotados:**
+  - La prueba con el servidor real sigue pasando: Testcontainers devuelve el contenedor cuando ya responde, así que la vigilancia no vio ningún error no clasificado.
+  - Falla la prueba de escrituras bloqueadas, cuyo 1222 no está clasificado: la ingesta se detiene y `LabelingReady` no vuelve.
+
+### Verificación final por dimensiones
+
+Workflow de 14 agentes `revisor-adversarial` sobre `c790f7e`, sin compilar ni ejecutar pruebas.
+
+- **Revisión.** Cinco revisores, uno por dimensión: falla cerrada, recirculación, sender y métricas, fuerza de las pruebas, y documentos.
+- **Refutación.** Cada hallazgo ALTA o MEDIA pasó por un escéptico que intentó refutarlo. Quedaron 8 confirmados: 7 MEDIA, una de ellas bajada desde ALTA, y 1 BAJA, bajada desde MEDIA. Uno se refutó: la compuerta por defecto no queda en rojo sin `--carga`.
+- **Sin verificar.** 19 BAJA quedaron sin refutación adversarial, por diseño, y se juzgaron una por una.
+
+**Un error de proceso.** La compuerta de `c790f7e` corrió a la par de esta verificación y falló en T08 por una caja vencida antes del corte. La verificación no compilaba ni ejecutaba pruebas, pero la carga de la máquina subió: p95 de 67 ms antes de la caída, frente a 41 ms en las corridas en reposo. Ninguna prueba que compare latencias corre ya junto a otro trabajo.
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| MEDIA 1: al volver SQL, `LabelingReady` subía antes de que la impresora de línea recuperara lease y TX-R0 | Media | Decisión 10. Prueba `FinalVerificationTests.LabelingReady_waits_for_the_line_printer_taken_with_tx_r0_and_drops_while_its_sender_is_paused_or_gone` |
+| MEDIA 2: TX-A y TX-E leían la estación sin lock con RCSI; un job escapaba a la purga de CLOCK_JUMP | Media | Decisión 12. Prueba `A_station_block_in_progress_makes_tx_a_and_tx_e_wait_and_see_it` (un bloqueo sin confirmar retiene la estación; TX-A y TX-E lo esperan y terminan `STATION_DISABLED`) |
+| MEDIA 3: un commit ambiguo de TX-B dejaba un `SENDING` huérfano y la impresora ocupada hasta reiniciar | Media | Decisión 11. Prueba `A_claim_whose_answer_was_lost_is_closed_by_tx_r0_before_the_next_claim` |
+| MEDIA 4: la regla "tres fallos seguidos: sender en pausa, `LabelingReady` en falso, alerta" no estaba | Media | Decisión 10. Prueba `Three_consecutive_device_failures_pause_the_sender_until_the_printer_answers_again` |
+| MEDIA 5: los tramos de evidencia se medían con el `ObservedAt` del dispositivo | Media | Decisión 13. Prueba `Evidence_segments_use_the_edge_host_clock_not_the_device_clock` (aplicador una hora atrasado, impresora una hora adelantada) |
+| MEDIA 6: `outbox_pending_age_seconds` quedaba congelado con un broker bloqueado | Media | Decisión 14. Prueba `BrokerStallTests` (proxy congelado: la alerta crece, la falla se registra y al volver se publica todo) |
+| MEDIA 7 (de ALTA): T08 fallaba por ruido de la máquina antes del corte, con un criterio más estricto que el catálogo | Media | Decisión 9, corregida |
+| BAJA (de MEDIA): SI-19 partía de una premisa falsa | Baja | SI-19 corregido: la variante es alcanzable y una prueba la ejercita tal como está escrita; el parche de clase A se retiró |
+| BAJA 1: sin ingesta, la caída que declara el sender no se levantaría nunca | Baja | El sender recibe la caída solo si hay ingesta |
+| BAJA 2: `Recover()` no era atómico | Baja | `TryRecover`: no levanta la caída si hay una falla informada después de empezar la prueba o una operación abandonada |
+| BAJA 3: TX-B esperando un lock baja `LabelingReady` y la histéresis no crecía | Baja | `RelapseWindow` de 60 s (más que el `CommandTimeout`); SI-20 dice lo que pasa |
+| BAJA 4: el interino de SI-04 en TX-A se imponía a D04 y a la estación | Baja | Movido a TX-A, después de esas guardas. Prueba de regresión |
+| BAJA 5: el orden por `ReceivedAt` de SI-17 no tenía prueba | Baja | Prueba `ReceivedAt_decides_which_pass_of_the_carton_came_first_not_the_cycle_number` |
+| BAJA 6: `opc_receive_to_send_start_ms` excluía los jobs de TX-E | Baja | También se marca la recepción de una detección en `WAITING_ERP` |
+| BAJA 7: `send_start_to_device_accept_ms` no tiene muestras sin acuse | Baja | Registrado: el tramo es "hasta el acuse del dispositivo" y sin acuse no existe. No se rellena con otro instante |
+| BAJA 8: `presend_check_to_write_ms` no ve lo que el transporte hace antes del primer byte | Baja | Registrado: el tramo termina en la invocación de la escritura. Una pausa entre la comprobación y el primer byte no se puede excluir por software (como en T29) |
+| BAJA 9: el diagnóstico de T08 y el backlog de T12 mezclaban el reloj de SQL Server con el del EdgeHost | Baja | Solo marcas del EdgeHost |
+| BAJA 10: los reintentos cortos dentro del plazo no tenían prueba | Baja | Prueba `A_short_cut_is_absorbed_by_the_retries_within_the_deadline` |
+| BAJA 11: la espera que se duplica no estaba probada | Baja | `SqlOutage.RecoveryHold`, probado hasta el tope de 64 veces |
+| BAJA 12: T32 registraba el segundo ciclo con la caja todavía sin etiquetar | Baja | El primer job llega a `CONFIRMED` antes del segundo ciclo |
+| BAJA 13: la prueba concurrente de TX-A y TX-E no depende del bloqueo de TX-E | Baja | Registrado en SI-17: la intercalación que lo necesita no se puede forzar sin puntos de inyección |
+| BAJA 14: la revisión de secretos no veía las formas de docker-compose, JSON y .env | Baja | Decisión 15 |
+| BAJA 15: el interino de SI-04 en TX-E publica `EXPIRED` con `ERP_UNAVAILABLE` | Baja | Registrado en SI-04, y la prueba fija el motivo |
+| BAJA 16: el FAT mandaba reiniciar también con el código 71 | Baja | El FAT distingue 70 (reinicio) de 71 (revisar); ninguna prueba ejercita los códigos (declarado) |
+| BAJA 17: el FAT omitía G04 (relojes sincronizados) y G16 (orden de aplicación) | Baja | Filas nuevas en el FAT |
+| BAJA 18: la demo corría con `SendMarginMs` 100, no viable según la sección 17 | Baja | 250, como T12 y T08 |
+| BAJA 19: "Lo que no se verificó" decía que T19 solo usa un proxy | Baja | Corregido aquí y en el FAT |
+
+Mutaciones después de las correcciones, cada una revertida; todas hacen fallar su prueba:
+
+- **Sin lock compartido en TX-A y TX-E:** falla la prueba del bloqueo en curso.
+- **Sin TX-R0 antes del claim:** el job siguiente nunca sale.
+- **Sin pausa por fallos seguidos:** el sender no entra en pausa.
+- **`LabelingReady` sin la impresora de línea:** la señal sube sin TX-R0.
+- **La edad del Outbox medida solo al publicar:** la alerta no crece con el broker colgado.
+- **Sin reintentos dentro del plazo:** el corte de 150 ms deja el ciclo como hueco.
+
+### Verificación de las correcciones
+
+Workflow de 10 agentes `revisor-adversarial` sobre el diff `c790f7e..0f5697c`, sin compilar ni ejecutar pruebas. Tres revisores (impresora y caída; transacciones y métricas; pruebas y documentos) y un escéptico por cada ALTA o MEDIA.
+
+- **Confirmados:** 6 hallazgos, uno de ellos repetido. Quedaron 2 MEDIA distintos y 3 BAJA, bajados desde MEDIA.
+- **Refutado:** 1 (el CHANGELOG solo dirá "en verde" con la compuerta final).
+- **Sin verificar:** 11 BAJA, juzgadas una por una.
+
+Ninguna prueba corrió a la par.
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| La pausa quedaba fija en `LinePrinterReadiness` cuando el sender en pausa se reemplazaba (lease perdido): `LabelingReady` en falso para siempre (reportado dos veces) | Media | Decisión 10: el sender nuevo hereda la pausa y la levanta. Prueba `A_new_sender_inherits_the_pause_and_lifts_it_when_the_printer_answers` |
+| Después de tres fallos de escritura, un connect TCP levantaba la pausa: el latido no la veía y se seguía perdiendo de a tres cajas | Media | Decisión 10: pausa mínima de 5 s, período de prueba y espera que se duplica. Prueba `A_printer_that_cuts_every_write_costs_one_attempt_per_probation_with_a_growing_pause` |
+| Nuevo interbloqueo entre TX-E y CLOCK_JUMP por el orden de locks | Baja | Decisión 12: TX-E lee la estación antes de tomar la detección |
+| T08: las ventanas de antes y de la vuelta del broker quedaban sin cota | Baja | Decisión 9: la vuelta con la misma regla que la caída, y un tope del 1 % para toda la corrida |
+| `check_secrets.py` dejó de ver una contraseña dentro de una cadena de conexión en código | Baja | Patrón propio para `;Password=` o `"Password=` sin espacios, que no confunde una asignación de código |
+| El TX-R0 del sender en marcha no comprobaba el lease | Baja | Solo toca los intentos con su propio token (decisión 11) |
+| `InService` en verdadero sin sender, si falta la fila de `PrinterSendOrder` | Baja | La impresora en servicio exige el sender corriendo |
+| La verificación previa al primer envío no repetía TX-R0 con otro token de lease | Baja | Lo repite (decisión 11) |
+| SI-20 decía que TX-R0 no se repite y que el sender lo ejecuta; J09 en marcha no estaba registrado | Baja | SI-20 corregido: TX-R0 se repite al volver a tomar la impresora y en el sender después de un error del claim, como extensión registrada de J09 |
+| La evidencia de una reimpresión se medía desde la escritura ordinaria original | Baja | La reimpresión deja sus marcas de escritura |
+| La prueba del corte breve podía pasar sin ningún reintento | Baja | Métrica `ingest_sql_retries_total`; la prueba exige al menos un reintento |
+| Trait de la prueba del bloqueo en curso | Baja | T37 (salto del reloj del EdgeHost con jobs READY), no T21 |
+| Resultados después de la verificación final registrados sin comando ni fecha, y la cuenta de `RecirculationTests` (8 pruebas, no 9) | Baja | Corregido abajo |
+
+Comandos, con la máquina en reposo, 2026-10-15:
+
+- 09:55, `dotnet test tests/CartonPrinting.IntegrationTests --no-build`, sobre `0f5697c`:
+
+  ```
+  Correctas! - Con error: 0, Superado: 105, Omitido: 0, Total: 105, Duración: 1 m 35 s - CartonPrinting.IntegrationTests.dll (net10.0)
+  ```
+
+- 10:00, `dotnet test tests/CartonPrinting.FaultTests --no-build --filter "FullyQualifiedName!~BrokerOutageTests&FullyQualifiedName!~LatencySegmentsTests&FullyQualifiedName!~BrokerStallTests"`, sobre `0f5697c`:
+
+  ```
+  Correctas! - Con error: 0, Superado: 111, Omitido: 0, Total: 111, Duración: 3 m 38 s - CartonPrinting.FaultTests.dll (net10.0)
+  ```
+
+- 10:05 a 10:12, `dotnet test tests/CartonPrinting.FaultTests --no-build --filter "FullyQualifiedName~FinalVerificationTests"`, dos veces seguidas con estas correcciones: las siete correctas las dos veces.
+  - La primera corrida previa falló en `A_claim_whose_answer_was_lost...`, con "UNKNOWN: Escritura interrumpida: A task was canceled".
+  - La causa estaba en la prueba: esperaba "ya no READY" y detenía el sender con el job todavía en SENDING. Ahora las tres esperas exigen un estado final.
+- Mutaciones de esta ronda, cada una revertida, todas detectadas:
+  - sin heredar la pausa: falla la prueba de la pausa heredada;
+  - sin período de prueba: no hay segunda pausa.
+
+  Las seis de la verificación final, a las 09:35, también se detectaron.
+- **Compuerta de `02992c0`** (`build/ci.ps1 --fase 7 --carga`, 2026-10-15 de 10:16 a 10:35, en reposo). Falló en las pruebas sin carga:
+  - UnitTests 176 de 176 e IntegrationTests 105 de 105;
+  - FaultTests 115 de 117, con T08 correcta. Fallaron dos pruebas:
+    - `LatencySegmentsTests(signal: False)`: "Los 1 jobs no quedaron CONFIRMED en 60 s";
+    - `OwnershipReviewTests.A_transient_renewal_error_does_not_stop_the_sender`: `lease_lost` 1 en lugar de 0.
+
+  Las dos son sensibles a tiempos, y corrieron en paralelo con la prueba que arranca y detiene un SQL Server propio.
+  - En la primera, una lectura del latido tardó más de 1 s, el latido declaró la caída y la primera caja quedó como hueco. Era demasiado agresivo: la especificación ata la caída a TX-A. Ahora una sola lectura lenta solo baja la señal en ese latido, y la caída se declara si la lectura sigue sin respuesta en el latido siguiente o con SQL no disponible.
+  - Las pruebas que comparan tiempos o que cargan la máquina pasaron a la colección sin paralelismo: `SqlOutageTests`, `LatencySegmentsTests`, `FinalVerificationTests` y `OwnershipReviewTests`.
+- 10:50, `dotnet test tests/CartonPrinting.FaultTests --no-build --filter "FullyQualifiedName~SqlOutageTests|FullyQualifiedName~LatencySegmentsTests|FullyQualifiedName~OwnershipReviewTests|FullyQualifiedName~FinalVerificationTests"`:
+
+  ```
+  Correctas! - Con error: 0, Superado: 25, Omitido: 0, Total: 25, Duración: 4 m 11 s - CartonPrinting.FaultTests.dll (net10.0)
+  ```
+- **Compuerta de `4e4dff8`** (`build/ci.ps1 --fase 7 --carga`, 2026-10-15 de 10:41 a 11:44, en reposo). Falló en T12:
+  - UnitTests 176 de 176, IntegrationTests 105 de 105 y FaultTests 117 de 117, con T08;
+  - T12: `Expected: 3010, Actual: 3000`, 10 jobs sin `CONFIRMED`.
+
+### Interbloqueo del barrido con el claim
+
+T12 vencía cajas en las corridas de 40 minutos: 10 en la compuerta de `4e4dff8`, sin diagnóstico. Tres corridas más de T12, solas, con diagnóstico agregado al reporte (decisión 17):
+
+- **"b"**, de 11:46 a 12:16: falló por backlog 4 en la tasa pactada (máximo 3), antes de escribir el reporte. Desde entonces el reporte va antes de las aserciones.
+- **"c"**, de 12:18 a 12:59: 3008 `CONFIRMED` y 2 `EXPIRED` con `DEADLINE_PASSED`, a los 1487 s. El ciclo 1496 quedó `NOT_SENT` en la segunda comprobación y el 1497 venció sin intento. Hubo 1 transacción reintentada por un 1205, sin caídas de SQL, pausas del sender ni errores.
+- **"d"**, a las 13:05: Docker Desktop se detuvo durante la corrida (código de salida 4, contenedores con 255) y no dejó resultados.
+
+Una sonda temporal en `CartonPrinting.LoadTests` (`DeadlockProbeTests`, `Category=Probe`, borrada antes de la compuerta) reprodujo la composición de T12 a 10 cajas por segundo durante 2 minutos. Se ejecutó con `CARTONPRINTING_PROBE_OUT=<scratchpad>/probe10.xml dotnet test tests/CartonPrinting.LoadTests --no-build --filter "FullyQualifiedName~Capture_deadlocks_at_ten"`; la prueba escribía en ese archivo el conteo de jobs por estado, los 1205 reintentados y los grafos de `system_health`.
+
+- **13:02, sin el muestreo de esperas:** `<!-- cajas 1201; EXPIRED=10, CONFIRMED=1191; 1205 reintentados 0 -->`. Ningún interbloqueo: estas 10 cajas no se explican con SI-21, y Docker Desktop se detuvo a las 13:05.
+- **13:04, otra sonda de TX-C contra TX-D (300 cajas, sin barrido):** `<!-- CONFIRMED=300; 1205 reintentados 0 -->`.
+- **14:07, con el muestreo de esperas (`StallWatch`):** `<!-- cajas 1200; EXPIRED=23, CONFIRMED=1177; 1205 reintentados 1 -->`. El muestreo ubicó el interbloqueo a los 93 s:
+
+```
+93.0 s: sesión 65 suspended 1905 ms, espera LCK_M_X 1904 ms en KEY: …: UPDATE pj SET Status = 'SENDING', … | bloqueada por la sesión 77 (…): … UPDATE pj SET Status = 'EXPIRED', Reason = 'OUT_OF_ORDER', …
+93.0 s: sesión 77 suspended 1905 ms, espera LCK_M_U 1904 ms en KEY: …: UPDATE pj SET Status = 'EXPIRED', Reason = 'OUT_OF_ORDER', … | bloqueada por la sesión 65 (…): … DECLARE @claimed …
+94.8 s: 1205 0 → 1
+```
+
+Según el grafo de `system_health`, el claim tenía X en `PK_PrintJob` y esperaba X en `IX_PrintJob_Sweep`; el barrido tenía U en `IX_PrintJob_Sweep` y esperaba U en `PK_PrintJob`. Es SI-21. Corrección: decisión 16.
+
+- **Sonda a 10 cajas por segundo con la corrección** (mismo comando), terminadas a las 14:14 y a las 14:17: `<!-- cajas 1200; CONFIRMED=1200; 1205 reintentados 0 -->` las dos veces, y el muestreo no registró ninguna espera larga.
+- **`SweepLockOrderTests`.** Pasó con la corrección en cuatro corridas seguidas: `Correctas! - Con error: 0, Superado: 2, Omitido: 0, Total: 2`. Comando: `dotnet test tests/CartonPrinting.FaultTests --no-build --filter "FullyQualifiedName~SweepLockOrderTests"`. No se anotó la hora de cada corrida.
+  - **Mutación**, con el `TxsSweep.cs` anterior (`git show HEAD:…` sobre el archivo, revertido después), dos veces: `Con error! - Con error: 2, Superado: 0, Total: 2`.
+  - **Las dos primeras versiones de la prueba no servían.**
+    - Una reclamaba con todos los jobs `READY`, y SQL Server recorría la clave primaria en lugar del índice: la mutación pasaba.
+    - La otra dependía de la carrera y detectó la mutación en 3 de 7 corridas.
+
+    La versión final fija el orden de los locks.
+- **Compuerta de `59e6c73`** (`build/ci.ps1 --fase 7 --carga`, 2026-10-15 de 14:40 a 15:36, en reposo). Falló en T12:
+  - UnitTests 176 de 176, IntegrationTests 105 de 105 y FaultTests 119 de 119, con T08 y con `SweepLockOrderTests`;
+  - T12, a los 31 m 14 s: `Las cajas no terminaron 60 s después de la fase.`
+
+  Falló en la primera fase, a una caja por segundo. El drenaje afirmaba antes de escribir el reporte, como había señalado la revisión (ver abajo), así que la corrida no dejó diagnóstico; el TRX tampoco tiene salida. La causa de esa caja sin terminar queda sin identificar hasta la corrida siguiente, que ahora escribe el reporte en cualquier caso: jobs sin `CONFIRMED`, detecciones sin job, huecos de secuencia y el momento de cada falla contada.
+
+### Revisión de `59e6c73`
+
+Workflow de 5 agentes `revisor-adversarial` sobre el diff `4e4dff8..59e6c73`, sin compilar ni ejecutar pruebas porque la compuerta estaba corriendo. Tres revisores (SQL y concurrencia; pruebas y diagnóstico; documentos y clasificación) y un escéptico por cada ALTA o MEDIA.
+
+- **ALTA y MEDIA:** 1 ALTA, bajada a MEDIA y confirmada; 1 MEDIA, bajada a BAJA.
+- **BAJA:** 21, juzgadas una por una.
+
+Las correcciones se prepararon en un worktree aparte mientras corría la compuerta.
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| Un job en `SENDING` durante un `CLOCK_JUMP` no lo veía la purga; un NOT_SENT posterior (J06) lo devolvía a `RETRY_WAIT` y se imprimía después del desbloqueo con el plazo del reloj anterior. Ya existía antes de `59e6c73` | Media | Decisión 18: J08 en TX-C con la estación bloqueada por `CLOCK_JUMP`, extensión de SI-16 aplicada con la autorización general. Prueba `A_send_rejected_after_the_clock_jump_purge_expires_its_job_instead_of_retrying` |
+| T47 ya no ejecutaba la sentencia de referencia de `OUT_OF_ORDER` (reportado tres veces) | Baja | `ExpireOutOfOrderReferenceAsync`, tal cual, con 0 y N filas en `ReferenceStatementTests` |
+| `SET DEADLOCK_PRIORITY HIGH` dentro de `sp_executesql` no regía en la sentencia que cierra el ciclo (reportado dos veces) | Baja | Va en un lote sin parámetros: en la mutación, la víctima es el barrido en los dos casos |
+| `SweepLockOrderTests` con Trait T42, sin comprobar el criterio de T42; el caso `CLOCK_JUMP` es de T37 (reportado dos veces) | Baja | Sin Trait: es la regresión de SI-21. TEST_STATUS lo menciona en T42 |
+| El drenaje de T12 afirmaba antes de escribir el reporte y `StallWatch` no se cerraba en un `finally` (reportado dos veces) | Baja | La falla se afirma después del reporte; el muestreo se cierra siempre y su propio error queda en el reporte. La compuerta de `59e6c73` cayó justo en ese caso |
+| `StallWatch` se truncaba por orden de llegada y leía `blocking_session_id` sin `IsDBNull` | Baja | Conserva todos los eventos y, de las solicitudes, las bloqueadas y las de mayor espera |
+| `BENCHMARK.md`: celdas con barras verticales o saltos de línea, la frase "todas `CONFIRMED`" sin condición y el muestreo de diagnóstico sin declarar | Baja | Celdas escapadas, frase condicionada, el muestreo en la fila "Composición" |
+| El comentario de `ClockJumpAsync` afirmaba un lock exclusivo que no existe si la estación ya estaba bloqueada | Baja | Comentario corregido: con otro bloqueo, el salto se retiene y la purga se repite |
+| SI-21 decía "la misma sentencia" y "sin cambio de comportamiento", con cifras que el registro no respaldaba (reportado tres veces) | Baja | SI-21 y la decisión 16: mismas guardas, motivo y efectos; la diferencia de la instantánea; solo cifras registradas, y lo inferido, marcado como inferido |
+| Resultados con la corrección sin comando, salida ni hora, y un conteo que no cuadraba con las clases nombradas (reportado dos veces) | Baja | Comandos y salidas arriba y abajo. El conteo sí cuadra: `ErpReviewTests` tiene 5 casos en el listado de `dotnet test --list-tests`, no 11 |
+| El CHANGELOG daba la fase "en verde" (reportado dos veces) | Baja | "Pendientes de la compuerta final" |
+| TEST_STATUS de T37, T42 y T47 con evidencia anterior al cambio de mecanismo | Baja | Se revalidan con la compuerta final |
+| La decisión 17 decía que `BENCHMARK.md` ya resumía el diagnóstico | Baja | Corregida: lo escribe el script al regenerarlo con la compuerta final |
+| SI-20 decía que el latido declara la caída con una sola lectura fallida | Baja | SI-20 con la regla vigente |
+
+Comandos de esta ronda, en el worktree de las correcciones, con la máquina en reposo después de la compuerta, 2026-10-15:
+
+```
+[15:38] dotnet test tests/CartonPrinting.FaultTests --no-build --filter "FullyQualifiedName~ClockAndRetryTests|FullyQualifiedName~SweepLockOrderTests|FullyQualifiedName~PrinterFaultTests|FullyQualifiedName~LateEventTests|FullyQualifiedName~ErpReviewTests"
+Correctas! - Con error:     0, Superado:    24, Omitido:     0, Total:    24, Duración: 53 s - CartonPrinting.FaultTests.dll (net10.0)
+[15:39] dotnet test tests/CartonPrinting.IntegrationTests --no-build --filter "FullyQualifiedName~ReferenceStatementTests"
+Correctas! - Con error:     0, Superado:    10, Omitido:     0, Total:    10, Duración: 19 s - CartonPrinting.IntegrationTests.dll (net10.0)
+[15:39] dotnet test tests/CartonPrinting.UnitTests --no-build --filter "FullyQualifiedName~ClockGuardTests|FullyQualifiedName~DeadlinePolicyTests"
+Correctas! - Con error:     0, Superado:     4, Omitido:     0, Total:     4, Duración: 394 ms - CartonPrinting.UnitTests.dll (net10.0)
+```
+
+Mutaciones, cada una revertida:
+
+- **15:40, TX-C sin la condición de `CLOCK_JUMP`:** la prueba nueva falla con `Expected: Tuple ("NOT_SENT", "EXPIRED", "DEADLINE_PASSED")` y `Actual: Tuple ("NOT_SENT", "RETRY_WAIT", null)`.
+- **15:41, `TxsSweep.cs` de `4e4dff8`:** `SweepLockOrderTests` falla en los dos casos, `CLOCK_JUMP: 1 transacciones reintentadas por un 1205 con el claim` y `OUT_OF_ORDER: 1 transacciones reintentadas por un 1205 con el claim`.
+
+### Compuerta final
+
+`build/ci.ps1 --fase 7 --carga`, sobre `e0812b0`, 2026-10-15 de 15:43 a 16:47, con la máquina en reposo y `CARTONPRINTING_BENCHMARK_OUT=<scratchpad>/benchmark-gate.json`:
+
+```
+inicio 2026-10-15 15:43 sobre e0812b0
+Resultado: 15 grupos OK, 0 errores
+Resultado: 366 archivos versionados revisados, 0 errores
+Correctas! - Con error:     0, Superado:   176, Omitido:     0, Total:   176, Duración: 12 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:   105, Omitido:     0, Total:   105, Duración: 3 m 22 s - CartonPrinting.IntegrationTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:   120, Omitido:     0, Total:   120, Duración: 23 m 12 s - CartonPrinting.FaultTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:     1, Omitido:     0, Total:     1, Duración: 40 m 16 s - CartonPrinting.LoadTests.dll (net10.0)
+Resultado: trazabilidad OK, 0 errores
+exit=0
+fin 2026-10-15 16:47
+```
+
+- **T08** (salida del TRX de FaultTests):
+
+  ```
+  T08 latencia recepción→escritura (ms): antes p50=43 p95=67 p99=138 máx=146; durante p50=45 p95=62 p99=94 máx=159; cajas=750
+  T08 vencidas: antes 0, durante 0, después 0 (como mucho 1 durante, 1 después y 7 en total)
+  ```
+
+- **T12.** 3010 cajas, 10 de calentamiento, 1800 a una por segundo y 1200 a dos por segundo. Todas `CONFIRMED` con VERIFIED, una etiqueta cada una.
+  - **Backlog:** 0 en las dos fases, y el pendiente más antiguo, 0 ms.
+  - **Interbloqueos y esperas:** ningún 1205 reintentado, ningún interbloqueo en `system_health` y ninguna espera larga ni pausa del proceso en el muestreo.
+  - **Fallas:** ninguna caída de SQL, pausa del sender, error del sender, NOT_SENT, UNKNOWN, detección sin job ni hueco.
+  - **Outbox:** 6020 eventos publicados, ninguno pendiente.
+  - **Notificación → invocación de la escritura:** p50 21,2 ms, p99 67,3 ms y máximo 166 ms a la tasa pactada; p99 70,5 ms al doble.
+  - **Desigualdad de factibilidad (PLC_TIMESTAMP):** 516 ms < 1500 ms. `SendMarginMs` 250 cubre p99(`presend_check_to_write_ms`) 0 + 200, y `DeviceLeadTimeMs` 400 cubre el p99 medido de 33 ms.
+
+  `docs/BENCHMARK.md` se regeneró de esta corrida: `py build/benchmark_report.py <scratchpad>/benchmark-gate.json --fecha "2026-10-15 23:47 UTC (40 min 16 s), compuerta de e0812b0" --comando "…" > docs/BENCHMARK.md`.
+- **T12 de la compuerta de `59e6c73`.** No se explicó la caja que no terminó: esa corrida no dejó diagnóstico. Con el mismo código del barrido, más la corrección de TX-C y el reporte completo, esta corrida terminó sin ninguna falla. Ver "Riesgos".
+
+### Lo que no se verificó
+
+- **Ningún equipo real.** PLC, impresora, aplicador, escáner y ERP son simuladores; las garantías físicas y la aceptación están en `docs/FAT_CHECKLIST.md`.
+- **T08** simula la caída del broker con un proxy TCP, no deteniendo el contenedor, y el consumidor no pierde su conexión. **T19** usa un proxy (cortes y congelamiento) y además el contenedor de SQL Server detenido y vuelto a arrancar, en la misma máquina, no en la red de planta.
+- **T12** es una hipótesis declarada: una sola máquina, red local, SQL Server en contenedor y simuladores sin tiempos físicos. El PLC simulado negocia la publicación en 100 ms. No mide la capacidad de una impresora o un aplicador reales (G12).
+- **TLS de RabbitMQ:** se prueba la configuración de la conexión (`RabbitMqTlsTests`), no una conexión TLS real contra un broker con certificados.
+- **OPC UA con SignAndEncrypt:** se prueba contra el PLC simulado con certificados autofirmados en directorios temporales; la PKI de planta (emisor, revocación) no se probó.
+- **La revisión de secretos** busca patrones: certificados, claves privadas, valores literales en claves que nombran un secreto y credenciales en Uri de RabbitMQ. No reemplaza una herramienta de detección de secretos.
+- **Los códigos de salida** 70 y 71 no los ejercita ninguna prueba automática.
+- **La pausa del sender** se prueba con la impresora simulada rechazando conexiones; con la real queda en el FAT.
+- **La demo** hace de integración de evidencia (el EdgeHost no tiene una propia) y conecta el PLC simulado sin cifrado.
+- **SQL Server sin respuesta** se simula con el proxy congelado, y una detención real con el contenedor detenido y vuelto a arrancar. No se probó una caída de red real ni cuánto tarda SqlClient en soltar una conexión medio abierta. La ingesta deja de esperarla al segundo, pero la caída no se levanta hasta que esa conexión termina.
+- **La prueba del camino de TX-A** toma el rango de inserción de la detección, pero no hace un commit. Un commit síncrono detenido (AG) se descubre en el primer TX-A después de levantar la caída, y las recaídas alargan la espera.
+- **J08 con `CLOCK_JUMP` en TX-C:** la prueba es secuencial (el NOT_SENT después de la purga). El orden frente a una purga concurrente, con TX-C sin confirmar, se apoya en el orden de locks de la estación (lock compartido de TX-C, exclusivo de la purga); no tiene una prueba que fuerce esa intercalación.
+- **Logs.** Los mensajes del EdgeHost ya no nombran el endpoint OPC, pero el texto de una excepción del cliente OPC UA o de SqlClient puede incluir la dirección del servidor. No se revisaron todas.
+
+### Riesgos
+
+- Las pruebas que comparan latencias (T08 y `LatencySegmentsTests`) dependen de que la máquina no esté cargada. T08 corre sola; las demás tienen calentamiento y márgenes amplios.
+- **Fallas de T12 sin explicar.** Dos se registraron sin diagnóstico ni causa:
+  - la sonda de las 13:02, con 10 cajas vencidas sin interbloqueo; Docker Desktop se detuvo tres minutos después;
+  - la caja sin terminar de la compuerta de `59e6c73`.
+
+  Ahora el reporte de T12 conserva el diagnóstico de cualquier falla. Si se repiten, quedarán explicadas en esa corrida.
+- La compuerta completa con `--carga` tarda más de una hora.
+- **Falla cerrada.** Una lectura lenta del latido (más de `SqlAttemptTimeoutMs`) baja `LabelingReady` en ese latido. La caída se declara si la lectura sigue sin respuesta en el latido siguiente o si SQL no está disponible. Hasta que la vigilancia la levanta, los ciclos que llegan son hueco: al menos 1 s, más con una conexión colgada o con recaídas.
+- **Login fallido.** Un 18456 cuenta como SQL no disponible: una contraseña mal configurada deja la estación en falla cerrada, con el error en el log, en lugar de detener el proceso.
+- **Caída de SQL Server y reinicio del PLC a la vez.** Si el ciclo siguiente a la caída llega con una época nueva, los ciclos descartados no quedan como hueco de la época anterior. Solo los cuenta `opc_records_rejected_total{cause=SQL_UNAVAILABLE}` (revisión, BAJA-6; en `docs/FAT_CHECKLIST.md`).

@@ -1,6 +1,7 @@
 using System.Threading.Channels;
 using CartonPrinting.Infrastructure.Data;
 using CartonPrinting.Infrastructure.Observability;
+using CartonPrinting.Infrastructure.Signals;
 using CartonPrinting.Infrastructure.Time;
 using CartonPrinting.Infrastructure.Transactions;
 using CartonPrinting.Orchestration;
@@ -24,6 +25,15 @@ public sealed class IngestHostOptions
     public int ChannelCapacity { get; set; } = 10_000;
 
     public int LabelingReadyIntervalMs { get; set; } = 500;
+
+    /// <summary>
+    /// Falla cerrada con SQL Server caído: tiempo máximo de cada intento de registrar un ciclo y de la lectura del estado en el
+    /// latido.
+    /// </summary>
+    public int SqlAttemptTimeoutMs { get; set; } = 1_000;
+
+    /// <summary>Falla cerrada con SQL Server caído: cada cuánto se prueba si volvió.</summary>
+    public int SqlRecoveryProbeMs { get; set; } = 1_000;
 
     /// <summary>Intervalo del barrido TX-S de la estación (cierre de vencidos, huecos y ventanas de evidencia).</summary>
     public int SweepIntervalMs { get; set; } = 200;
@@ -54,17 +64,22 @@ public sealed class IngestHostedService : BackgroundService
 
     public IngestHostedService(
         IngestHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers, IErpDemand? erpDemand = null,
-        bool coordinated = false)
+        bool coordinated = false, ReadyJobSignal? readySignal = null, SqlOutage? outage = null, LinePrinterReadiness? linePrinter = null)
     {
+        outage ??= new SqlOutage(clock);
         _options = options;
         _clock = clock;
         _coordinated = coordinated;
         _logger = loggers.CreateLogger<IngestHostedService>();
         var station = new StationSettings(options.SiteId, options.StationId, options.LabelSerialPrefix, options.Opc.RecordNodeId);
         var stations = new StationConfigStore(db);
-        var registration = new RegistrationService(new TxaRegisterDetection(db), new ErpCacheStore(db), new LabelSerialSource(db), clock, metrics);
+        var registration = new RegistrationService(new TxaRegisterDetection(db), new ErpCacheStore(db), new LabelSerialSource(db), clock, metrics, readySignal);
         Service = new StationIngestService(station, registration, stations, new PlcEpochStore(db), new SequenceStore(db), new TxsSweep(db),
-            new TxmManualActions(db), clock, metrics, loggers.CreateLogger<StationIngestService>(), erpDemand);
+            new TxmManualActions(db), clock, metrics, loggers.CreateLogger<StationIngestService>(), erpDemand, new SqlFailClosedOptions
+            {
+                AttemptTimeout = TimeSpan.FromMilliseconds(options.SqlAttemptTimeoutMs),
+                RecoveryProbeInterval = TimeSpan.FromMilliseconds(options.SqlRecoveryProbeMs),
+            }, outage);
         _channel = Channel.CreateBounded<RawNotification>(new BoundedChannelOptions(options.ChannelCapacity)
         {
             SingleReader = true,
@@ -72,11 +87,15 @@ public sealed class IngestHostedService : BackgroundService
         });
         _source = new OpcUaCycleSource(options.Opc, clock, metrics, loggers.CreateLogger<OpcUaCycleSource>());
         var pressure = new ChannelPressure(_channel.Reader, options.ChannelCapacity, () => _source.DroppedNotifications);
-        _heartbeat = new LabelingReadyHeartbeat(station, stations, _source, metrics, loggers.CreateLogger<LabelingReadyHeartbeat>(), pressure.Overloaded);
+        _heartbeat = new LabelingReadyHeartbeat(station, stations, _source, metrics, loggers.CreateLogger<LabelingReadyHeartbeat>(), pressure.Overloaded,
+            outage, TimeSpan.FromMilliseconds(options.SqlAttemptTimeoutMs), linePrinter);
     }
 
     /// <summary>La ingesta (para recargar épocas o reingresar registros retenidos desde la operación).</summary>
     public StationIngestService Service { get; }
+
+    /// <summary>La suscripción OPC UA: los intervalos negociados quedan en sus propiedades Revised* (T12).</summary>
+    public OpcUaCycleSource Source => _source;
 
     /// <summary>Etapa 5: revisión activa, épocas y marca alta por época desde SQL.</summary>
     public async Task LoadStateAsync(CancellationToken ct)
@@ -89,7 +108,7 @@ public sealed class IngestHostedService : BackgroundService
     public async Task SubscribeAsync(CancellationToken ct)
     {
         await _source.StartAsync(_channel.Writer, ct);
-        _logger.LogInformation("Ingesta de {Site}/{Station} conectada a {Endpoint}", _options.SiteId, _options.StationId, _options.Opc.EndpointUrl);
+        _logger.LogInformation("Ingesta de {Site}/{Station} conectada al PLC", _options.SiteId, _options.StationId);
     }
 
     /// <summary>Etapa 8: el primer latido (LabelingReady según el estado de la estación); después, el periódico.</summary>
@@ -123,6 +142,8 @@ public sealed class IngestHostedService : BackgroundService
         }
         catch (Exception ex)
         {
+            // Sale con un código distinto de 0 para que el supervisor lo note (71: la ingesta se detuvo; 70 es el sender).
+            Environment.ExitCode = 71;
             _logger.LogCritical(ex, "La ingesta de {Station} se detuvo: ningún registro se salta; revisar antes de reiniciar", _options.StationId);
             throw;
         }
@@ -148,8 +169,7 @@ public sealed class IngestHostedService : BackgroundService
             }
             catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
             {
-                _logger.LogWarning(ex, "Ingesta de {Station}: no se pudo conectar a {Endpoint}; reintento en {Backoff}", _options.StationId,
-                    _options.Opc.EndpointUrl, backoff);
+                _logger.LogWarning(ex, "Ingesta de {Station}: no se pudo conectar al PLC; reintento en {Backoff}", _options.StationId, backoff);
                 await Task.Delay(backoff, _clock.TimeProvider, ct);
                 backoff = TimeSpan.FromTicks(Math.Min(backoff.Ticks * 2, TimeSpan.FromSeconds(30).Ticks));
             }

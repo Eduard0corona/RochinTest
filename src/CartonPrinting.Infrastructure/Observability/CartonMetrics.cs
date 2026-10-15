@@ -16,6 +16,14 @@ public sealed class CartonMetrics : IDisposable
     private readonly ConcurrentDictionary<string, long> _totals = new();
     private readonly ConcurrentDictionary<string, ConcurrentQueue<double>> _samples = new();
     private readonly ConcurrentDictionary<string, double> _gauges = new();
+    private readonly ConcurrentDictionary<Guid, long> _received = new();
+    private readonly ConcurrentDictionary<Guid, (long Started, long? Completed)> _writes = new();
+
+    /// <summary>Muestras que se conservan en memoria por serie: las más recientes (el exportador recibe todas).</summary>
+    public const int MaxSamplesPerSeries = 50_000;
+
+    /// <summary>Marcas de recepción pendientes de consumir por el sender.</summary>
+    public const int MaxReceivedMarks = 10_000;
 
     public CartonMetrics()
     {
@@ -42,10 +50,60 @@ public sealed class CartonMetrics : IDisposable
     {
         var histogram = _histograms.GetOrAdd(name, n => Meter.CreateHistogram<double>(n));
         histogram.Record(value, ToTagList(tags));
-        _samples.GetOrAdd(Key(name, tags), _ => new ConcurrentQueue<double>()).Enqueue(value);
+        Keep(_samples.GetOrAdd(Key(name, tags), _ => new ConcurrentQueue<double>()), value);
         if (tags.Length > 0)
         {
-            _samples.GetOrAdd(Key(name, []), _ => new ConcurrentQueue<double>()).Enqueue(value);
+            Keep(_samples.GetOrAdd(Key(name, []), _ => new ConcurrentQueue<double>()), value);
+        }
+    }
+
+    /// <summary>
+    /// Marca monotónica de la recepción OPC de una detección con job, para medir <c>opc_receive_to_send_start_ms</c> en el
+    /// sender (otro componente del mismo proceso). Se consume una vez. Si se acumulan sin consumir (jobs que vencieron o nunca se
+    /// enviaron), se descartan las más antiguas, no las de los jobs en curso.
+    /// </summary>
+    public void MarkReceived(Guid detectionId, long receivedTimestamp)
+    {
+        EvictOldest(_received, ts => ts);
+        _received[detectionId] = receivedTimestamp;
+    }
+
+    /// <summary>
+    /// Marcas monotónicas de la escritura de un job: la invocación y, si terminó sin error, la escritura completa. Los tramos de
+    /// evidencia de la sección 10.4 son monotónicos: se miden desde estas marcas hasta la recepción de cada observación en el EdgeHost,
+    /// nunca con el ObservedAt de otro dispositivo (verificación final de la Fase 7).
+    /// </summary>
+    public void MarkWrite(Guid printJobId, long startedTimestamp, long? completedTimestamp)
+    {
+        EvictOldest(_writes, w => w.Started);
+        _writes[printJobId] = (startedTimestamp, completedTimestamp);
+    }
+
+    /// <summary>Las marcas de la escritura de un job, si este proceso la hizo.</summary>
+    public (long Started, long? Completed)? WriteOf(Guid printJobId) => _writes.TryGetValue(printJobId, out var w) ? w : null;
+
+    /// <summary>Al llegar al límite, se descartan las marcas más antiguas (jobs que nunca se completaron), no las de los jobs en curso.</summary>
+    public static void EvictOldest<T>(ConcurrentDictionary<Guid, T> marks, Func<T, long> timestamp)
+    {
+        if (marks.Count < MaxReceivedMarks)
+        {
+            return;
+        }
+
+        foreach (var stale in marks.OrderBy(e => timestamp(e.Value)).Take(MaxReceivedMarks / 10).Select(e => e.Key).ToList())
+        {
+            marks.TryRemove(stale, out _);
+        }
+    }
+
+    /// <summary>La marca de recepción de la detección, si este proceso la recibió y nadie la tomó todavía.</summary>
+    public long? TakeReceived(Guid detectionId) => _received.TryRemove(detectionId, out var ts) ? ts : null;
+
+    private static void Keep(ConcurrentQueue<double> samples, double value)
+    {
+        samples.Enqueue(value);
+        while (samples.Count > MaxSamplesPerSeries && samples.TryDequeue(out _))
+        {
         }
     }
 
@@ -66,6 +124,10 @@ public sealed class CartonMetrics : IDisposable
     /// <summary>Total acumulado; sin etiquetas devuelve la suma de todas las series.</summary>
     public long Total(string name, params (string Key, string Value)[] tags) =>
         _totals.TryGetValue(Key(name, tags), out var v) ? v : 0;
+
+    /// <summary>Total de cada serie etiquetada de un contador (para reportes), con las etiquetas como texto.</summary>
+    public IReadOnlyDictionary<string, long> Series(string name) =>
+        _totals.Where(kv => kv.Key.StartsWith(name + "{", StringComparison.Ordinal)).ToDictionary(kv => kv.Key[name.Length..], kv => kv.Value);
 
     public IReadOnlyList<double> Samples(string name, params (string Key, string Value)[] tags) =>
         _samples.TryGetValue(Key(name, tags), out var q) ? q.ToArray() : [];
@@ -95,6 +157,17 @@ public static class MetricNames
     public const string ClaimRejected = "claim_rejected_total";
     public const string PrintAttempts = "print_attempts_total";
     public const string PrinterUnknown = "printer_unknown_total";
+
+    /// <summary>1 mientras el sender de la impresora está en pausa por tres fallos seguidos del dispositivo (ESTRATEGIA_RECUPERACION §3).</summary>
+    public const string PrinterSenderPaused = "printer_sender_paused";
+
+    public const string PrinterSenderPauses = "printer_sender_pauses_total";
+
+    /// <summary>Errores del sender fuera de la escritura (claim, lectura del siguiente job); después de cada uno, TX-R0 antes del claim.</summary>
+    public const string SenderErrors = "printer_sender_errors_total";
+
+    /// <summary>Reintentos cortos de TX-A con SQL Server sin responder (ESTRATEGIA_RECUPERACION §3).</summary>
+    public const string IngestSqlRetries = "ingest_sql_retries_total";
     public const string RestartRecoveredSending = "restart_recovered_sending_total";
     public const string InboxDuplicates = "inbox_duplicates_total";
     public const string DetectionsExpired = "detections_expired_total";

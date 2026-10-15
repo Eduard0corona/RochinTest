@@ -104,12 +104,18 @@ public sealed class TxcWriteResult(SqlDb db)
     /// <summary>
     /// A02 y, para un intento ordinario, J06, J07 o J08. Regla de código: el sender sabe que no
     /// llamó a write; SQL no puede comprobarlo. Un intento excepcional NOT_SENT no cambia el job.
+    /// Con la estación bloqueada por CLOCK_JUMP, un NOT_SENT ordinario vence el job (J08) en lugar de volver a RETRY_WAIT: la
+    /// persona decidió que nada pendiente anterior al salto se imprima (SI-16), y un envío en curso durante el salto no lo vio la
+    /// purga, que solo vence READY y RETRY_WAIT. La estación se lee con lock compartido hasta el commit, antes que cualquier otra
+    /// fila: la purga (que bloquea la estación primero) espera a este NOT_SENT y ve su RETRY_WAIT, o este lo espera a ella y ve el
+    /// bloqueo.
     /// </summary>
     public Task<WriteOutcome> NotSentAsync(
         Guid attemptId, DateTime? preSendCheckAt, string failureDetail, NotSentCause cause, int retryBackoffMs, byte effectiveMaxAutoAttempts,
         DateTime edgeNowUtc, CancellationToken ct) =>
         db.InTransactionAsync(async (conn, tx) =>
         {
+            var clockJump = await StationBlockedByClockJumpAsync(conn, tx, attemptId, ct);
             var attempt = await UpdateAttemptAsync(conn, tx, """
                 UPDATE dbo.PrintAttempt
                 SET Outcome = 'NOT_SENT', MayHaveSent = 0, PreSendCheckAt = @PreSendCheckAt, FailureDetail = @FailureDetail
@@ -128,7 +134,7 @@ public sealed class TxcWriteResult(SqlDb db)
             }
 
             var jobId = attempt.Value.JobId;
-            if (cause != NotSentCause.DeadlinePassed)
+            if (cause != NotSentCause.DeadlinePassed && !clockJump)
             {
                 // J06: con plazo vigente. Un rechazo por compuerta o estación no consume intento.
                 var retried = await UpdateJobAsync(conn, tx, """
@@ -157,7 +163,7 @@ public sealed class TxcWriteResult(SqlDb db)
                 return new WriteOutcome(AttemptOutcome.NotSent, JobStatus.Failed, JobReason.PrinterUnavailable, failed);
             }
 
-            // J08: plazo vencido.
+            // J08: plazo vencido, o un plazo calculado con el reloj anterior a un salto (SI-16).
             await RequireJobAsync(conn, tx, """
                 UPDATE dbo.PrintJob
                 SET Status = 'EXPIRED', Reason = 'DEADLINE_PASSED', ResultVersion = ResultVersion + 1, UpdatedAt = @EdgeNowUtc
@@ -167,6 +173,24 @@ public sealed class TxcWriteResult(SqlDb db)
             var expired = await ResultPublisher.PublishJobAsync(conn, tx, jobId, edgeNowUtc, ResultExtras.None, ct);
             return new WriteOutcome(AttemptOutcome.NotSent, JobStatus.Expired, JobReason.DeadlinePassed, expired);
         }, ct);
+
+    /// <summary>
+    /// ¿Está bloqueada la estación del intento con CLOCK_JUMP? Lee StationConfig con lock compartido hasta el commit (REPEATABLEREAD),
+    /// como TX-A y TX-E; el intento y su job se leen por versiones, sin locks.
+    /// </summary>
+    private static async Task<bool> StationBlockedByClockJumpAsync(SqlConnection conn, SqlTransaction tx, Guid attemptId, CancellationToken ct)
+    {
+        await using var cmd = conn.Command(tx, """
+            SELECT sc.LabelingEnabled, sc.BlockReason
+            FROM dbo.PrintAttempt AS pa
+            INNER JOIN dbo.PrintJob AS pj ON pj.PrintJobId = pa.PrintJobId
+            INNER JOIN dbo.StationConfig AS sc WITH (REPEATABLEREAD) ON sc.SiteId = pj.SiteId AND sc.StationId = pj.StationId
+            WHERE pa.AttemptId = @AttemptId;
+            """);
+        cmd.Guid("@AttemptId", attemptId);
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        return await r.ReadAsync(ct) && !r.GetBoolean(0) && r.GetNullableString(1) == BlockReason.ClockJump;
+    }
 
     /// <summary>
     /// Error o timeout después de invocar la escritura (A04): J09 con WRITE_INTERRUPTED para un intento

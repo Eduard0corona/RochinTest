@@ -14,6 +14,7 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/CartonPrinting.FaultHost/CartonPrinting.FaultHost.csproj" />
+    <Project Path="tests/CartonPrinting.DemoHost/CartonPrinting.DemoHost.csproj" />
     <Project Path="tests/CartonPrinting.FaultTests/CartonPrinting.FaultTests.csproj" />
     <Project Path="tests/CartonPrinting.IntegrationTests/CartonPrinting.IntegrationTests.csproj" />
     <Project Path="tests/CartonPrinting.LoadTests/CartonPrinting.LoadTests.csproj" />

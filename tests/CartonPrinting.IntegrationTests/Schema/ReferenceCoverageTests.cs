@@ -129,7 +129,8 @@ public sealed class ReferenceCoverageTests(SqlServerFixture sql) : IAsyncLifetim
     public async Task Tx_e_d08_with_recirculated_carton()
     {
         // Dos detecciones de la misma caja esperan snapshot con CYCLE_ONLY; después se activa
-        // CARTON_ID_REQUIRED y llega el snapshot: TX-E repite la validación de recirculación.
+        // CARTON_ID_REQUIRED y llega el snapshot: TX-E repite la validación de recirculación. Para la segunda,
+        // la primera (anterior, en WAITING_ERP) es recirculación (SI-17).
         var s = await StationScenario.CreateAsync(_db, ct: Ct);
         var d1 = await s.RegisterAsync(s.Cycle(70, workOrder: "WO-RC", cartonId: "C-99"));
         var d2 = await s.RegisterAsync(s.Cycle(71, workOrder: "WO-RC", cartonId: "C-99"));
@@ -137,10 +138,10 @@ public sealed class ReferenceCoverageTests(SqlServerFixture sql) : IAsyncLifetim
         var rev8 = await s.Stations.ActivateRevisionAsync(StationScenario.DefaultRevision(s.StationId) with { RevisionNumber = 8, CartonIdentityMode = "CARTON_ID_REQUIRED" }, Ct);
         await s.AddSnapshotAsync("R1", "SKU-RC", "LOT-RC", Ct, "WO-RC");
         var snapshot = (await s.Erp.FindValidAsync("WO-RC", s.Clock.UtcNow, Ct))!;
-        var detection = (await s.DetectionAsync(70))!;
+        var detection = (await s.DetectionAsync(71))!;
         var serial = LabelSerialSource.Format(s.SerialPrefix, await s.Serials.NextAsync(Ct));
         var label = LabelRenderer.Render(s.Revision, snapshot, detection.Identity, serial, "C-99");
-        var plan = new ErpArrivalPlan(d1.DetectionId, new JobInsert(Guid.NewGuid(), s.Revision.LabelType, s.Revision.PrinterId, "WO-RC", snapshot.Revision,
+        var plan = new ErpArrivalPlan(d2.DetectionId, new JobInsert(Guid.NewGuid(), s.Revision.LabelType, s.Revision.PrinterId, "WO-RC", snapshot.Revision,
             snapshot.ProductId, snapshot.LotId, serial, s.Revision.TemplateRevision, label.Payload, label.PayloadHash, detection.DeadlineAt),
             RequiresCartonId: true, detection.DeadlineAt, s.Revision.SendMarginMs, s.Revision.LabelType, s.Clock.UtcNow, snapshot.Gtin,
             rev8.ConfigRevisionId);   // el plazo y el margen se calculan con la revisión activa
