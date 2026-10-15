@@ -9,6 +9,43 @@ using CartonPrinting.PrintAgent;
 // TerminateProcess en Windows, SIGKILL en Linux). Solo para pruebas; nunca se conecta a equipo real.
 //
 // Uso: CartonPrinting.FaultHost <cadena de conexión> <puerto impresora> <PrinterId> <OwnerInstanceId> <LeaseToken> <PrintJobId> <punto>
+//
+// Modo "lock" (T27): CartonPrinting.FaultHost lock <PrinterId> <directorio de locks>. Toma el lock de sistema operativo
+// de la impresora, avisa "LOCKED" (o "BUSY" si otro proceso lo tiene) y lo mantiene hasta que lo maten.
+if (args.Length == 3 && args[0] == "lock")
+{
+    using var held = PrinterOsLock.TryAcquire(args[1], args[2]);
+    Console.WriteLine(held is null ? "BUSY" : "LOCKED");
+    Console.Out.Flush();
+    if (held is null)
+    {
+        return 3;
+    }
+
+    await Task.Delay(Timeout.Infinite);
+    return 0;
+}
+
+// Modo "reprint" (T43): CartonPrinting.FaultHost reprint <conexión> <puerto> <PrinterId manual> <owner> <leaseToken> <AuthorizationId> <punto>.
+// Ejecuta la reimpresión autorizada con el sender real de la impresora manual y se detiene en el punto pedido.
+if (args.Length == 8 && args[0] == "reprint")
+{
+    var reprintDb = new SqlDb(new DatabaseOptions { ConnectionString = args[1] + ";Application Name=CartonPrinting.FaultHost" });
+    var reprintClock = new EdgeClock(TimeProvider.System);
+    using var reprintMetrics = new CartonMetrics();
+    await using var reprintTransport = new TcpPrinterTransport(new PrinterTransportOptions
+    {
+        Port = int.Parse(args[2], System.Globalization.CultureInfo.InvariantCulture), AcceptanceTimeoutMs = 2_000,
+    }, TimeProvider.System);
+    var manual = new ManualReprintSender(args[3], reprintDb, new TxxReprint(reprintDb), new TxcWriteResult(reprintDb),
+        new LeaseGrant(args[3], args[4], long.Parse(args[5], System.Globalization.CultureInfo.InvariantCulture), DateTime.UtcNow.AddMinutes(10)),
+        reprintTransport, reprintClock, reprintMetrics, new StopAt(Enum.Parse<SenderPoint>(args[7])));
+    var reprint = await manual.ExecuteAsync(long.Parse(args[6], System.Globalization.CultureInfo.InvariantCulture), CancellationToken.None);
+    Console.Out.WriteLine($"DONE {reprint.Write?.AttemptOutcome ?? "NOT_EXECUTED"}");
+    Console.Out.Flush();
+    return 0;
+}
+
 if (args.Length != 7)
 {
     Console.Error.WriteLine("Uso: CartonPrinting.FaultHost <conexión> <puerto> <printerId> <owner> <leaseToken> <printJobId> <punto>");

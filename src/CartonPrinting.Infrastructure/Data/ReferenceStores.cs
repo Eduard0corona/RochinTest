@@ -246,6 +246,24 @@ public sealed class PrinterLeaseStore(SqlDb db)
             await using var r = await cmd.ExecuteReaderAsync(ct);
             return await r.ReadAsync(ct) ? new LeaseGrant(printerId, ownerInstanceId, r.GetInt64(0), r.GetUtc(1)) : null;
         }, ct);
+
+    /// <summary>
+    /// Libera el lease del dueño con ese token: lo deja vencido más allá de la gracia, para que otra instancia lo tome en
+    /// cuanto lo pida (con el token siguiente). Si ya no es suyo, no cambia nada.
+    /// </summary>
+    public Task<bool> ReleaseAsync(string printerId, string ownerInstanceId, long fencingToken, int leaseGraceMs, DateTime edgeNowUtc, CancellationToken ct) =>
+        db.InTransactionAsync(async (conn, tx) =>
+        {
+            await using var cmd = conn.Command(tx, """
+                UPDATE dbo.PrinterLease
+                SET AcquiredAt = DATEADD(MILLISECOND, -(@grace + 2000), @now), LeaseUntil = DATEADD(MILLISECOND, -(@grace + 1000), @now)
+                OUTPUT inserted.PrinterId
+                WHERE PrinterId = @p AND OwnerInstanceId = @owner AND FencingToken = @token;
+                """);
+            cmd.Int("@grace", leaseGraceMs).DateTime2("@now", edgeNowUtc).NVarChar("@p", printerId, 64).NVarChar("@owner", ownerInstanceId, 128)
+                .BigInt("@token", fencingToken);
+            return await cmd.ExecuteScalarAsync(ct) is not null;
+        }, ct);
 }
 
 /// <summary>Seriales de LabelSerialSeq, siempre antes de TX-A y fuera de la transacción (H3, ADR 0008).</summary>

@@ -5,7 +5,9 @@ using CartonPrinting.Infrastructure.Observability;
 using CartonPrinting.Infrastructure.Sql;
 using CartonPrinting.Infrastructure.Time;
 using CartonPrinting.OpcIngest;
+using CartonPrinting.Operations;
 using CartonPrinting.Outbox;
+using CartonPrinting.Recovery;
 using OpenTelemetry;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
@@ -25,6 +27,12 @@ builder.Services.AddSingleton<EdgeClock>();
 builder.Services.AddSingleton<CartonMetrics>();
 builder.Services.AddSingleton(new DatabaseOptions { ConnectionString = builder.Configuration.GetConnectionString("CartonPrinting") ?? string.Empty });
 builder.Services.AddSingleton<SqlDb>();
+
+// Arranque ordenado (Fase 5): cada módulo registra sus pasos; StartupHostedService los ejecuta en orden.
+var startup = new StartupCoordinator(TimeProvider.System);
+startup.Add(StartupStage.LabelingReadyLow, "LabelingReady sin escribir hasta la etapa 8", _ => Task.CompletedTask);
+builder.Services.AddSingleton(startup);
+builder.Services.AddHostedService<StartupHostedService>();
 
 // Outbox Relay (Fase 1): solo con RabbitMQ configurado. Sin broker la impresión sigue y el Outbox acumula.
 var rabbit = builder.Configuration.GetSection("RabbitMq").Get<RabbitMqOptions>();
@@ -56,27 +64,53 @@ var ingest = builder.Configuration.GetSection("Ingest").Get<IngestHostOptions>()
 if (!string.IsNullOrWhiteSpace(ingest?.Opc.EndpointUrl))
 {
     builder.Services.AddSingleton(ingest);
-    builder.Services.AddHostedService(sp => new IngestHostedService(ingest, sp.GetRequiredService<SqlDb>(), sp.GetRequiredService<EdgeClock>(),
-        sp.GetRequiredService<CartonMetrics>(), sp.GetRequiredService<ILoggerFactory>(), sp.GetService<CartonPrinting.Orchestration.IErpDemand>()));
+    builder.Services.AddSingleton(sp =>
+    {
+        var service = new IngestHostedService(ingest, sp.GetRequiredService<SqlDb>(), sp.GetRequiredService<EdgeClock>(),
+            sp.GetRequiredService<CartonMetrics>(), sp.GetRequiredService<ILoggerFactory>(), sp.GetService<CartonPrinting.Orchestration.IErpDemand>(),
+            coordinated: true);
+        startup.Add(StartupStage.StateLoaded, $"revisión, épocas y marca alta de {ingest.StationId}", service.LoadStateAsync);
+        startup.Add(StartupStage.Subscribed, $"suscripción OPC UA de {ingest.StationId}", service.SubscribeAsync);
+        startup.Add(StartupStage.LabelingReady, $"primer LabelingReady de {ingest.StationId}", service.FirstBeatAsync);
+        return service;
+    });
+    builder.Services.AddHostedService(sp => sp.GetRequiredService<IngestHostedService>());
+    builder.Services.AddSingleton<IAnomalyReingest>(sp => new IngestReingest(sp.GetRequiredService<IngestHostedService>(), ingest));
 }
 
 // Sincronización ERP y barrido TX-S de la estación (Fase 3): con la estación configurada en "Ingest";
 // el ERP solo con "ErpSync:BaseUrl".
 builder.Services.AddStationServices(builder.Configuration);
 
-// Sender de la impresora de línea (Fase 4): solo con "Printer:PrinterId" y su puerto configurados.
-var printer = builder.Configuration.GetSection("Printer").Get<CartonPrinting.EdgeHost.PrinterHostOptions>();
-if (!string.IsNullOrWhiteSpace(printer?.PrinterId) && printer.Transport.Port > 0)
+// Impresoras (Fases 4 y 5): la de línea ("Printer") y la manual de reimpresiones ("ManualPrinter"), cada una con su
+// lock de sistema operativo, su lease y un solo sender; solo con PrinterId y puerto configurados.
+foreach (var (section, role) in new[] { ("Printer", PrinterRole.Line), ("ManualPrinter", PrinterRole.Manual) })
 {
-    builder.Services.AddSingleton(printer);
-    builder.Services.AddHostedService<CartonPrinting.EdgeHost.PrinterHostedService>();
+    var printer = builder.Configuration.GetSection(section).Get<PrinterHostOptions>();
+    if (!string.IsNullOrWhiteSpace(printer?.PrinterId) && printer.Transport.Port > 0)
+    {
+        builder.Services.AddHostedService(sp => new PrinterHostedService(role, printer, sp.GetRequiredService<SqlDb>(), sp.GetRequiredService<EdgeClock>(),
+            sp.GetRequiredService<CartonMetrics>(), sp.GetRequiredService<ILoggerFactory>(), startup, sp.GetService<ClockGuard>()));
+    }
 }
 
-// Los demás módulos (propiedad de la impresora, Operations API) se registran en sus fases.
+// Operations API (Fase 5): solo con personas configuradas ("Operations:OperatorKeySha256"). Las claves de planta no van
+// en el repositorio; la configuración guarda solo su SHA-256.
+var operations = builder.Configuration.GetSection("Operations").Get<OperationsOptions>();
+if (operations is { OperatorKeySha256.Count: > 0 })
+{
+    builder.Services.AddOperations(operations);
+}
 
 var app = builder.Build();
 app.MapHealthChecks("/health/live", new() { Predicate = _ => false });
 app.MapHealthChecks("/health/ready", new() { Predicate = c => c.Tags.Contains("ready") });
+if (operations is { OperatorKeySha256.Count: > 0 })
+{
+    app.UseAuthentication();
+    app.UseAuthorization();
+    app.MapOperations();
+}
 await app.RunAsync();
 
 // 0, o el código que fijó un módulo que detuvo el host por una falla (por ejemplo, el sender sin TX-C posible).

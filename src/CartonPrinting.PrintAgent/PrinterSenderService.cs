@@ -239,27 +239,8 @@ public sealed class PrinterSenderService(
     /// el sender se detiene (<see cref="SenderHaltedException"/>): el intento queda en SENDING, la impresora no se usa y el
     /// arranque siguiente ejecuta TX-R0 (ESTRATEGIA_RECUPERACION §3, SQL Server).
     /// </summary>
-    private async Task<WriteOutcome> RecordResultAsync(Guid attemptId, Func<Task<WriteOutcome>> txcCall)
-    {
-        for (var attempt = 1; ; attempt++)
-        {
-            try
-            {
-                return await txcCall();
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                if (attempt >= 3)
-                {
-                    _logger.LogCritical(ex, "Sender de {Printer}: TX-C del intento {Attempt} falló tres veces; el sender se detiene", printerId, attemptId);
-                    throw new SenderHaltedException($"TX-C del intento {attemptId} no se pudo registrar.", ex);
-                }
-
-                _logger.LogWarning(ex, "Sender de {Printer}: TX-C del intento {Attempt} falló; reintento {Retry}", printerId, attemptId, attempt);
-                await Task.Delay(TimeSpan.FromMilliseconds(200 * attempt));
-            }
-        }
-    }
+    private Task<WriteOutcome> RecordResultAsync(Guid attemptId, Func<Task<WriteOutcome>> txcCall) =>
+        ResultRecorder.RecordAsync(txcCall, printerId, attemptId, _logger);
 
     /// <summary>Bucle del sender: envía mientras haya jobs READY; si no, espera una señal o el intervalo de sondeo.</summary>
     public async Task RunAsync(TimeSpan pollInterval, TimeProvider loopTime, Func<CancellationToken, Task>? waitForSignal, CancellationToken ct)

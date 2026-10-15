@@ -2,6 +2,16 @@
 
 Cambios de la implementación. Los de la especificación están en `spec/CHANGELOG.md`.
 
+## Fase 5 · Propiedad, recuperación y operación (2026-10-15)
+
+- Propiedad por impresora: lock de sistema operativo por archivo, lease con renovación y ciclo de vida (`OwnedPrinterRunner`); sin propiedad, cero envíos y alerta.
+- Arranque ordenado del EdgeHost (`StartupCoordinator`, ocho etapas) con propiedad, TX-R0, estado, barrido, suscripción y `LabelingReady` en orden.
+- Operations API (`CartonPrinting.Operations`): autenticación por persona con claves de hash en la configuración, acciones manuales por TX-M y reimpresión con regla de dos personas; el sender de la impresora manual ejecuta TX-X.
+- Métricas `exceptional_reprints_total{risk,result}` y `unknown_resolution_total{result}`.
+- Pruebas: T27, T34, T36, T40, T41 y T43 en verde contra SQL Server real, la impresora simulada, el PLC simulado y procesos reales.
+- Revisión independiente: el arranque no sigue sin la impresora de línea (y el lease se libera al detener); una renovación que falla cuenta como lease perdido; TX-R0 antes de volver a enviar, probado con un `SENDING` heredado; los fallos del arranque se registran; una autorización rechazada no bloquea a las demás; validación de la API (400) y solicitud pendiente tras un rechazo.
+- Segunda revisión independiente: el sender se detiene al vencer la cobertura local del lease (duración menos gracia), aunque SQL cuelgue, y un error transitorio se reintenta; el ciclo de propiedad sobrevive a un error del sender; la etapa 3 no se completa sin la impresora; desbloqueo decidido en TX-M; cualquier rechazo de TX-X espera; pruebas de la liberación del lease y del NOT_SENT del sender manual.
+
 ## Fase 4 · Print Agent (2026-10-15)
 
 - Impresora simulada por TCP (rechazo de conexiones, corte a mitad de la escritura, impresión sin acuse, cola retenida, cancelación según capacidades) y simulador de evidencia (impresora, aplicador y escáner por ciclo).

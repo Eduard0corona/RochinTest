@@ -103,6 +103,7 @@ public sealed class PrintAgentReviewTests(SqlServerFixture sql) : IAsyncLifetime
             // Fin de la ventana de observación.
         }
 
+        // Con un sondeo de 200 ms, a lo sumo unos 15 en 3 s (antes de la corrección, unos 70 por segundo).
         Assert.InRange(s.Metrics.Total(MetricNames.ClaimRejected, ("cause", nameof(ClaimRejection.StationDisabled))), 1, 20);
         Assert.Equal(0L, rig.Printer.BytesReceived);
     }

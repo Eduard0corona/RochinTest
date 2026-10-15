@@ -26,6 +26,12 @@ public sealed class SenderRecovery(Txr0Recovery txr0, EdgeClock clock, CartonMet
                 printerId, recovered);
         }
 
+        if (result.ExceptionalJobs.Count > 0)
+        {
+            // X03 en la misma transacción que A04: reimpresión excepcional sin resolver.
+            metrics.Add(MetricNames.ExceptionalReprints, result.ExceptionalJobs.Count, ("result", "UNRESOLVED"));
+        }
+
         return result;
     }
 }

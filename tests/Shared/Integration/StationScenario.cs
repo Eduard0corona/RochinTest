@@ -322,6 +322,22 @@ public sealed class StationScenario
         return (T)(await cmd.ExecuteScalarAsync(ct))!;
     }
 
+    public async Task<IReadOnlyList<T>> QueryAsync<T>(string sql, Action<SqlCommand>? bind, Func<SqlDataReader, T> read, CancellationToken ct = default)
+    {
+        await using var conn = new SqlConnection(Db.AppConnectionString);
+        await conn.OpenAsync(ct);
+        await using var cmd = new SqlCommand(sql, conn);
+        bind?.Invoke(cmd);
+        await using var r = await cmd.ExecuteReaderAsync(ct);
+        var list = new List<T>();
+        while (await r.ReadAsync(ct))
+        {
+            list.Add(read(r));
+        }
+
+        return list;
+    }
+
     public Task<int> CountAsync(string fromWhere, Action<SqlCommand>? bind = null, CancellationToken ct = default) =>
         ScalarAsync<int>("SELECT COUNT(*) " + fromWhere, bind, ct);
 
