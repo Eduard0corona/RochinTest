@@ -16,9 +16,10 @@ Clasificación de `CLAUDE.md`:
 | SI-07 | B (vacío de guarda) | 1 | `spec/database/sqlserver_schema.sql` (`TR_PrintJob_StateMachine`, rama CORRECTION) | Resuelto: la persona eligió endurecer el trigger; ADR 0016 en `5eb9695` (spec 1.1.3) |
 | SI-08 | B (vacío de guarda) | 1 | `spec/database/sqlserver_schema.sql` (`TR_PlcEpochHistory_Guard`) | Abierto: el código inserta una acción por confirmación |
 | SI-09 | B (vacío) | 1 | `docs/ARQUITECTURA_TECNICA.md` (plazo efectivo tras cambiar la revisión) | Abierto: comportamiento interino de falla cerrada |
-| SI-10 | B (vacío; capacidad de hardware sin confirmar, regla 6 de `AI_CONTEXT`) | 2 | `DOCUMENTO_PRINCIPAL.md` sección 4, ADR 0001 | Abierto: eco de cierre en el simulador detrás de `CycleDecoder` |
-| SI-11 | A | 2 | `spec/tests/test-catalog.json` (T11) | Abierto: pendiente de aprobación de la edición |
-| SI-12 | B (vacío) | 2 | `DOCUMENTO_PRINCIPAL.md` sección 9.2 ("marca alta reiniciada") | Abierto: interino de falla cerrada |
+| SI-10 | B (vacío; capacidad de hardware sin confirmar, regla 6 de `AI_CONTEXT`) | 2 | `DOCUMENTO_PRINCIPAL.md` sección 4, ADR 0001 | Abierto (OT-04): la persona decidió mantener el eco de cierre del simulador detrás de `CycleDecoder` |
+| SI-11 | A | 2 | `spec/tests/test-catalog.json` (T11) | Resuelto: edición aprobada y aplicada en `8798b85` (spec 1.1.4) |
+| SI-12 | B (vacío) | 2 | `DOCUMENTO_PRINCIPAL.md` sección 9.2 ("marca alta reiniciada") | Abierto (OT-04): la persona decidió mantener el interino de falla cerrada |
+| SI-13 | B (vacío) | 2 | `DOCUMENTO_PRINCIPAL.md` secciones 4 y 9.2, ADR 0001 (registro incoherente frente a la secuencia) | Abierto: la persona decidió mantener el interino de falla cerrada |
 
 ## SI-01 · Rango de códigos de error en el criterio de T47
 
@@ -86,17 +87,34 @@ Clasificación de `CLAUDE.md`:
 - **Vacío.** La sección 4 y el ADR 0001 dicen que, si los campos del registro no corresponden al mismo ciclo, la detección queda `BLOCKED` con `INCOHERENT_SNAPSHOT` (T13), pero no definen cómo lo reconoce el gateway: un valor atómico no trae, por sí mismo, una prueba de que sus campos son del mismo ciclo.
 - **Qué hace la implementación.** Es una capacidad del PLC no confirmada por OT (regla 6 de `spec/AI_CONTEXT.md`): queda detrás de `CycleDecoder` y del simulador. El registro del simulador termina con un eco del `CycleId` que el PLC escribe al cerrar el registro (`closingCycleId`); si no coincide con `cycleId`, el registro es incoherente. Sin eco, la coherencia no se puede comprobar y el registro se acepta.
 - **Pendiente de OT (OT-04).** El formato real del registro y su mecanismo de coherencia (eco, contador de escritura, estructura OPC UA atómica).
+- **Decisión de la persona (2026-10-14).** Mantener el mecanismo del simulador detrás de `CycleDecoder` hasta que OT defina el formato real.
 
 ## SI-11 · T11: el hueco 1001-1020 y la lectura tras reconectar
 
 - **Observación.** T11 espera "hueco 1001-1020 OPEN" con 20 cajas pasadas durante la desconexión. Tras reconectar, OPC UA entrega el valor actual del registro (sección 9.2); si es la caja 1020, el hueco que abre es 1001-1019 y la FIFO entrega 19 cajas nuevas.
 - **Interpretación usada.** La prueba reconecta cuando el registro actual ya es la caja 1021: la lectura abre el hueco 1001-1020 y la FIFO entrega las 20 como `RECOVERED`. Ninguna regla cambia; solo se precisa el escenario.
 - **Por qué clase A.** El criterio de T11 no se puede ejecutar tal como está escrito (con 20 cajas y la lectura del valor actual, el hueco es 1001-1019) y corregirlo no cambia ninguna regla.
-- **Parche mínimo propuesto.** En `spec/tests/test-catalog.json`, T11, `injection`: "Desconectar el gateway mientras pasan 20 cajas; reconectar." → "Desconectar el gateway mientras pasan 20 cajas; reconectar cuando el registro actual ya es la caja siguiente (1021)." Después, `generate_artifacts.py`, `update_checksums.py` y `verify_package.py`. Pendiente de la aprobación de la persona.
+- **Parche mínimo propuesto.** En `spec/tests/test-catalog.json`, T11, `injection`: "Desconectar el gateway mientras pasan 20 cajas; reconectar." → "Desconectar el gateway mientras pasan 20 cajas; reconectar cuando el registro actual ya es la caja siguiente (1021)." Después, `generate_artifacts.py`, `update_checksums.py` y `verify_package.py`.
+- **Resolución (2026-10-14).** La persona aprobó la edición; se aplicó en el commit `8798b85` (`spec: SI-11 …`) con `MATRIZ_PRUEBAS.md` regenerada, los checksums actualizados y el verificador en verde (especificación 1.1.4).
 
 ## SI-12 · Valor de la marca alta al reiniciarse con una época nueva
 
 - **Vacío.** La sección 9.2 dice que, con un cambio legítimo de época, la marca alta se reinicia, pero no a qué valor. Si se reinicia "vacía", el primer registro de la época nueva nunca abre hueco: con el contador arrancando en 1 y el primer registro en 7, los ciclos 1 a 6 no se cuentan (I16) y, con `GATEWAY_RECEIPT`, el registro 7 recibe plazo aunque la entrega no fue continua (I26).
 - **Comportamiento interino (falla cerrada).** En la primera época de la estación (`INITIAL`) no se abre hueco: no se sabe desde dónde contaba el PLC. En una época nueva (`AUTO_INCREMENT_BY_ONE` u `OPERATOR_CONFIRMED`), la marca alta se reinicia como si el contador arrancara en 1: un primer registro mayor que 1 abre el hueco desde 1. Un PLC que arranque en 0 no abre hueco con 0 ni con 1.
 - **Por qué clase B.** Elegir el valor de arranque es una decisión de comportamiento que depende del PLC (OT-04). Pendiente de la persona.
+- **Costo del interino (segunda revisión de la Fase 2, BAJA-8).** Si la época la administra el gateway, o el PLC no reinicia el contador al cambiar de época, el primer registro (por ejemplo 5000) abre el hueco 1-4999: infla `cycles_unobserved_total`, da una alarma falsa y, con `GATEWAY_RECEIPT`, deja sin plazo ese registro.
+- **Alternativa para decidir.** En `OPERATOR_CONFIRMED`, arrancar en `PlcEpochHistory.FirstCycleId`, el ciclo que la persona confirma, en lugar de 1. En `AUTO_INCREMENT_BY_ONE` no hay un valor confirmado y el problema sigue.
+- **Decisión de la persona (2026-10-14).** Mantener el interino hasta que OT-04 fije el valor de arranque.
+
+## SI-13 · Registro incoherente frente al estado de secuencia
+
+- **Vacío.** La sección 4 y el ADR 0001 dicen que un registro incoherente queda `BLOCKED` con `INCOHERENT_SNAPSHOT` (D05), pero no qué efecto tiene sobre la secuencia de la sección 9.2. En particular, no dicen si puede aceptar una época, si su `CycleId` mueve la marca alta o abre huecos, ni si su `DetectionTimestamp` sirve para distinguir un tardío de un reinicio. La sección 9.2 sí dice que la marca alta se reconstruye desde SQL, donde la detección incoherente cuenta.
+- **Comportamiento interino (falla cerrada).**
+  - No acepta épocas. Un incoherente de una época no aceptada se retiene como `EPOCH_UNEXPECTED` y bloquea la estación, aunque la época sea la actual + 1 con `AUTO_INCREMENT_BY_ONE`: su `PlcEpoch` puede ser de otro ciclo.
+  - Su `CycleId` mueve la marca alta y abre huecos, igual que su fila al recargar desde SQL.
+  - Su hora no cuenta para la marca alta. Esto vale para toda detección `BLOCKED` con `INCOHERENT_SNAPSHOT`, porque SQL no distingue el motivo de SI-04 ni el de `PLC_TIMESTAMP` sin hora.
+  - Consecuencia: un tardío legítimo posterior a esa marca es `AMBIGUOUS_DECREASE` (`WARNING`, detección `BLOCKED`, estación habilitada salvo repetición), no `Late`.
+  - Por debajo de la marca no tiene efecto de secuencia ni corta la racha de descensos ambiguos.
+- **Por qué clase B.** Usar `EPOCH_UNEXPECTED` para una época que la política aceptaría, y elegir qué hora vale para la marca alta, son decisiones de comportamiento.
+- **Decisión de la persona (2026-10-14).** Mantener el interino.
 

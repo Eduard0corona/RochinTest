@@ -352,15 +352,15 @@ Las correcciones posteriores a la segunda revisión fueron el cambio de especifi
 3. **`EPOCH_UNEXPECTED`.** Cada registro de una época no aceptada queda como su propia anomalía con el registro completo, y la estación se bloquea una vez. El reingreso exige la época ya aceptada (`CONFIRM_EPOCH`), registra el mismo registro latched con `ANOMALY_REINGEST` y conserva `ReceivedAt`, y después resuelve la anomalía con `RESOLVE_ANOMALY`. Repetirlo da un duplicado auténtico.
 4. **Tardío o reinicio.** Con `DetectionTimestamp` en el registro y en la marca alta, anterior es tardío y posterior o igual es `RESET_SUSPECTED` (la igualdad se trata como reinicio: falla cerrada). Sin alguno de los dos timestamps es `AMBIGUOUS_DECREASE`: `WARNING` y, si la clave nueva anterior también fue ambigua, `BLOCKING` con la estación bloqueada.
 5. **Rebote.** El avance mínimo plausible desde la marca alta es `(CycleId − M) × MinCycleIntervalMs`; sin `DetectionTimestamp` (o sin `MinCycleIntervalMs`) la regla no se aplica, como pide T26. Un registro con rebote que además salta ciclos abre igual su hueco (diagrama 08).
-6. **Registro incoherente.** El formato real del registro latched es una decisión de OT (OT-04). El simulador cierra el registro con un eco del `CycleId`; si el eco no coincide, el registro es incoherente: no alimenta el estado de secuencia (no acepta épocas, no mueve la marca alta, no abre huecos) y queda `BLOCKED` con `INCOHERENT_SNAPSHOT` si su época ya está aceptada, o retenido con la estación bloqueada si no (falla cerrada). Sin eco, la coherencia no se puede comprobar (SI-10).
+6. **Registro incoherente.** El formato real del registro latched es una decisión de OT (OT-04). El simulador cierra el registro con un eco del `CycleId`; si el eco no coincide, el registro es incoherente. Queda `BLOCKED` con `INCOHERENT_SNAPSHOT` y pasa por la clasificación con dos límites (SI-13, clase B, interino): no acepta épocas y su hora no cuenta. Su `CycleId` mueve la marca alta y abre huecos, igual que su fila al recargar desde SQL; la hora de una detección `BLOCKED` con `INCOHERENT_SNAPSHOT` tampoco cuenta al recargar. Texto anterior, reemplazado por la segunda revisión: "no alimenta el estado de secuencia (no acepta épocas, no mueve la marca alta, no abre huecos) y queda `BLOCKED` con `INCOHERENT_SNAPSHOT` si su época ya está aceptada, o retenido con la estación bloqueada si no (falla cerrada). Sin eco, la coherencia no se puede comprobar (SI-10).
 7. **Decodificación.** Solo StatusCode Good produce un registro; vacío, mal formado o sin identidad se descarta con `opc_records_rejected_total{cause,transport}` y nunca llega a TX-A.
 8. **`LabelingReady`** = estación habilitada, OPC conectado con la recuperación terminada y el canal de la ingesta sin saturar (o sin notificaciones descartadas desde el latido anterior); baja si no se puede leer SQL y al detener el servicio. La recuperación tras reconectar termina cuando terminan sus lecturas, no cuando pasa una caja.
 9. **G03 en la ingesta.** Mientras no existe el barrido completo de la Fase 3, el servicio alojado cierra los huecos vencidos cada `GapSweepIntervalMs` y mide `cycles_unobserved_total` y `sequence_gaps_open`.
 10. **El consumidor no salta registros.** Si TX-A falla con un error que no es de identidad ni 1205, el servicio se detiene: la disponibilidad cede ante la consistencia.
 11. **Pruebas de T45 por transporte.** La clasificación del transporte la prueba `OpcClientTransportTests` contra el servidor simulado (primera notificación, Republish tras congelar el enlace, Overflow, reinicio con lectura y FIFO); la regla de plazo por transporte se prueba con registros de cada transporte en la ingesta, más un recorrido completo por OPC (primera notificación tras reiniciar el servidor).
-12. **Precondición de T24 en bloque.** Los 5000 ciclos registrados se cargan con `SqlBulkCopy` (con `FireTriggers` y `CheckConstraints`) y pasan a `EXPIRED` por D04; la inyección (5200 entregas) pasa completa por la ingesta y TX-A.
+12. **Precondición de T24 por TX-A.** Los 5000 ciclos registrados entran por TX-A en paralelo, cada uno con su job (la versión anterior, con `SqlBulkCopy` y detecciones `EXPIRED` sin job, se reemplazó por B8); la inyección (5200 entregas) pasa completa por la ingesta y TX-A.
 
-13. **Transporte tras reconectar.** Una suscripción recreada (reinicio del PLC, sesión nueva o suscripción vencida) vuelve a numerar sus mensajes: el cliente lleva el número de secuencia por suscripción y la primera notificación de la nueva es `READ`. Durante la recuperación, un cambio que el servidor registró antes de la reconexión (por su `ServerTimestamp` frente a la hora del servidor al reconectar) es `REPUBLISH` aunque viaje en un mensaje nuevo; uno posterior es `SUBSCRIPTION`. La recuperación hace, en pasos independientes: hora del servidor, lectura del registro actual, Republish de lo perdido en tránsito y FIFO.
+13. **Transporte tras reconectar.** Una suscripción recreada (reinicio del PLC, sesión nueva o suscripción vencida) vuelve a numerar sus mensajes: el cliente lleva el número de secuencia por suscripción y la primera notificación de la nueva es `READ`. Durante la recuperación, un cambio que el servidor registró antes de la reconexión (por su `ServerTimestamp` frente a la hora del servidor al reconectar) es `REPUBLISH` aunque viaje en un mensaje nuevo; uno posterior es `SUBSCRIPTION`. La suscripción se reconoce por su instancia y por su Id (segunda revisión, MEDIA-1). La recuperación hace, en pasos independientes: hora del servidor, lectura del registro actual, Republish de lo perdido en tránsito y FIFO. El Republish usa la suscripción viva de la sesión y espera una respuesta de publicación posterior a la reconexión (MEDIA-2). Terminada la recuperación, la marca de la última reconexión se conserva: un cambio anterior a ella que llega tarde sigue siendo `REPUBLISH` (BAJA-1).
 14. **Dos instancias.** Un duplicado auténtico también mueve la marca alta (la detección existe), como al reconstruir el estado desde SQL.
 15. **Arranque sin PLC.** El servicio alojado reintenta la conexión con espera exponencial en lugar de detener el EdgeHost.
 
@@ -432,9 +432,55 @@ Resultado: trazabilidad OK, 0 errores
 Compuerta en verde.
 ```
 
+### Segunda revisión independiente
+
+Subagente `revisor-adversarial` sobre una copia limpia de `51bcb88` (2026-10-14). Ejecutó la compuerta (158, 80 y 27 pruebas en verde), comprobó que las pruebas nuevas de A1 y A2 fallan sin su corrección e hizo experimentos propios con el cliente OPC UA real: 32 rondas de corte, reinicios del PLC y cuatro escenarios contra SQL Server real. 0 ALTA, 3 MEDIA y 8 BAJA:
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| MEDIA-1: el reinicio de la numeración dependía de que el servidor cambiara el `SubscriptionId` | Media | También se reinicia cuando cambia la instancia de `Subscription`. El simulador elige Ids al azar, así que ninguna prueba cubre un servidor que repita Ids (ver lo no verificado) |
+| MEDIA-2: tras el primer reinicio del PLC, la recuperación usaba la suscripción muerta; con una lista de disponibles vieja, el Republish no esperaba | Media | La suscripción y el monitored item vivos se toman de la sesión al reconectar y en cada recuperación. La lista de disponibles se lee después de una respuesta de publicación posterior a la reconexión (`LastNotificationTime`). Prueba nueva: tras un reinicio, lo publicado durante un corte llega como `REPUBLISH` en esa recuperación; falla sin la corrección |
+| MEDIA-3: tras recargar, el registro incoherente sí era la marca alta (en memoria no), y ocultaba huecos | Media | Una sola regla en los dos caminos (decisión 6, SI-13). Pruebas: `An_incoherent_record_feeds_the_mark_the_same_in_memory_and_after_reload` contra SQL y cuatro unitarias en `IncoherentSequenceTests` |
+| BAJA-1: la marca de hora del servidor se descartaba al terminar la recuperación; dos recuperaciones superpuestas se pisaban | Baja | Se conserva la marca de la última reconexión: un cambio anterior a ella es `REPUBLISH` aunque llegue después. Contador de generación por recuperación |
+| BAJA-2: un incoherente de una época recién confirmada volvía a bloquear la estación | Baja | El incoherente pasa por la misma relectura previa a retener. Prueba `An_incoherent_record_of_a_just_confirmed_epoch_does_not_block_the_station_again` |
+| BAJA-3: la decisión 6 era un cambio de comportamiento no registrado | Baja | SI-13 (clase B) |
+| BAJA-4: la prueba de M4 no ejercitaba el canal; la saturación no se evaluaba con la estación bloqueada o desconectada | Baja | `ChannelPressure` extraída y probada con un canal acotado real; se evalúa en cada latido |
+| BAJA-5: un arranque fallido dejaba la sesión abierta y enganchada al keep-alive | Baja | Se desengancha y se cierra en `StartAsync` |
+| BAJA-6: un reingreso concurrente informaba éxito y dejaba una `OperatorAction` sin efecto | Baja | `ResolveAnomalyAsync` resuelve primero e inserta la acción solo si resolvió; el reingreso falla si otro ya la resolvió. Prueba `Resolving_an_already_resolved_anomaly_leaves_no_operator_action` |
+| BAJA-7: documentación desfasada (decisión 12, fila T24, B6 sin prueba) | Baja | Decisión 12 y fila T24 corregidas; la métrica `OPERATOR_CONFIRMED` se comprueba en `A_confirmed_epoch_reaches_the_running_ingest`; límite de reinicio en lo no verificado |
+| BAJA-8: el interino de SI-12 abre huecos enormes si la época cambia sin reiniciar el contador | Baja | Agregado a SI-12 con la alternativa `FirstCycleId`, para que la persona decida |
+
+Compuerta completa después de las correcciones de la segunda revisión, 2026-10-14 23:50 (`powershell -File build/ci.ps1`):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   162, Omitido:     0, Total:   162, Duración: 21 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    80, Omitido:     0, Total:    80, Duración: 2 m 14 s - CartonPrinting.IntegrationTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    30, Omitido:     0, Total:    30, Duración: 3 m 35 s - CartonPrinting.FaultTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 62 ejecutadas
+  Fase 2: T11=1 destino(s), 1 ejecutadas, T13=5 destino(s), 5 ejecutadas, T24=1 destino(s), 1 ejecutadas, T25=8 destino(s), 10 ejecutadas, T26=2 destino(s), 3 ejecutadas, T30=2 destino(s), 3 ejecutadas, T35=2 destino(s), 2 ejecutadas, T45=4 destino(s), 12 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
+La prueba nueva de MEDIA-2 se ejecutó también contra `OpcUaCycleSource.cs` de `51bcb88` (sin la corrección): falla (1 de 1). Con la corrección pasó 3 de 3 veces seguidas, junto con la prueba de corte sin reinicio.
+
+Sin hallazgos ALTA en la segunda revisión: no se pide una tercera.
+
+### Decisiones de la persona (2026-10-14)
+
+- **SI-11 (clase A):** edición aprobada y aplicada en `8798b85` (especificación 1.1.4). Después: `py spec/tools/generate_artifacts.py` (regeneró `tests/MATRIZ_PRUEBAS.md`), `py spec/tools/update_checksums.py` (150 archivos) y `py spec/tools/verify_package.py` (`Resultado: 15 grupos OK, 0 errores`); `generate_artifacts.py --check`: artefactos al día.
+- **SI-10, SI-12 y SI-13 (clase B):** se mantienen los interinos de falla cerrada; quedan abiertos para OT-04.
+
 ### Lo que no se verificó
 
 - Ningún PLC real: el servidor OPC UA es el simulador. El formato del registro latched, el eco de cierre y la FIFO son del simulador (OT-04, OT-14).
+- Un servidor OPC UA que repita `SubscriptionId` al reiniciar (MEDIA-1): el cambio de instancia lo cubre en el cliente, pero el simulador elige Ids al azar y ninguna prueba lo ejercita.
+- `plc_epoch_changes_total{mode=OPERATOR_CONFIRMED}` se cuenta al aparecer la época en una recarga del proceso en ejecución; si el EdgeHost reinicia entre la confirmación y la recarga, esa época no se cuenta.
 - La clasificación del transporte tras reconectar se probó con el servidor de OPC Foundation (reinicio, enlace congelado, sesión vencida); otros servidores pueden numerar o sellar distinto.
 - Dos instancias se probaron con dos consumidores en un proceso, no con dos EdgeHost reales (la Fase 5 agrega la propiedad de la impresora).
 - El flujo `REQUIRE_CONFIRMATION` de punta a punta en el EdgeHost necesita la Operations API (Fase 5); aquí se probó con la ingesta y las acciones manuales de TX-M.

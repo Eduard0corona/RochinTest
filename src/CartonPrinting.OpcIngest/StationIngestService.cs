@@ -159,22 +159,9 @@ public sealed class StationIngestService
             ?? throw new InvalidOperationException($"La estación {_station.SiteId}/{_station.StationId} no tiene StationConfig.");
         await CheckClockSkewAsync(record, state, revision, ct);
 
-        // Un registro incoherente (campos de ciclos distintos) no alimenta el estado de secuencia: no acepta
-        // épocas, no mueve la marca alta ni abre huecos. Con su época ya aceptada queda BLOCKED con
-        // INCOHERENT_SNAPSHOT; con una época desconocida, se retiene y la estación se bloquea (falla cerrada).
-        if (!record.Coherent)
-        {
-            if (_classifier.Epochs.Any(e => e.Epoch == record.PlcEpoch))
-            {
-                var blocked = await _registration.RegisterAsync(record, _station, revision, SequenceDecision.InOrder, ct);
-                activity?.SetTag("sequence", "INCOHERENT");
-                return new IngestOutcome(IngestKind.Registered, record, null, blocked, blocked.AnomalyId);
-            }
-
-            var retainedId = await RetainAsync(record, revision, _clock.UtcNow, ct);
-            return new IngestOutcome(IngestKind.Retained, record, AnomalyId: retainedId);
-        }
-
+        // Un registro incoherente (campos de ciclos distintos) pasa por la misma clasificación con dos límites: no
+        // acepta épocas (SI-13) y su hora no decide nada. Queda BLOCKED con INCOHERENT_SNAPSHOT y su CycleId mueve
+        // la marca alta y abre huecos, como su fila al recargar el estado desde SQL.
         var reloaded = false;
         for (var guard = 0; ; guard++)
         {
@@ -210,7 +197,7 @@ public sealed class StationIngestService
 
                 case SequenceVerdict.Register register:
                     var result = await _registration.RegisterAsync(record, _station, revision, register.Decision, ct);
-                    _classifier.Observe(record, register.Case, result.Outcome);
+                    _classifier.Observe(record, register.Case, result);
                     if (result.FinalStatus == DetectionStatus.WaitingErp && record.WorkOrderId is { } workOrder)
                     {
                         _erpDemand?.WorkOrderNeeded(workOrder);
@@ -322,7 +309,13 @@ public sealed class StationIngestService
             _serial.Release();
         }
 
-        await _manual.ResolveAnomalyAsync(anomalyId, _station.SiteId, _station.StationId, performedBy, resolution, _clock.UtcNow, ct);
+        var resolved = await _manual.ResolveAnomalyAsync(anomalyId, _station.SiteId, _station.StationId, performedBy, resolution, _clock.UtcNow, ct);
+        if (!resolved.Applied)
+        {
+            // Otro reingreso concurrente la resolvió: el registro de este fue su duplicado auténtico.
+            throw new InvalidOperationException($"La anomalía {anomalyId} ya la resolvió otro reingreso (este registro: {outcome.Result?.Outcome}).");
+        }
+
         return outcome;
     }
 

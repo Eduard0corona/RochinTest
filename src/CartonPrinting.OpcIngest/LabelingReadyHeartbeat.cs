@@ -29,11 +29,14 @@ public sealed class LabelingReadyHeartbeat(
     /// <summary>Un latido: calcula la señal, la escribe y la devuelve.</summary>
     public async Task<bool> BeatAsync(CancellationToken ct)
     {
+        // Se evalúa en cada latido, también con la estación bloqueada o sin conexión: los descartes de ese periodo
+        // no se atribuyen al primer latido posterior.
+        var saturated = overloaded?.Invoke() ?? false;
         bool ready;
         try
         {
             var active = await stations.GetActiveAsync(station.SiteId, station.StationId, ct);
-            ready = active is { State.LabelingEnabled: true } && sink.Connected && !(overloaded?.Invoke() ?? false);
+            ready = active is { State.LabelingEnabled: true } && sink.Connected && !saturated;
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
