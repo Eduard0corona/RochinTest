@@ -183,6 +183,7 @@ public sealed class PrintAgentSecondReviewTests(SqlServerFixture sql) : IAsyncLi
         Assert.False(result.WriteInvoked);
         Assert.Equal((AttemptOutcome.NotSent, JobStatus.RetryWait), (result.Write!.AttemptOutcome, result.Write.JobStatus));
         Assert.Equal(AttemptOutcome.NotSent, Assert.Single(await s.AttemptsAsync(job, Ct)).Outcome);
+        Assert.Equal(0, (await s.JobAsync(job, Ct)).AutoAttemptCount);   // no consume intento
         Assert.Equal(0L, printer.BytesReceived);
     }
 
@@ -210,20 +211,20 @@ public sealed class PrintAgentSecondReviewTests(SqlServerFixture sql) : IAsyncLi
     }
 
     /// <summary>
-    /// M-3: el job está CONFIRMED y una lectura contradictoria posterior quedó registrada sin aplicar (el proceso cayó entre las
+    /// M-3 (T44, nivel APPLIED): el job está CONFIRMED y una lectura contradictoria posterior quedó registrada sin aplicar (el proceso cayó entre las
     /// dos transacciones de TX-D). La reaplicación del arranque la aplica: J18, UNKNOWN con SERIAL_MISMATCH y la alerta.
     /// </summary>
     [Fact]
     [Trait("Spec", "T44")]
     public async Task Startup_reapplies_a_recorded_correction_of_a_confirmed_job()
     {
-        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        var s = await StationScenario.CreateAsync(_db, r => r with { MinConfirmationLevel = EvidenceLevel.Applied }, Ct);
         var (job, _) = await s.TransmittedJobAsync(1700, Ct);
-        await s.EvidenceAsync(s.Printed(job), Ct);
+        await s.EvidenceAsync(s.Applied(1700), Ct);
         Assert.Equal(JobStatus.Confirmed, (await s.JobAsync(job, Ct)).Status);
         await s.ObserveAsync(s.Verified(1700, WrongSerial), Ct);
 
-        Assert.Equal(1, await new EvidenceService(s.Txd, s.Sql, s.Clock, s.Metrics).ReapplyOpenAsync(s.PrinterId, Ct));
+        Assert.Equal(1, await new EvidenceService(s.Txd, s.Sql, s.Clock, s.Metrics).ReapplyOpenAsync(StationScenario.SiteId, s.StationId, Ct));
         var row = await s.JobAsync(job, Ct);
         Assert.Equal((JobStatus.Unknown, JobReason.SerialMismatch), (row.Status, row.Reason));
         Assert.Equal(1, s.Metrics.Total(MetricNames.ConfirmedCorrected));
@@ -235,7 +236,7 @@ public sealed class PrintAgentSecondReviewTests(SqlServerFixture sql) : IAsyncLi
     /// sin efecto. La reaplicación del sender después de TX-C la aplica: la PRINTED confirma y la contradicción cuenta su alerta.
     /// </summary>
     [Fact]
-    [Trait("Spec", "T15")]
+    [Trait("Spec", "T22")]
     public async Task The_sender_applies_evidence_that_arrived_before_its_result()
     {
         var s = await StationScenario.CreateAsync(_db, ct: Ct);
@@ -301,8 +302,9 @@ public sealed class PrintAgentSecondReviewTests(SqlServerFixture sql) : IAsyncLi
         Assert.Equal(2, passIds.Count);
         Assert.InRange(passRead, 1, 1_000);
 
-        await using var startup = conn.Command(null, EvidenceQueries.StartupContradictions);
-        startup.DateTime2("@since", s.Clock.UtcNow - EvidenceService.StartupHorizon).NVarChar("@printer", s.PrinterId, 64);
+        await using var startup = conn.Command(null, EvidenceQueries.StartupReapply);
+        startup.DateTime2("@since", s.Clock.UtcNow - EvidenceService.StartupHorizon).NVarChar("@site", StationScenario.SiteId, 64)
+            .NVarChar("@station", s.StationId, 64);
         var (startupIds, startupRead) = await RunWithPlanAsync(startup);
         Assert.Single(startupIds);
         Assert.InRange(startupRead, 1, 1_000);

@@ -61,7 +61,7 @@ public sealed class OwnershipReviewTests(SqlServerFixture sql) : IAsyncLifetime
             await Task.Delay(Timeout.Infinite, ct);
         }, stop.Token);
 
-        await AdvanceUntilAsync(s, () => sent.Task.IsCompleted);
+        await AdvanceUntilAsync(s, () => sent.Task.IsCompleted, stopAdvancing: () => runnerB.Owned);
         Assert.Equal($"{JobStatus.Unknown}/{JobReason.RestartDuringSend}", seenAtFirstRun);
         Assert.Equal(1, printer.TransmissionsOf((await s.JobAsync(next, Ct)).LabelSerial));
         Assert.Equal(0, printer.TransmissionsOf((await s.JobAsync(inherited, Ct)).LabelSerial));
@@ -126,7 +126,10 @@ public sealed class OwnershipReviewTests(SqlServerFixture sql) : IAsyncLifetime
             await steal.ExecuteNonQueryAsync(Ct);
         }
 
-        await AdvanceUntilAsync(s, () => resumed.Task.IsCompleted);
+        // Una vez detectada la pérdida y vuelta a tomar la impresora, el reloj de prueba deja de avanzar: si siguiera, podría
+        // vencer la cobertura del lease mientras SQL responde en tiempo real.
+        await AdvanceUntilAsync(s, () => resumed.Task.IsCompleted,
+            stopAdvancing: () => runner.Owned && s.Metrics.Total(MetricNames.PrinterOwnerConflicts, ("printer", s.PrinterId), ("cause", "lease_lost")) >= 1);
         Assert.Equal(["primera", $"{JobStatus.Unknown}/{JobReason.RestartDuringSend}"], runs);
         Assert.Equal(1, s.Metrics.Total(MetricNames.PrinterOwnerConflicts, ("printer", s.PrinterId), ("cause", "lease_lost")));
         Assert.Equal(2, runner.SenderRuns);
@@ -187,17 +190,218 @@ public sealed class OwnershipReviewTests(SqlServerFixture sql) : IAsyncLifetime
         }
     }
 
+
+    /// <summary>
+    /// Segunda revisión de la Fase 5, MEDIA 1: SQL Server deja de responder a la renovación sin cortar la conexión (proxy
+    /// congelado, conexiones del pool). El sender se detiene cuando vence la cobertura del lease (duración menos gracia), sin
+    /// esperar el tiempo de espera del comando (30 s): antes de que el lease venza y otra instancia pueda tomarlo.
+    /// </summary>
+    [Fact]
+    public async Task A_renewal_that_hangs_stops_the_sender_before_the_lease_can_expire()
+    {
+        var s = await StationScenario.CreateAsync(_db, r => r with { TransitBudgetMs = 600_000 }, Ct, TimeProvider.System);
+        var parts = new SqlConnectionStringBuilder(s.Db.AppConnectionString).DataSource.Replace("tcp:", string.Empty, StringComparison.Ordinal).Split(',');
+        await using var proxy = new TcpProxy(parts[0], int.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture)).Start();
+        var viaProxy = new SqlConnectionStringBuilder(s.Db.AppConnectionString) { DataSource = $"127.0.0.1,{proxy.Port}" };
+        var leases = new PrinterLeaseStore(new SqlDb(new DatabaseOptions { ConnectionString = viaProxy.ConnectionString }));
+        using var ownership = new PrinterOwnership(s.PrinterId, s.OwnerInstanceId, "host-a", leases, s.Clock, s.Metrics, 1_500, 300,
+            lockDirectory: NewLockDirectory());
+        var runner = new OwnedPrinterRunner(ownership, Recovery(s), s.Clock);
+        Assert.True(await runner.AcquireAsync(Ct));
+        var stopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        var run = runner.RunAsync(async (_, ct) =>
+        {
+            try
+            {
+                await Task.Delay(Timeout.Infinite, ct);
+            }
+            finally
+            {
+                stopped.TrySetResult();
+            }
+        }, stop.Token);
+        try
+        {
+            await Task.Delay(1_000, Ct);   // al menos una renovación por el proxy
+            proxy.Freeze();
+            var frozenAt = DateTime.UtcNow;
+            await stopped.Task.WaitAsync(TimeSpan.FromSeconds(20), Ct);
+            var elapsed = DateTime.UtcNow - frozenAt;
+            Assert.True(elapsed < TimeSpan.FromSeconds(3), $"el sender se detuvo {elapsed.TotalMilliseconds:F0} ms después de congelar SQL");
+            Assert.Equal(1, s.Metrics.Total(MetricNames.PrinterOwnerConflicts, ("printer", s.PrinterId), ("cause", "lease_lost")));
+        }
+        finally
+        {
+            proxy.Resume();
+            await stop.CancelAsync();
+            await run.ContinueWith(_ => { }, TaskScheduler.Default);
+        }
+    }
+
+    /// <summary>
+    /// Segunda revisión de la Fase 5, MEDIA 1 (efecto inverso): un corte breve de SQL Server durante una renovación no detiene
+    /// el sender mientras el lease lo cubre: la renovación se reintenta y el job siguiente se imprime sin alerta.
+    /// </summary>
+    [Fact]
+    public async Task A_transient_renewal_error_does_not_stop_the_sender()
+    {
+        var s = await StationScenario.CreateAsync(_db, r => r with { TransitBudgetMs = 600_000 }, Ct, TimeProvider.System);
+        await using var printer = PrinterSimulator.Start();
+        await using var transport = Transport(printer.Port, printer, s);
+        var parts = new SqlConnectionStringBuilder(s.Db.AppConnectionString).DataSource.Replace("tcp:", string.Empty, StringComparison.Ordinal).Split(',');
+        await using var proxy = new TcpProxy(parts[0], int.Parse(parts[1], System.Globalization.CultureInfo.InvariantCulture)).Start();
+        var viaProxy = new SqlConnectionStringBuilder(s.Db.AppConnectionString)
+        {
+            DataSource = $"127.0.0.1,{proxy.Port}", ConnectTimeout = 2, Pooling = false, ConnectRetryCount = 0,
+        };
+        var leases = new PrinterLeaseStore(new SqlDb(new DatabaseOptions { ConnectionString = viaProxy.ConnectionString }));
+        using var ownership = new PrinterOwnership(s.PrinterId, s.OwnerInstanceId, "host-a", leases, s.Clock, s.Metrics, 3_000, 500,
+            lockDirectory: NewLockDirectory());
+        var runner = new OwnedPrinterRunner(ownership, Recovery(s), s.Clock);
+        Assert.True(await runner.AcquireAsync(Ct));
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        var run = runner.RunAsync((lease, ct) =>
+            new PrinterSenderService(s.PrinterId, s.Sql, s.Claims, s.Txc, s.Stations, lease, transport, s.Clock, s.Metrics)
+                .RunAsync(TimeSpan.FromMilliseconds(50), TimeProvider.System, null, ct), stop.Token);
+        try
+        {
+            // Corte de 1,3 s: más largo que el intervalo de renovación (1 s), así que al menos una renovación falla, y más corto
+            // que la cobertura del lease (duración menos gracia, 2,5 s), así que un reintento llega a tiempo.
+            await Task.Delay(1_200, Ct);
+            proxy.AcceptNew = false;
+            proxy.SeverAll();
+            await Task.Delay(1_300, Ct);
+            proxy.AcceptNew = true;
+            await Task.Delay(2_500, Ct);
+
+            var job = await s.ReadyJobAsync(770, Ct);
+            var serial = (await s.JobAsync(job, Ct)).LabelSerial;
+            var deadline = DateTime.UtcNow.AddSeconds(30);
+            while (printer.TransmissionsOf(serial) == 0)
+            {
+                Assert.True(DateTime.UtcNow < deadline, "el job no se imprimió después del corte breve");
+                await Task.Delay(100, Ct);
+            }
+
+            Assert.Equal(0, s.Metrics.Total(MetricNames.PrinterOwnerConflicts, ("printer", s.PrinterId), ("cause", "lease_lost")));
+            Assert.Equal(1, runner.SenderRuns);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await run.ContinueWith(_ => { }, TaskScheduler.Default);
+        }
+    }
+
+    /// <summary>
+    /// Segunda revisión de la Fase 5, MEDIA 2: el sender termina con un error fuera de la escritura (por ejemplo, SQL al
+    /// prepararlo) con un intento en SENDING. El ciclo de propiedad no termina: vuelve a tomar la impresora, ejecuta TX-R0 (el
+    /// SENDING queda UNKNOWN) y vuelve a correr el sender.
+    /// </summary>
+    [Fact]
+    public async Task An_error_in_the_sender_does_not_end_the_ownership_cycle_and_tx_r0_runs_before_it_runs_again()
+    {
+        var s = await StationScenario.CreateAsync(_db, r => r with { TransitBudgetMs = 7_200_000 }, Ct);
+        using var ownership = new PrinterOwnership(s.PrinterId, s.OwnerInstanceId, "host-a", s.Leases, s.Clock, s.Metrics, 600_000, 2_000,
+            lockDirectory: NewLockDirectory());
+        var runner = new OwnedPrinterRunner(ownership, Recovery(s), s.Clock);
+        Assert.True(await runner.AcquireAsync(Ct));
+        var inFlight = await s.ReadyJobAsync(780, Ct);
+        string? seenAtSecondRun = null;
+        var resumed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        var run = runner.RunAsync(async (lease, ct) =>
+        {
+            if (runner.SenderRuns == 1)
+            {
+                Assert.True((await s.Claims.TryClaimAsync(inFlight, lease, ct))!.Claimed);
+                throw new InvalidOperationException("Error simulado al preparar el sender");
+            }
+
+            var row = await s.JobAsync(inFlight, ct);
+            seenAtSecondRun = $"{row.Status}/{row.Reason}";
+            resumed.TrySetResult();
+            await Task.Delay(Timeout.Infinite, ct);
+        }, stop.Token);
+
+        await AdvanceUntilAsync(s, () => resumed.Task.IsCompleted || run.IsFaulted, stopAdvancing: () => runner.Owned);
+        Assert.False(run.IsFaulted, run.Exception?.GetBaseException().Message);
+        Assert.Equal($"{JobStatus.Unknown}/{JobReason.RestartDuringSend}", seenAtSecondRun);
+        Assert.Equal(2, runner.SenderRuns);
+        await stop.CancelAsync();
+        await run.ContinueWith(_ => { }, TaskScheduler.Default);
+    }
+
+    /// <summary>
+    /// Segunda revisión de la Fase 5, MEDIA 3 y BAJA 1: otra instancia tomó el lease entre las etapas 2 y 3 y tiene un intento en
+    /// SENDING. TX-R0 de esta instancia no corre y no toca ese intento; y el reintento de la etapa 3 vuelve a fallar, no la da
+    /// por terminada sin TX-R0.
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T27")]
+    public async Task Tx_r0_does_not_run_after_the_lease_was_taken_by_another_instance()
+    {
+        var s = await StationScenario.CreateAsync(_db, r => r with { TransitBudgetMs = 7_200_000 }, Ct);
+        using var ownership = new PrinterOwnership(s.PrinterId, s.OwnerInstanceId, "host-a", s.Leases, s.Clock, s.Metrics, 600_000, 2_000,
+            lockDirectory: NewLockDirectory());
+        var runner = new OwnedPrinterRunner(ownership, Recovery(s), s.Clock);
+        await runner.AcquireOrFailAsync(Ct);
+
+        s.AdvanceMs(603_000);   // el lease de esta instancia venció; otra lo toma y reclama un job
+        var intruder = (await s.Leases.AcquireAsync(s.PrinterId, "edgehost-b", "host-b", 600_000, 2_000, s.Clock.UtcNow, Ct))!;
+        var job = await s.ReadyJobAsync(790, Ct);
+        var claim = (await s.Claims.TryClaimAsync(job, intruder, Ct))!;
+        Assert.True(claim.Claimed, claim.Rejection.ToString());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => runner.RecoverAsync(Ct));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => runner.RecoverAsync(Ct));
+        Assert.Equal(AttemptOutcome.Sending, Assert.Single(await s.AttemptsAsync(job, Ct)).Outcome);
+        Assert.Equal(JobStatus.Sending, (await s.JobAsync(job, Ct)).Status);
+    }
+
+    /// <summary>
+    /// Segunda revisión de la Fase 5, MEDIA 3: la liberación del lease al detener. Quien no es su dueño (u otro token) no lo
+    /// cambia; la del dueño lo deja vencido y otra instancia lo toma en el acto, con el token siguiente.
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T27")]
+    public async Task Only_the_owner_releases_the_lease_and_the_next_instance_takes_it_at_once()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        using var a = new PrinterOwnership(s.PrinterId, s.OwnerInstanceId, "host-a", s.Leases, s.Clock, s.Metrics, 600_000, 2_000,
+            lockDirectory: NewLockDirectory());
+        var lease = (await a.TryAcquireAsync(Ct))!;
+
+        Assert.False(await s.Leases.ReleaseAsync(s.PrinterId, "edgehost-b", lease.FencingToken, 2_000, s.Clock.UtcNow, Ct));
+        Assert.False(await s.Leases.ReleaseAsync(s.PrinterId, s.OwnerInstanceId, lease.FencingToken + 1, 2_000, s.Clock.UtcNow, Ct));
+        Assert.Null(await s.Leases.AcquireAsync(s.PrinterId, "edgehost-b", "host-b", 600_000, 2_000, s.Clock.UtcNow, Ct));
+
+        await a.ReleaseAsync(Ct);
+        var next = await s.Leases.AcquireAsync(s.PrinterId, "edgehost-b", "host-b", 600_000, 2_000, s.Clock.UtcNow, Ct);
+        Assert.NotNull(next);
+        Assert.Equal(lease.FencingToken + 1, next.FencingToken);
+    }
+
     private static TcpPrinterTransport Transport(int port, PrinterSimulator printer, StationScenario s) => new(new PrinterTransportOptions
     {
         Port = port, ExpectsAcceptance = printer.Capabilities.ReportsAcceptance, AcceptanceTimeoutMs = 1_000,
     }, s.Provider);
 
-    /// <summary>Avanza el reloj de prueba de a poco hasta que se cumpla la condición (los temporizadores del ciclo de propiedad).</summary>
-    private static async Task AdvanceUntilAsync(StationScenario s, Func<bool> done)
+    /// <summary>
+    /// Avanza el reloj de prueba de a poco hasta que se cumpla la condición (los temporizadores del ciclo de propiedad). Con
+    /// <paramref name="stopAdvancing"/> deja de avanzarlo cuando se cumple, para no vencer el plazo de los jobs mientras el
+    /// sender trabaja (segunda revisión de la Fase 5, BAJA 5).
+    /// </summary>
+    private static async Task AdvanceUntilAsync(StationScenario s, Func<bool> done, Func<bool>? stopAdvancing = null)
     {
         for (var i = 0; i < 200 && !done(); i++)
         {
-            s.AdvanceMs(100_000);
+            if (stopAdvancing?.Invoke() != true)
+            {
+                s.AdvanceMs(100_000);
+            }
+
             await Task.Delay(50, Ct);
         }
 

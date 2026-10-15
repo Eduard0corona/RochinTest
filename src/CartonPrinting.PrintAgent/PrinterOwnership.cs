@@ -61,6 +61,10 @@ public sealed class PrinterOwnership(
     private readonly ILogger _logger = logger ?? NullLogger<PrinterOwnership>.Instance;
     private PrinterOsLock? _lock;
 
+    // Marca monotónica hasta la que el lease vigente cubre al sender: la duración menos la gracia, contada desde que se pidió
+    // la toma o la renovación que lo dio (conservador).
+    private long _coveredUntil;
+
     public LeaseGrant? Lease { get; private set; }
 
     public string PrinterId => printerId;
@@ -78,8 +82,13 @@ public sealed class PrinterOwnership(
             return null;
         }
 
+        var requested = clock.GetTimestamp();
         Lease = await leases.AcquireAsync(printerId, ownerInstanceId, ownerHost, leaseDurationMs, leaseGraceMs, clock.UtcNow, ct);
-        if (Lease is null)
+        if (Lease is not null)
+        {
+            _coveredUntil = Covered(requested);
+        }
+        else
         {
             metrics.Increment(MetricNames.PrinterOwnerConflicts, ("printer", printerId), ("cause", "lease"));
             _logger.LogError("Impresora {Printer}: otra instancia tiene el lease vigente; esta no envía", printerId);
@@ -89,38 +98,85 @@ public sealed class PrinterOwnership(
     }
 
     /// <summary>
-    /// Renueva el lease; si se pierde, cancela <paramref name="lost"/> para que el sender deje de reclamar. Una renovación que
-    /// falla (por ejemplo, SQL Server no responde) cuenta como lease perdido: sin ella, el lease vencería con el sender vivo y
-    /// cada claim se rechazaría en silencio (revisión de la Fase 5, A2). El ciclo de propiedad vuelve a tomar la impresora
-    /// y ejecuta TX-R0 antes de enviar.
+    /// Renueva el lease cada tercio de su duración; si se pierde, cancela <paramref name="lost"/> para que el sender deje de
+    /// reclamar. El sender se detiene antes de que el lease venza, con un margen igual a <c>LeaseGraceMs</c>
+    /// (ARQUITECTURA_TECNICA, propiedad de la impresora): si hasta ese instante no hay una renovación confirmada (SQL Server no
+    /// responde, falla o cuelga la llamada), el lease cuenta como perdido sin esperar a que la llamada termine. Los errores
+    /// de una renovación se reintentan mientras el lease cubra al sender (revisiones de la Fase 5: A2 y la segunda, MEDIA 1).
+    /// El ciclo de propiedad vuelve a tomar la impresora y ejecuta TX-R0 antes de enviar.
     /// </summary>
     public async Task RenewAsync(CancellationTokenSource lost, CancellationToken ct)
     {
         while (!ct.IsCancellationRequested && !lost.IsCancellationRequested)
         {
-            await Task.Delay(TimeSpan.FromMilliseconds(leaseDurationMs / 3.0), clock.TimeProvider, ct);
-            LeaseGrant? renewed;
-            try
+            var wait = Min(TimeSpan.FromMilliseconds(leaseDurationMs / 3.0), Remaining());
+            if (wait > TimeSpan.Zero)
             {
-                renewed = await leases.AcquireAsync(printerId, ownerInstanceId, ownerHost, leaseDurationMs, leaseGraceMs, clock.UtcNow, ct);
-            }
-            catch (Exception ex) when (!ct.IsCancellationRequested)
-            {
-                _logger.LogError(ex, "Impresora {Printer}: no se pudo renovar el lease", printerId);
-                renewed = null;
+                await Task.Delay(wait, clock.TimeProvider, ct);
             }
 
-            if (renewed is null || renewed.FencingToken != Lease?.FencingToken)
+            if (!await RenewOnceAsync(ct))
             {
                 metrics.Increment(MetricNames.PrinterOwnerConflicts, ("printer", printerId), ("cause", "lease_lost"));
                 _logger.LogError("Impresora {Printer}: lease perdido; el sender se detiene", printerId);
                 await lost.CancelAsync();
                 return;
             }
-
-            Lease = renewed;
         }
     }
+
+    /// <summary>Una renovación, con reintentos mientras el lease cubra al sender. False: perdido (otro dueño o sin cobertura).</summary>
+    private async Task<bool> RenewOnceAsync(CancellationToken ct)
+    {
+        while (true)
+        {
+            var remaining = Remaining();
+            if (remaining <= TimeSpan.Zero)
+            {
+                return false;
+            }
+
+            var requested = clock.GetTimestamp();
+            // En el pool de hilos: parte de SqlClient es síncrona por debajo (BeginTransactionAsync), y con SQL colgado la llamada
+            // no devolvería su tarea hasta el tiempo de espera del comando.
+            var renewal = Task.Run(() => leases.AcquireAsync(printerId, ownerInstanceId, ownerHost, leaseDurationMs, leaseGraceMs, clock.UtcNow, ct), ct);
+            if (await Task.WhenAny(renewal, Task.Delay(remaining, clock.TimeProvider, ct)) != renewal)
+            {
+                // La llamada sigue colgada: el sender se detiene igual; su resultado, si llega, ya no cuenta.
+                _ = renewal.ContinueWith(t => t.Exception, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+                _logger.LogError("Impresora {Printer}: la renovación del lease no respondió antes de que venza su cobertura", printerId);
+                return false;
+            }
+
+            try
+            {
+                var renewed = await renewal;
+                if (renewed is null || renewed.FencingToken != Lease?.FencingToken)
+                {
+                    return false;
+                }
+
+                Lease = renewed;
+                _coveredUntil = Covered(requested);
+                return true;
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                _logger.LogWarning(ex, "Impresora {Printer}: no se pudo renovar el lease; se reintenta mientras cubra al sender", printerId);
+                var pause = Min(TimeSpan.FromMilliseconds(200), Remaining());
+                if (pause > TimeSpan.Zero)
+                {
+                    await Task.Delay(pause, clock.TimeProvider, ct);
+                }
+            }
+        }
+    }
+
+    private long Covered(long requested) => clock.AddToTimestamp(requested, TimeSpan.FromMilliseconds(leaseDurationMs - leaseGraceMs));
+
+    private TimeSpan Remaining() => clock.GetElapsedTime(clock.GetTimestamp(), _coveredUntil);
+
+    private static TimeSpan Min(TimeSpan a, TimeSpan b) => a < b ? a : b;
 
     /// <summary>
     /// Al detener el proceso, libera el lease (lo deja vencido) para que la instancia siguiente no espere a que venza: sin
@@ -149,6 +205,7 @@ public sealed class OwnedPrinterRunner(PrinterOwnership ownership, SenderRecover
 {
     private readonly ILogger _logger = logger ?? NullLogger<OwnedPrinterRunner>.Instance;
     private volatile bool _owned;
+    private bool _requireOwnership;
 
     public bool Owned => _owned;
 
@@ -168,6 +225,7 @@ public sealed class OwnedPrinterRunner(PrinterOwnership ownership, SenderRecover
     /// </summary>
     public async Task AcquireOrFailAsync(CancellationToken ct)
     {
+        _requireOwnership = true;
         if (!await AcquireAsync(ct))
         {
             throw new InvalidOperationException($"La impresora {ownership.PrinterId} tiene otro dueño: el arranque no sigue sin ella.");
@@ -182,6 +240,13 @@ public sealed class OwnedPrinterRunner(PrinterOwnership ownership, SenderRecover
     {
         if (!_owned)
         {
+            // La impresora de línea no completa la etapa 3 sin ser dueña: el reintento de la etapa la volvería a dar por
+            // terminada sin TX-R0 (segunda revisión de la Fase 5, BAJA 1).
+            if (_requireOwnership)
+            {
+                throw new InvalidOperationException($"La impresora {ownership.PrinterId} no es de este proceso: TX-R0 no se ejecuta.");
+            }
+
             return;
         }
 
@@ -210,8 +275,25 @@ public sealed class OwnedPrinterRunner(PrinterOwnership ownership, SenderRecover
 
     public async Task RunAsync(Func<LeaseGrant, CancellationToken, Task> runSender, CancellationToken ct)
     {
+        var verify = _owned;
         while (!ct.IsCancellationRequested)
         {
+            if (verify)
+            {
+                // Entre la etapa 2 y el primer envío pasan las etapas 3 a 6 sin renovar: si el lease dejó de ser de este
+                // proceso, se vuelve a tomar la impresora con TX-R0 (segunda revisión de la Fase 5, BAJA 1).
+                verify = false;
+                try
+                {
+                    _owned = await AcquireAsync(ct);
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested)
+                {
+                    _owned = false;
+                    _logger.LogError(ex, "Impresora {Printer}: no se pudo confirmar el lease antes de enviar", ownership.PrinterId);
+                }
+            }
+
             if (!_owned)
             {
                 await Task.Delay(TimeSpan.FromMilliseconds(ownership.LeaseDurationMs), clock.TimeProvider, ct);
@@ -244,16 +326,25 @@ public sealed class OwnedPrinterRunner(PrinterOwnership ownership, SenderRecover
             {
                 _logger.LogError("Impresora {Printer}: lease perdido; el sender se detuvo y no envía hasta volver a tomarla", ownership.PrinterId);
             }
-
-            _owned = false;
-            await lost.CancelAsync();
-            try
+            catch (Exception ex) when (ex is not OperationCanceledException and not SenderHaltedException)
             {
-                await renewal;
+                // Un error fuera de la escritura (por ejemplo, SQL al preparar el sender) no detiene el EdgeHost: se registra y
+                // la vuelta siguiente vuelve a tomar la impresora, con TX-R0 (segunda revisión de la Fase 5, MEDIA 2).
+                _logger.LogError(ex, "Impresora {Printer}: el sender terminó con un error; se vuelve a tomar la impresora", ownership.PrinterId);
             }
-            catch (OperationCanceledException)
+            finally
             {
-                // Detención o lease perdido.
+                // Siempre, también si el sender se detuvo: la renovación no sigue después (segunda revisión, BAJA 2).
+                _owned = false;
+                await lost.CancelAsync();
+                try
+                {
+                    await renewal;
+                }
+                catch (OperationCanceledException)
+                {
+                    // Detención o lease perdido.
+                }
             }
         }
     }

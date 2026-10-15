@@ -26,7 +26,7 @@ public sealed class ManualReprintSender(
     public static readonly TimeSpan RejectedRetryDelay = TimeSpan.FromSeconds(5);
 
     private readonly ILogger _logger = logger ?? NullLogger<ManualReprintSender>.Instance;
-    private readonly ConcurrentDictionary<long, DateTime> _rejectedUntil = new();
+    private readonly ConcurrentDictionary<long, long> _rejectedUntil = new();   // marca monotónica
 
     /// <summary>
     /// La siguiente autorización APPROVED vigente dirigida a esta impresora. Una que TX-X rechazó (por ejemplo, LABEL_DAMAGED
@@ -52,7 +52,7 @@ public sealed class ManualReprintSender(
 
             return ids;
         }, ct);
-        var now = clock.UtcNow;
+        var now = clock.GetTimestamp();
         foreach (var stale in _rejectedUntil.Keys.Except(approved))
         {
             _rejectedUntil.TryRemove(stale, out _);
@@ -72,11 +72,12 @@ public sealed class ManualReprintSender(
         {
             execution = await txx.ExecuteAsync(authorizationId, printerId, lease.OwnerInstanceId, lease.FencingToken, attemptId, clock.UtcNow, ct);
         }
-        catch (SqlException ex) when (ex.Number is TxxReprint.NotExecutable or TxxReprint.AttemptRejected)
+        catch (SqlException ex)
         {
-            // Sin autorización ejecutable (revocada, vencida, de otro job), o el trigger rechaza el intento (por ejemplo,
-            // LABEL_DAMAGED sin el retiro de la etiqueta original registrado): nada se envía, y se vuelve a intentar después.
-            _rejectedUntil[authorizationId] = clock.UtcNow + RejectedRetryDelay;
+            // Sin autorización ejecutable (revocada, vencida, de otro job), el trigger rechaza el intento (por ejemplo,
+            // LABEL_DAMAGED sin el retiro de la etiqueta original registrado), un índice lo rechaza (otro intento abierto del job)
+            // o SQL no responde: nada se envía, y se vuelve a intentar después de la espera (segunda revisión de la Fase 5, BAJA 3).
+            _rejectedUntil[authorizationId] = clock.AddToTimestamp(clock.GetTimestamp(), RejectedRetryDelay);
             _logger.LogWarning("Autorización {Authorization} no ejecutable en {Printer}: {Error}", authorizationId, printerId, ex.Message);
             return new ReprintSendResult(authorizationId, null, null, false);
         }

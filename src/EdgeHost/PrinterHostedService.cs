@@ -95,10 +95,10 @@ public sealed class PrinterHostedService : BackgroundService
             await _startup.WhenReached(StartupStage.Swept).WaitAsync(stoppingToken);
             await _runner.RunAsync(RunSenderAsync, stoppingToken);
         }
-        catch (SenderHaltedException)
+        catch (Exception ex) when (ex is not OperationCanceledException || !stoppingToken.IsCancellationRequested)
         {
-            // El host se detiene con un código distinto de 0, para que el supervisor lo relance y el arranque siguiente
-            // ejecute TX-R0 (segunda revisión de la Fase 4, B-3).
+            // Cualquier falla que detiene el host (el sender sin TX-C posible, por ejemplo) sale con un código distinto de 0,
+            // para que el supervisor lo relance y el arranque siguiente ejecute TX-R0 (revisiones de la Fase 4: B-3 y MEDIA-4).
             Environment.ExitCode = 70;
             throw;
         }
@@ -111,32 +111,50 @@ public sealed class PrinterHostedService : BackgroundService
 
     private async Task RunSenderAsync(LeaseGrant lease, CancellationToken ct)
     {
+        await using var transport = new TcpPrinterTransport(_options.Transport, _clock.TimeProvider);
+        var poll = TimeSpan.FromMilliseconds(_options.PollIntervalMs);
+        var evidence = new EvidenceService(new TxdEvidence(_db), _db, _clock, _metrics);
+        if (_role == PrinterRole.Manual)
+        {
+            var manual = new ManualReprintSender(_options.PrinterId, _db, new TxxReprint(_db), new TxcWriteResult(_db), lease, transport, _clock, _metrics,
+                evidence: evidence, logger: _loggers.CreateLogger<ManualReprintSender>());
+            await manual.RunAsync(poll, _clock.TimeProvider, ct);
+            return;
+        }
+
         // Se ejecuta después de tomar la impresora y de TX-R0. Sin su fila de PrinterSendOrder, el sender de línea no
         // arranca (regla 13): se alerta y el ciclo de propiedad lo vuelve a intentar después de la duración del lease.
-        if (_role == PrinterRole.Line && await new PrinterSendOrderStore(_db).GetAsync(_options.PrinterId, ct) is null)
+        if (await new PrinterSendOrderStore(_db).GetAsync(_options.PrinterId, ct) is not { } order)
         {
             _logger.LogCritical("La impresora {Printer} no tiene fila en PrinterSendOrder: su sender no arranca", _options.PrinterId);
             return;
         }
 
-        // La evidencia que quedó registrada sin aplicar (por ejemplo, durante un SENDING que TX-R0 acaba de cerrar) se
-        // aplica ahora, en orden.
-        var evidence = new EvidenceService(new TxdEvidence(_db), _db, _clock, _metrics);
-        await evidence.ReapplyOpenAsync(_options.PrinterId, ct);
-        await using var transport = new TcpPrinterTransport(_options.Transport, _clock.TimeProvider);
-        var poll = TimeSpan.FromMilliseconds(_options.PollIntervalMs);
-        if (_role == PrinterRole.Line)
+        // La evidencia de la estación que quedó registrada sin aplicar (por ejemplo, durante un SENDING que TX-R0 acaba de
+        // cerrar, también de una reimpresión) se aplica en paralelo con el sender, sin retrasar el primer envío (tercera
+        // revisión de la Fase 4, MEDIA-3). Aplicar es idempotente y va bajo los locks de TX-D.
+        var reapply = Task.Run(async () =>
+        {
+            try
+            {
+                var applied = await evidence.ReapplyOpenAsync(order.SiteId, order.StationId, ct);
+                _logger.LogInformation("Arranque de {Printer}: {Applied} observaciones pendientes aplicadas", _options.PrinterId, applied);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                _logger.LogError(ex, "Arranque de {Printer}: no se pudo reaplicar la evidencia pendiente", _options.PrinterId);
+            }
+        }, ct);
+        try
         {
             var sender = new PrinterSenderService(_options.PrinterId, _db, new ClaimService(_db, new TxbClaim(_db), _metrics, _clock, _clockGuard),
                 new TxcWriteResult(_db), new StationConfigStore(_db), lease, transport, _clock, _metrics,
                 logger: _loggers.CreateLogger<PrinterSenderService>(), evidence: evidence);
             await sender.RunAsync(poll, _clock.TimeProvider, _readySignal is null ? null : _readySignal.WaitAsync, ct);
         }
-        else
+        finally
         {
-            var sender = new ManualReprintSender(_options.PrinterId, _db, new TxxReprint(_db), new TxcWriteResult(_db), lease, transport, _clock, _metrics,
-                evidence: evidence, logger: _loggers.CreateLogger<ManualReprintSender>());
-            await sender.RunAsync(poll, _clock.TimeProvider, ct);
+            await reapply.ContinueWith(_ => { }, TaskScheduler.Default);
         }
     }
 

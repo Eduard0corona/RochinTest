@@ -2,6 +2,10 @@
 
 Cambios de la implementación. Los de la especificación están en `spec/CHANGELOG.md`.
 
+## Fase 6 · Perfil extendido (2026-10-15)
+
+- Sin código: `PERFIL_EXTENDIDO=NO` y OT-14 abierta. T09 y T20 quedan `NO_APLICA (OT-14 abierta)`.
+
 ## Fase 5 · Propiedad, recuperación y operación (2026-10-15)
 
 - Propiedad por impresora: lock de sistema operativo por archivo, lease con renovación y ciclo de vida (`OwnedPrinterRunner`); sin propiedad, cero envíos y alerta.
@@ -10,6 +14,7 @@ Cambios de la implementación. Los de la especificación están en `spec/CHANGEL
 - Métricas `exceptional_reprints_total{risk,result}` y `unknown_resolution_total{result}`.
 - Pruebas: T27, T34, T36, T40, T41 y T43 en verde contra SQL Server real, la impresora simulada, el PLC simulado y procesos reales.
 - Revisión independiente: el arranque no sigue sin la impresora de línea (y el lease se libera al detener); una renovación que falla cuenta como lease perdido; TX-R0 antes de volver a enviar, probado con un `SENDING` heredado; los fallos del arranque se registran; una autorización rechazada no bloquea a las demás; validación de la API (400) y solicitud pendiente tras un rechazo.
+- Segunda revisión independiente: el sender se detiene al vencer la cobertura local del lease (duración menos gracia), aunque SQL cuelgue, y un error transitorio se reintenta; el ciclo de propiedad sobrevive a un error del sender; la etapa 3 no se completa sin la impresora; desbloqueo decidido en TX-M; cualquier rechazo de TX-X espera; pruebas de la liberación del lease y del NOT_SENT del sender manual.
 
 ## Fase 4 · Print Agent (2026-10-15)
 
@@ -20,6 +25,7 @@ Cambios de la implementación. Los de la especificación están en `spec/CHANGEL
 - Pruebas: T05, T06, T07, T15, T22, T29, T31, T38, T39, T42 y T44 en verde contra SQL Server real y la impresora simulada.
 - Correcciones de la revisión independiente: la comprobación monotónica es lo último antes de escribir; la evidencia se aplica en orden desde el último claim y se reaplica al arrancar; TX-C con reintentos y detención del sender; sin bucle con el claim rechazado; conexión cerrada reabierta y escritura con tiempo máximo; sender sin `PrinterSendOrder` no arranca.
 - Segunda revisión independiente: una lectura contradictoria anterior no queda detrás de una confirmación, tampoco bajo concurrencia (guarda en TX-D y lock de evidencia por ciclo); NOT_SENT ante cualquier error o apagado entre el claim y la escritura; el arranque reaplica las correcciones J18 pendientes; consultas de evidencia acotadas; el EdgeHost sale con código 70 si el sender se detiene.
+- Tercera revisión independiente: la guarda de TX-D con la coherencia de la aplicación; el lock del ciclo antes del job y reintento de la víctima de interbloqueo; reaplicación del arranque guiada por la evidencia reciente y en paralelo con el sender; el EdgeHost sale con código 70 ante cualquier falla del servicio de impresora; SI-18 decidido.
 
 ## Fase 3 · ERP y plazo (2026-10-14)
 

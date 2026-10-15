@@ -33,7 +33,11 @@ public sealed class ReprintRestartTests(SqlServerFixture sql) : IAsyncLifetime
         await using var printer = PrinterSimulator.Start();
         var job = await s.ReadyJobAsync(960, Ct);
         var row = await s.JobAsync(job, Ct);
-        await Task.Delay(row.DeadlineAt - DateTime.UtcNow + TimeSpan.FromMilliseconds(200), Ct);
+        var untilExpired = row.DeadlineAt - DateTime.UtcNow + TimeSpan.FromMilliseconds(200);
+        if (untilExpired > TimeSpan.Zero)
+        {
+            await Task.Delay(untilExpired, Ct);
+        }
         await new StationSweepService(s.Settings, s.Txs, s.Stations, new ClockGuard(s.Clock), s.Clock, s.Metrics).SweepOnceAsync(Ct);
         Assert.Equal((JobStatus.Expired, JobReason.DeadlinePassed), ((await s.JobAsync(job, Ct)).Status, (await s.JobAsync(job, Ct)).Reason));
         var authorization = await s.ApproveReprintAsync(job, JobStatus.Expired, "EXPIRED_CARTON_HELD", "NONE_PROVEN", Ct);

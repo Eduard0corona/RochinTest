@@ -356,6 +356,33 @@ public sealed class ReprintTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Null(await rig.Sender.ExecuteNextAsync(Ct));   // EXECUTED: no se reintenta
     }
 
+    /// <summary>
+    /// Segunda revisión de la Fase 5, MEDIA 3: la impresora manual no acepta la conexión después de TX-X. La escritura nunca se
+    /// invocó: el intento queda NOT_SENT (no en SENDING, que ocuparía la impresora manual hasta reiniciar), la autorización
+    /// queda EXECUTED y el job sigue en su estado previo; la impresora manual queda libre para la reimpresión siguiente.
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T34")]
+    public async Task A_reprint_whose_connection_fails_after_tx_x_is_not_sent()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        await using var ops = await OperationsHost.StartAsync(s, Ct);
+        await using var rig = ManualRig.Create(s);
+        var (job, _) = await s.UnknownJobAsync(880, Ct);
+        var authorization = await AuthorizeAsync(ops, job, "UNKNOWN_NOT_RESOLVED", "ACCEPTED");
+        rig.Printer.Mode = PrinterMode.RejectConnections;
+
+        var executed = await rig.Sender.ExecuteAsync(authorization, Ct);
+        Assert.False(executed.WriteInvoked);
+        Assert.Equal(AttemptOutcome.NotSent, executed.Write!.AttemptOutcome);
+        Assert.Equal(AttemptOutcome.NotSent, (await s.AttemptsAsync(job, Ct)).Single(a => a.Kind == AttemptKind.ExceptionalReprint).Outcome);
+        Assert.Equal("EXECUTED", await s.ScalarAsync<string>("SELECT Status FROM dbo.ReprintAuthorization WHERE AuthorizationId = @id",
+            c => c.Parameters.AddWithValue("@id", authorization), Ct));
+        Assert.Equal(JobStatus.Unknown, (await s.JobAsync(job, Ct)).Status);
+        Assert.Equal(0, await s.CountAsync("FROM dbo.PrintAttempt WHERE PrinterId = @p AND Outcome = 'SENDING'",
+            c => c.Parameters.AddWithValue("@p", s.ManualPrinterId), Ct));
+    }
+
     /// <summary>Sender de la impresora manual con su lease, su impresora simulada y la evidencia.</summary>
     private sealed class ManualRig : IAsyncDisposable
     {

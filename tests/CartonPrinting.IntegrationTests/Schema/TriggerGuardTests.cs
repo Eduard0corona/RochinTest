@@ -115,11 +115,17 @@ public sealed class TriggerGuardTests(SqlServerFixture sql) : IAsyncLifetime
     public async Task T51018_51019_operator_action_and_evidence_are_insert_only()
     {
         var s = await StationAsync();
-        var noop = await s.Txm.UnblockStationAsync(StationScenario.SiteId, s.StationId, "operador.lopez", "Estación ya habilitada", s.Clock.UtcNow, Ct);
-        Assert.False(noop.Applied);
+        // Desde la segunda revisión de la Fase 5, TX-M no registra una OperatorAction al desbloquear una estación habilitada:
+        // la acción sale de un desbloqueo real que ya no referencia StationConfig (hubo otro después), para que lo que rechace
+        // el DELETE sea el trigger y no la FK.
+        await s.Stations.BlockAsync(StationScenario.SiteId, s.StationId, BlockReason.Operator, "operador.lopez", null, s.Clock.UtcNow, Ct);
+        var unblock = await s.Txm.UnblockStationAsync(StationScenario.SiteId, s.StationId, "operador.lopez", "Revisada", s.Clock.UtcNow, Ct);
+        Assert.True(unblock.Applied);
+        await s.Stations.BlockAsync(StationScenario.SiteId, s.StationId, BlockReason.Operator, "operador.lopez", null, s.Clock.UtcNow, Ct);
+        Assert.True((await s.Txm.UnblockStationAsync(StationScenario.SiteId, s.StationId, "operador.lopez", "Revisada otra vez", s.Clock.UtcNow, Ct)).Applied);
         await ExpectAsync(51018, s, "UPDATE dbo.OperatorAction SET ReasonText = N'otra' WHERE OperatorActionId = @o",
-            c => c.Parameters.AddWithValue("@o", noop.OperatorActionId));
-        await ExpectAsync(51018, s, "DELETE FROM dbo.OperatorAction WHERE OperatorActionId = @o", c => c.Parameters.AddWithValue("@o", noop.OperatorActionId));
+            c => c.Parameters.AddWithValue("@o", unblock.OperatorActionId));
+        await ExpectAsync(51018, s, "DELETE FROM dbo.OperatorAction WHERE OperatorActionId = @o", c => c.Parameters.AddWithValue("@o", unblock.OperatorActionId));
 
         var obs = await s.ObserveAsync(s.Applied(999));
         await ExpectAsync(51019, s, "UPDATE dbo.EvidenceObservation SET SourceReference = N'otra' WHERE ObservationId = @o", c => c.Parameters.AddWithValue("@o", obs));
