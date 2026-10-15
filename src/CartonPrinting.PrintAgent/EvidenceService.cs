@@ -15,6 +15,7 @@ namespace CartonPrinting.PrintAgent;
 public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, CartonMetrics metrics)
 {
     private readonly ConcurrentDictionary<Guid, DateTime> _printedAt = new();
+    private readonly ConcurrentDictionary<Guid, ConcurrentQueue<(string Level, DateTime ObservedAt)>> _pending = new();
 
     public async Task<EvidenceOutcome> SubmitAsync(ObservationInput observation, CancellationToken ct)
     {
@@ -97,6 +98,7 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
             }
         }
 
+        await MeasurePendingAsync(job.PrintJobId, ct);
         return applied;
     }
 
@@ -118,25 +120,54 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
             return;
         }
 
-        var attempts = await db.ReadAsync(conn => JobQueries.GetAttemptsAsync(conn, null, jobId, ct), ct);
-        var sent = attempts.Where(a => a.WriteStartedAt is not null).MaxBy(a => a.AttemptNumber)?.WriteStartedAt;
-        if (sent is null)
+        if (await SentAtAsync(jobId, ct) is { } sent)
+        {
+            Measure(jobId, sent, o.EvidenceLevel, o.ObservedAt, outcome.Action is EvidenceAction.Confirmed or EvidenceAction.ExceptionalConfirmed);
+        }
+        else
+        {
+            // Llegó antes de TX-C (todavía sin WriteStartedAt): se mide al reaplicar después de TX-C, o ahora mismo
+            // si TX-C confirmó entre la lectura y el encolado.
+            _pending.GetOrAdd(jobId, _ => new ConcurrentQueue<(string, DateTime)>()).Enqueue((o.EvidenceLevel, o.ObservedAt));
+            await MeasurePendingAsync(jobId, ct);
+        }
+    }
+
+    /// <summary>Mide la evidencia que llegó mientras el intento estaba en SENDING, ya con la escritura registrada.</summary>
+    private async Task MeasurePendingAsync(Guid jobId, CancellationToken ct)
+    {
+        if (!_pending.ContainsKey(jobId) || await SentAtAsync(jobId, ct) is not { } sent || !_pending.TryRemove(jobId, out var queue))
         {
             return;
         }
 
-        switch (o.EvidenceLevel)
+        var confirmed = await db.ReadAsync(async conn => (await JobQueries.GetJobAsync(conn, null, jobId, ct))?.Status == JobStatus.Confirmed, ct);
+        while (queue.TryDequeue(out var item))
+        {
+            Measure(jobId, sent, item.Level, item.ObservedAt, confirmed);
+        }
+    }
+
+    private void Measure(Guid jobId, DateTime sent, string level, DateTime observedAt, bool confirmed)
+    {
+        switch (level)
         {
             case EvidenceLevel.Printed:
-                _printedAt[jobId] = o.ObservedAt;
-                metrics.Record(MetricNames.SendToPrintedMs, (o.ObservedAt - sent.Value).TotalMilliseconds);
+                _printedAt[jobId] = observedAt;
+                metrics.Record(MetricNames.SendToPrintedMs, (observedAt - sent).TotalMilliseconds);
                 break;
             case EvidenceLevel.Applied when _printedAt.TryGetValue(jobId, out var printed):
-                metrics.Record(MetricNames.PrintedToAppliedMs, (o.ObservedAt - printed).TotalMilliseconds);
+                metrics.Record(MetricNames.PrintedToAppliedMs, (observedAt - printed).TotalMilliseconds);
                 break;
-            case EvidenceLevel.Verified when outcome.Action == EvidenceAction.Confirmed:
-                metrics.Record(MetricNames.SendToVerifiedMs, (o.ObservedAt - sent.Value).TotalMilliseconds);
+            case EvidenceLevel.Verified when confirmed:
+                metrics.Record(MetricNames.SendToVerifiedMs, (observedAt - sent).TotalMilliseconds);
                 break;
         }
+    }
+
+    private async Task<DateTime?> SentAtAsync(Guid jobId, CancellationToken ct)
+    {
+        var attempts = await db.ReadAsync(conn => JobQueries.GetAttemptsAsync(conn, null, jobId, ct), ct);
+        return attempts.Where(a => a.WriteStartedAt is not null).MaxBy(a => a.AttemptNumber)?.WriteStartedAt;
     }
 }
