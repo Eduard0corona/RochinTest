@@ -516,3 +516,48 @@ Durante el desarrollo:
 - Una latencia del ERP cercana al plazo deja la detección en `WAITING_ERP` y la vence: es el comportamiento pedido, pero en la máquina de pruebas depende del ruido.
 - El `ClockGuard` compara entre comprobaciones: si nada lo consulta durante un rato, un salto se detecta en la siguiente comprobación (el barrido corre cada 200 ms).
 
+## Fase 4 · Print Agent (T05, T06, T07, T15, T22, T29, T31, T38, T39, T42, T44)
+
+### Plan
+
+- **Entregables:** impresora simulada por TCP (rechaza conexiones, corta a mitad de la escritura, imprime sin responder, acusa recibo, retiene en cola, confirma o no la cancelación según sus capacidades declaradas, cuenta bytes por conexión y por etiqueta); sender por impresora con una sola conexión, claim con `PrinterSendOrder`, segunda comprobación monotónica y TX-C con la regla de `NOT_SENT`; simulador de evidencia (impresora, aplicador y escáner correlacionados por ciclo) y TX-D con J10 a J12, J15 y J18; puntos de falla para matar el proceso en tres momentos (T07) y suspender el sender (T29).
+- **Pruebas que la cierran:** T05, T06, T07, T15, T22, T29, T31, T38, T39, T42 y T44.
+- **Riesgos previstos:** carreras entre la evidencia y TX-C con una impresora rápida; matar un proceso de verdad desde una prueba.
+
+### Lo hecho
+
+- **Simuladores**: `PrinterSimulator` (TCP en 127.0.0.1, protocolo de laboratorio: ZPL terminado en `^XZ` y "ACK serial" si el dispositivo lo declara) y `EvidenceSimulator` (PRINTED por job, APPLIED y VERIFIED por ciclo; lecturas inyectables).
+- **Print Agent**: `IPrinterTransport`/`TcpPrinterTransport` (conectar no es escribir; escritura en dos mitades con punto de falla intermedio; espera del acuse), `PrinterSenderService` (orden de envío, claim, segunda comprobación con reloj monotónico, estación y compuerta, NOT_SENT o UNKNOWN según si la escritura se invocó, TX-C en una transacción nueva, reaplicación de la evidencia que llegó durante `SENDING`), `EvidenceService` (registro y aplicación; tiempos de la sección 19; reaplicación), `DeviceCancellation` (A07 y J12 solo con cancelación confirmada por el dispositivo), `SenderRecovery` (TX-R0 al arrancar el sender).
+- **Fallas**: `tests/CartonPrinting.FaultHost`, un proceso que ejecuta el sender real y se detiene en el punto pedido para que la prueba lo mate.
+- **EdgeHost**: sender de la impresora de línea (sección `Printer`) con lease y recuperación de arranque.
+
+### Decisiones
+
+1. **Protocolo con el dispositivo.** El del simulador; el real (y qué informa: acuse, fin de impresión, cancelación) es una decisión de integración (OT-01, OT-07) detrás de `IPrinterTransport` y `IDeviceJobControl`. Un acuse de recibo no prueba impresión (I05).
+2. **NOT_SENT solo si la escritura nunca se invocó** (fallo al conectar, o la segunda comprobación rechaza); cualquier error desde que se invoca la escritura, incluido el corte del canal o la falta de acuse, es UNKNOWN (I02) y el canal se descarta.
+3. **Segunda comprobación monotónica.** Al reclamar se calcula lo que queda hasta el plazo efectivo menos el margen, medido desde una marca monotónica tomada antes del claim (conservador); justo antes de escribir se compara con el reloj monotónico. También se relee la estación (bloqueada: NOT_SENT sin consumir intento) y, si la revisión exige compuerta física, se consulta `IPhysicalGate`; sin una compuerta configurada el envío no se hace (falla cerrada). El catálogo no tiene una prueba de la compuerta; su implementación con `PrintWindowCycleId` queda para la integración con el PLC real.
+4. **Evidencia durante SENDING.** Con una impresora rápida, la evidencia llega antes de TX-C, cuando todavía no hay transición que aplicar: se registra y el sender la reaplica después de TX-C (seguro por el ADR 0016). Lo encontró T44; la medición de tiempos de esa evidencia se completa entonces.
+5. **Cancelación (T31).** "No impreso" sin confirmación de cancelación no cambia el job; solo una cancelación confirmada por el dispositivo para ese job aplica A07 y J12.
+6. **T07 con un proceso real.** El sender corre en `CartonPrinting.FaultHost`; la prueba lo mata con `Process.Kill` (TerminateProcess en Windows, equivalente a kill -9) en cada punto, comprueba con el login administrador que la sesión del host no tiene transacciones abiertas durante el I/O (I20) y ejecuta la recuperación de arranque. El UNKNOWN del primer punto (no se escribió nada) es falso: es el costo aceptado de no poder distinguirlo desde SQL.
+7. **El sender del EdgeHost** toma el lease y ejecuta TX-R0 antes de enviar; el lock de sistema operativo, la renovación del lease y la parada ante su pérdida son de la Fase 5.
+
+### Comandos y resultados
+
+La compuerta de la fase se registra al cerrarla (después de cerrar las Fases 2 y 3, que se revisan en paralelo).
+
+Durante el desarrollo:
+
+- T44 falló al principio: la evidencia del aplicador llegaba mientras el intento seguía en `SENDING` y quedaba registrada sin efecto (decisión 4).
+- T42 falló porque la impresora "fuera de línea" no cortaba la conexión TCP ya abierta; el simulador ahora la corta y la prueba reconecta.
+- T31 falló de forma intermitente por la medición de la evidencia que llega durante `SENDING`; la medición quedó pendiente hasta TX-C.
+
+### Pruebas de la fase
+
+- **T05, T06, T07, T15, T22, T29, T31, T38, T39, T42 y T44**: se ejecutan y pasan; su estado se registra con la compuerta de cierre.
+
+### Lo que no se verificó
+
+- Ninguna impresora, aplicador ni escáner reales; el protocolo y las capacidades son del simulador.
+- La compuerta física (`PLC_WINDOW_TAG`) no tiene implementación ni prueba del catálogo.
+- `Process.Kill` no es un corte de energía: no prueba el estado del disco ni del dispositivo tras un apagón.
+
