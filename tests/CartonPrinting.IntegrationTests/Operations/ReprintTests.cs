@@ -27,41 +27,6 @@ public sealed class ReprintTests(SqlServerFixture sql) : IAsyncLifetime
 
     private static JsonElement LastResult(IReadOnlyList<JsonElement> results) => results.MaxBy(r => r.GetProperty("resultVersion").GetInt32());
 
-    /// <summary>Sender de la impresora manual con su lease, su impresora simulada y la evidencia.</summary>
-    private sealed class ManualRig : IAsyncDisposable
-    {
-        private ManualRig(PrinterSimulator printer, TcpPrinterTransport transport, ManualReprintSender sender, EvidenceService evidence)
-        {
-            Printer = printer;
-            Transport = transport;
-            Sender = sender;
-            Evidence = evidence;
-        }
-
-        public PrinterSimulator Printer { get; }
-        public TcpPrinterTransport Transport { get; }
-        public ManualReprintSender Sender { get; }
-        public EvidenceService Evidence { get; }
-
-        public static ManualRig Create(StationScenario s)
-        {
-            var printer = PrinterSimulator.Start();
-            var transport = new TcpPrinterTransport(new PrinterTransportOptions
-            {
-                Port = printer.Port, ExpectsAcceptance = printer.Capabilities.ReportsAcceptance, AcceptanceTimeoutMs = 1_000,
-            }, s.Provider);
-            var evidence = new EvidenceService(s.Txd, s.Sql, s.Clock, s.Metrics);
-            return new ManualRig(printer, transport, new ManualReprintSender(s.ManualPrinterId, s.Sql, s.Txx, s.Txc, s.ManualLease, transport, s.Clock,
-                s.Metrics, evidence: evidence), evidence);
-        }
-
-        public async ValueTask DisposeAsync()
-        {
-            await Transport.DisposeAsync();
-            await Printer.DisposeAsync();
-        }
-    }
-
     private static async Task<Guid> RequestAsync(OperationsHost ops, Guid job, string reason, string risk, string requestedBy = OperationsHost.Operator)
     {
         using var http = ops.As(requestedBy);
@@ -313,5 +278,40 @@ public sealed class ReprintTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Equal(AttemptOutcome.Confirmed, (await s.AttemptsAsync(job, Ct)).Single(a => a.Kind == AttemptKind.ExceptionalReprint).Outcome);
         Assert.Equal("CONFIRMED", LastResult(await s.ResultsAsync(job, Ct)).GetProperty("outcome").GetString());
         Assert.Equal(1, rig.Printer.TransmissionsOf(serial));   // una etiqueta de reimpresión, en la impresora manual
+    }
+
+    /// <summary>Sender de la impresora manual con su lease, su impresora simulada y la evidencia.</summary>
+    private sealed class ManualRig : IAsyncDisposable
+    {
+        private ManualRig(PrinterSimulator printer, TcpPrinterTransport transport, ManualReprintSender sender, EvidenceService evidence)
+        {
+            Printer = printer;
+            Transport = transport;
+            Sender = sender;
+            Evidence = evidence;
+        }
+
+        public PrinterSimulator Printer { get; }
+        public TcpPrinterTransport Transport { get; }
+        public ManualReprintSender Sender { get; }
+        public EvidenceService Evidence { get; }
+
+        public static ManualRig Create(StationScenario s)
+        {
+            var printer = PrinterSimulator.Start();
+            var transport = new TcpPrinterTransport(new PrinterTransportOptions
+            {
+                Port = printer.Port, ExpectsAcceptance = printer.Capabilities.ReportsAcceptance, AcceptanceTimeoutMs = 1_000,
+            }, s.Provider);
+            var evidence = new EvidenceService(s.Txd, s.Sql, s.Clock, s.Metrics);
+            return new ManualRig(printer, transport, new ManualReprintSender(s.ManualPrinterId, s.Sql, s.Txx, s.Txc, s.ManualLease, transport, s.Clock,
+                s.Metrics, evidence: evidence), evidence);
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            await Transport.DisposeAsync();
+            await Printer.DisposeAsync();
+        }
     }
 }
