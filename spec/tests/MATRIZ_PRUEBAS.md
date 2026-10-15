@@ -852,7 +852,7 @@ Origen: revisión independiente · Nivel: INTEGRATION · Perfil: AMBOS · Estado
 | Precondiciones | SQL Server 2022 en Testcontainers; conexión con ANSI_NULLS y QUOTED_IDENTIFIER en ON. |
 | Datos iniciales | Base vacía; después datos de un escenario completo. |
 | Inyección | Ejecutar el DDL y la semilla; ejecutar cada sentencia de database/sqlserver_operations_reference.sql con 0 filas afectadas y con filas afectadas; intentar cada transición prohibida y cada transición manual, excepcional o de corrección sin su respaldo o con un respaldo anterior; cambiar solo Reason; retroceder PrinterSendOrder; editar PlcEpochHistory; desbloquear una estación sin OperatorAction. |
-| Estados esperados | El DDL se crea sin error (incluidos los índices filtrados); ninguna sentencia de 0 filas lanza excepción; ninguna sentencia falla con Msg 334; todo intento indebido falla con su error (51010 a 51032). |
+| Estados esperados | El DDL se crea sin error (incluidos los índices filtrados); ninguna sentencia de 0 filas lanza excepción; ninguna sentencia falla con Msg 334; todo intento indebido falla con su error (51001 a 51032, o 52001 en TX-X). |
 | Eventos publicados | — |
 | Efectos físicos esperados | — |
 | Métricas afectadas | — |
