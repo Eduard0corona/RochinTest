@@ -52,7 +52,7 @@ Cambios de la implementación. Los de la especificación están en `spec/CHANGEL
   - la sentencia de referencia de `OUT_OF_ORDER` se conserva para T47;
   - T12 escribe su reporte aunque una fase no termine y aunque falle su diagnóstico;
   - `BENCHMARK.md` escapa las celdas y solo dice "todas `CONFIRMED`" si lo están.
-- Pruebas: pendientes de la compuerta final.
+- Pruebas: T08, T12, T16, T19 y T32 en verde contra SQL Server y RabbitMQ reales y simuladores, en la compuerta final de `e0812b0` (`build/ci.ps1 --fase 7 --carga`, 2026-10-15 16:47); T37, T42 y T47 revalidadas en la misma compuerta. `docs/BENCHMARK.md` se regeneró de esa corrida.
 
 ## Fase 6 · Perfil extendido (2026-10-15)
 

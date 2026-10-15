@@ -1369,7 +1369,14 @@ Después de la verificación final, con la máquina en reposo:
 
 ### Pruebas de la fase
 
-{PRUEBAS}
+- **T08, T12, T16, T19 y T32: PASA** en la compuerta final de `e0812b0` (detalle en `docs/TEST_STATUS.md`). T37, T42 y T47, cuyos mecanismos cambiaron en esta fase (SI-21 y la extensión de SI-16), quedan revalidadas en la misma compuerta.
+- Cinco rondas de revisión:
+  - dos revisiones independientes;
+  - la verificación final por dimensiones;
+  - la verificación de sus correcciones;
+  - la revisión de `59e6c73`.
+
+  La última no dejó hallazgos ALTA: su única ALTA se bajó a MEDIA y se corrigió.
 
 ### Revisión independiente
 
@@ -1622,7 +1629,40 @@ Mutaciones, cada una revertida:
 - **15:40, TX-C sin la condición de `CLOCK_JUMP`:** la prueba nueva falla con `Expected: Tuple ("NOT_SENT", "EXPIRED", "DEADLINE_PASSED")` y `Actual: Tuple ("NOT_SENT", "RETRY_WAIT", null)`.
 - **15:41, `TxsSweep.cs` de `4e4dff8`:** `SweepLockOrderTests` falla en los dos casos, `CLOCK_JUMP: 1 transacciones reintentadas por un 1205 con el claim` y `OUT_OF_ORDER: 1 transacciones reintentadas por un 1205 con el claim`.
 
-La compuerta completa, con `--carga`, se ejecuta después, con la máquina en reposo.
+### Compuerta final
+
+`build/ci.ps1 --fase 7 --carga`, sobre `e0812b0`, 2026-10-15 de 15:43 a 16:47, con la máquina en reposo y `CARTONPRINTING_BENCHMARK_OUT=<scratchpad>/benchmark-gate.json`:
+
+```
+inicio 2026-10-15 15:43 sobre e0812b0
+Resultado: 15 grupos OK, 0 errores
+Resultado: 366 archivos versionados revisados, 0 errores
+Correctas! - Con error:     0, Superado:   176, Omitido:     0, Total:   176, Duración: 12 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:   105, Omitido:     0, Total:   105, Duración: 3 m 22 s - CartonPrinting.IntegrationTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:   120, Omitido:     0, Total:   120, Duración: 23 m 12 s - CartonPrinting.FaultTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:     1, Omitido:     0, Total:     1, Duración: 40 m 16 s - CartonPrinting.LoadTests.dll (net10.0)
+Resultado: trazabilidad OK, 0 errores
+exit=0
+fin 2026-10-15 16:47
+```
+
+- **T08** (salida del TRX de FaultTests):
+
+  ```
+  T08 latencia recepción→escritura (ms): antes p50=43 p95=67 p99=138 máx=146; durante p50=45 p95=62 p99=94 máx=159; cajas=750
+  T08 vencidas: antes 0, durante 0, después 0 (como mucho 1 durante, 1 después y 7 en total)
+  ```
+
+- **T12.** 3010 cajas, 10 de calentamiento, 1800 a una por segundo y 1200 a dos por segundo. Todas `CONFIRMED` con VERIFIED, una etiqueta cada una.
+  - **Backlog:** 0 en las dos fases, y el pendiente más antiguo, 0 ms.
+  - **Interbloqueos y esperas:** ningún 1205 reintentado, ningún interbloqueo en `system_health` y ninguna espera larga ni pausa del proceso en el muestreo.
+  - **Fallas:** ninguna caída de SQL, pausa del sender, error del sender, NOT_SENT, UNKNOWN, detección sin job ni hueco.
+  - **Outbox:** 6020 eventos publicados, ninguno pendiente.
+  - **Notificación → invocación de la escritura:** p50 21,2 ms, p99 67,3 ms y máximo 166 ms a la tasa pactada; p99 70,5 ms al doble.
+  - **Desigualdad de factibilidad (PLC_TIMESTAMP):** 516 ms < 1500 ms. `SendMarginMs` 250 cubre p99(`presend_check_to_write_ms`) 0 + 200, y `DeviceLeadTimeMs` 400 cubre el p99 medido de 33 ms.
+
+  `docs/BENCHMARK.md` se regeneró de esta corrida: `py build/benchmark_report.py <scratchpad>/benchmark-gate.json --fecha "2026-10-15 23:47 UTC (40 min 16 s), compuerta de e0812b0" --comando "…" > docs/BENCHMARK.md`.
+- **T12 de la compuerta de `59e6c73`.** No se explicó la caja que no terminó: esa corrida no dejó diagnóstico. Con el mismo código del barrido, más la corrección de TX-C y el reporte completo, esta corrida terminó sin ninguna falla. Ver "Riesgos".
 
 ### Lo que no se verificó
 
@@ -1637,11 +1677,17 @@ La compuerta completa, con `--carga`, se ejecuta después, con la máquina en re
 - **La demo** hace de integración de evidencia (el EdgeHost no tiene una propia) y conecta el PLC simulado sin cifrado.
 - **SQL Server sin respuesta** se simula con el proxy congelado, y una detención real con el contenedor detenido y vuelto a arrancar. No se probó una caída de red real ni cuánto tarda SqlClient en soltar una conexión medio abierta. La ingesta deja de esperarla al segundo, pero la caída no se levanta hasta que esa conexión termina.
 - **La prueba del camino de TX-A** toma el rango de inserción de la detección, pero no hace un commit. Un commit síncrono detenido (AG) se descubre en el primer TX-A después de levantar la caída, y las recaídas alargan la espera.
+- **J08 con `CLOCK_JUMP` en TX-C:** la prueba es secuencial (el NOT_SENT después de la purga). El orden frente a una purga concurrente, con TX-C sin confirmar, se apoya en el orden de locks de la estación (lock compartido de TX-C, exclusivo de la purga); no tiene una prueba que fuerce esa intercalación.
 - **Logs.** Los mensajes del EdgeHost ya no nombran el endpoint OPC, pero el texto de una excepción del cliente OPC UA o de SqlClient puede incluir la dirección del servidor. No se revisaron todas.
 
 ### Riesgos
 
 - Las pruebas que comparan latencias (T08 y `LatencySegmentsTests`) dependen de que la máquina no esté cargada. T08 corre sola; las demás tienen calentamiento y márgenes amplios.
+- **Fallas de T12 sin explicar.** Dos se registraron sin diagnóstico ni causa:
+  - la sonda de las 13:02, con 10 cajas vencidas sin interbloqueo; Docker Desktop se detuvo tres minutos después;
+  - la caja sin terminar de la compuerta de `59e6c73`.
+
+  Ahora el reporte de T12 conserva el diagnóstico de cualquier falla. Si se repiten, quedarán explicadas en esa corrida.
 - La compuerta completa con `--carga` tarda más de una hora.
 - **Falla cerrada.** Una lectura lenta del latido (más de `SqlAttemptTimeoutMs`) baja `LabelingReady` en ese latido. La caída se declara si la lectura sigue sin respuesta en el latido siguiente o si SQL no está disponible. Hasta que la vigilancia la levanta, los ciclos que llegan son hueco: al menos 1 s, más con una conexión colgada o con recaídas.
 - **Login fallido.** Un 18456 cuenta como SQL no disponible: una contraseña mal configurada deja la estación en falla cerrada, con el error en el log, en lugar de detener el proceso.
