@@ -44,8 +44,19 @@ public sealed class PrinterHostedService(
 
         await new SenderRecovery(new Txr0Recovery(db), clock, metrics, loggers.CreateLogger<SenderRecovery>()).RecoverAsync(options.PrinterId, stoppingToken);
 
-        await using var transport = new TcpPrinterTransport(options.Transport, clock.TimeProvider);
+        // Sin su fila de PrinterSendOrder, el sender no arranca (regla 13; ARQUITECTURA_TECNICA, arranque, paso 5).
+        if (await new PrinterSendOrderStore(db).GetAsync(options.PrinterId, stoppingToken) is null)
+        {
+            logger.LogCritical("La impresora {Printer} no tiene fila en PrinterSendOrder: su sender no arranca", options.PrinterId);
+            return;
+        }
+
+        // La evidencia que quedó registrada sin aplicar (por ejemplo, durante un SENDING que TX-R0 acaba de cerrar) se
+        // aplica ahora, en orden.
         var evidence = new EvidenceService(new TxdEvidence(db), db, clock, metrics);
+        await evidence.ReapplyOpenAsync(options.PrinterId, stoppingToken);
+
+        await using var transport = new TcpPrinterTransport(options.Transport, clock.TimeProvider);
         var sender = new PrinterSenderService(options.PrinterId, db, new ClaimService(db, new TxbClaim(db), metrics, clock, services.GetService<ClockGuard>() ?? new ClockGuard(clock)), new TxcWriteResult(db),
             new StationConfigStore(db), lease, transport, clock, metrics, logger: loggers.CreateLogger<PrinterSenderService>(), evidence: evidence);
         await sender.RunAsync(TimeSpan.FromMilliseconds(options.PollIntervalMs), clock.TimeProvider, null, stoppingToken);
