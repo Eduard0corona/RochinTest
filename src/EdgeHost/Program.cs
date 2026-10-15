@@ -112,4 +112,6 @@ if (operations is { OperatorKeySha256.Count: > 0 })
     app.MapOperations();
 }
 await app.RunAsync();
-return 0;
+
+// 0, o el código que fijó un módulo que detuvo el host por una falla (por ejemplo, el sender sin TX-C posible).
+return Environment.ExitCode;

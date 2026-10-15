@@ -9,9 +9,9 @@ namespace CartonPrinting.EdgeHost;
 /// construirse; el host construye todos los servicios alojados antes de arrancar el primero, así que cuando este
 /// servicio arranca ya están todos.
 /// </summary>
-public sealed class StartupHostedService(StartupCoordinator startup) : BackgroundService
+public sealed class StartupHostedService(StartupCoordinator startup, ILogger<StartupCoordinator> logger) : BackgroundService
 {
-    protected override Task ExecuteAsync(CancellationToken stoppingToken) => startup.RunAsync(stoppingToken);
+    protected override Task ExecuteAsync(CancellationToken stoppingToken) => startup.RunAsync(stoppingToken, logger);
 }
 
 /// <summary>Reingreso de registros retenidos por la Operations API, con la ingesta de la estación de este EdgeHost.</summary>

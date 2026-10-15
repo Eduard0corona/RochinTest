@@ -34,8 +34,10 @@ public sealed partial class PrinterOsLock : IDisposable
         {
             return new PrinterOsLock(new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None));
         }
-        catch (IOException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
+            // Otro proceso lo tiene abierto, o el archivo lo creó otra cuenta sin permitir el acceso a esta: en los dos
+            // casos este proceso no es dueño de la impresora.
             return null;
         }
     }
@@ -86,13 +88,28 @@ public sealed class PrinterOwnership(
         return Lease;
     }
 
-    /// <summary>Renueva el lease; si se pierde, cancela <paramref name="lost"/> para que el sender deje de reclamar.</summary>
+    /// <summary>
+    /// Renueva el lease; si se pierde, cancela <paramref name="lost"/> para que el sender deje de reclamar. Una renovación que
+    /// falla (por ejemplo, SQL Server no responde) cuenta como lease perdido: sin ella, el lease vencería con el sender vivo y
+    /// cada claim se rechazaría en silencio (revisión de la Fase 5, A2). El ciclo de propiedad vuelve a tomar la impresora
+    /// y ejecuta TX-R0 antes de enviar.
+    /// </summary>
     public async Task RenewAsync(CancellationTokenSource lost, CancellationToken ct)
     {
         while (!ct.IsCancellationRequested && !lost.IsCancellationRequested)
         {
             await Task.Delay(TimeSpan.FromMilliseconds(leaseDurationMs / 3.0), clock.TimeProvider, ct);
-            var renewed = await leases.AcquireAsync(printerId, ownerInstanceId, ownerHost, leaseDurationMs, leaseGraceMs, clock.UtcNow, ct);
+            LeaseGrant? renewed;
+            try
+            {
+                renewed = await leases.AcquireAsync(printerId, ownerInstanceId, ownerHost, leaseDurationMs, leaseGraceMs, clock.UtcNow, ct);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                _logger.LogError(ex, "Impresora {Printer}: no se pudo renovar el lease", printerId);
+                renewed = null;
+            }
+
             if (renewed is null || renewed.FencingToken != Lease?.FencingToken)
             {
                 metrics.Increment(MetricNames.PrinterOwnerConflicts, ("printer", printerId), ("cause", "lease_lost"));
@@ -102,6 +119,19 @@ public sealed class PrinterOwnership(
             }
 
             Lease = renewed;
+        }
+    }
+
+    /// <summary>
+    /// Al detener el proceso, libera el lease (lo deja vencido) para que la instancia siguiente no espere a que venza: sin
+    /// esto, cada reinicio retrasaría el arranque la duración del lease más la gracia (revisión de la Fase 5, A1).
+    /// </summary>
+    public async Task ReleaseAsync(CancellationToken ct)
+    {
+        if (Lease is { } lease)
+        {
+            await leases.ReleaseAsync(printerId, ownerInstanceId, lease.FencingToken, leaseGraceMs, clock.UtcNow, ct);
+            Lease = null;
         }
     }
 
@@ -131,8 +161,52 @@ public sealed class OwnedPrinterRunner(PrinterOwnership ownership, SenderRecover
         return _owned;
     }
 
-    /// <summary>TX-R0 de la impresora, solo si este proceso es su dueño.</summary>
-    public Task RecoverAsync(CancellationToken ct) => _owned ? recovery.RecoverAsync(ownership.PrinterId, ct) : Task.CompletedTask;
+    /// <summary>
+    /// Etapa 2 del arranque para la impresora de línea: falla mientras otro proceso o instancia sea su dueño, para que el
+    /// arranque la reintente (con una alerta por intento) y no siga a la suscripción ni a LabelingReady sin la impresora y
+    /// sin TX-R0 (revisión de la Fase 5, A1).
+    /// </summary>
+    public async Task AcquireOrFailAsync(CancellationToken ct)
+    {
+        if (!await AcquireAsync(ct))
+        {
+            throw new InvalidOperationException($"La impresora {ownership.PrinterId} tiene otro dueño: el arranque no sigue sin ella.");
+        }
+    }
+
+    /// <summary>
+    /// TX-R0 de la impresora, solo si este proceso es su dueño. Antes renueva el lease: si la etapa se reintentó después de
+    /// que venciera y otra instancia lo tomó, TX-R0 cerraría el intento en curso de esa instancia (revisión de la Fase 5).
+    /// </summary>
+    public async Task RecoverAsync(CancellationToken ct)
+    {
+        if (!_owned)
+        {
+            return;
+        }
+
+        if (!await AcquireAsync(ct))
+        {
+            throw new InvalidOperationException($"La impresora {ownership.PrinterId} cambió de dueño antes de TX-R0.");
+        }
+
+        await recovery.RecoverAsync(ownership.PrinterId, ct);
+    }
+
+    /// <summary>Libera el lease al detener el proceso; un error solo se registra (el lease vencerá solo).</summary>
+    public async Task ReleaseAsync()
+    {
+        _owned = false;
+        try
+        {
+            using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+            await ownership.ReleaseAsync(limit.Token);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Impresora {Printer}: no se pudo liberar el lease; vencerá solo", ownership.PrinterId);
+        }
+    }
 
     public async Task RunAsync(Func<LeaseGrant, CancellationToken, Task> runSender, CancellationToken ct)
     {
@@ -141,12 +215,22 @@ public sealed class OwnedPrinterRunner(PrinterOwnership ownership, SenderRecover
             if (!_owned)
             {
                 await Task.Delay(TimeSpan.FromMilliseconds(ownership.LeaseDurationMs), clock.TimeProvider, ct);
-                if (!await AcquireAsync(ct))
+                try
                 {
+                    if (!await AcquireAsync(ct))
+                    {
+                        continue;
+                    }
+
+                    await recovery.RecoverAsync(ownership.PrinterId, ct);
+                }
+                catch (Exception ex) when (!ct.IsCancellationRequested)
+                {
+                    // Por ejemplo, SQL Server no responde: sin propiedad ni TX-R0 no se envía nada, y se vuelve a intentar.
+                    _owned = false;
+                    _logger.LogError(ex, "Impresora {Printer}: no se pudo volver a tomar la impresora; se reintenta", ownership.PrinterId);
                     continue;
                 }
-
-                await recovery.RecoverAsync(ownership.PrinterId, ct);
             }
 
             using var lost = CancellationTokenSource.CreateLinkedTokenSource(ct);

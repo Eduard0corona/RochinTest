@@ -96,6 +96,9 @@ public sealed class ReprintTests(SqlServerFixture sql) : IAsyncLifetime
         var unbacked = await s.FailsAsync("UPDATE dbo.PrintJob SET Status = 'CONFIRMED', Reason = NULL, ResultVersion = ResultVersion + 1 WHERE PrintJobId = @id",
             c => c.Parameters.AddWithValue("@id", job), "EXCEPTION", Ct);
         Assert.Equal(51012, unbacked.Number);   // TR_PrintJob_StateMachine: X01 sin intento excepcional que lo respalde
+        var resend = await s.FailsAsync("UPDATE dbo.PrintJob SET Status = 'SENDING', Reason = NULL WHERE PrintJobId = @id",
+            c => c.Parameters.AddWithValue("@id", job), ct: Ct);
+        Assert.Equal(51012, resend.Number);   // TR_PrintJob_StateMachine: UNKNOWN → SENDING está prohibido (I03)
 
         var (approved, body) = await ApproveAsync(ops, request);
         Assert.Equal(201, approved);
@@ -123,7 +126,8 @@ public sealed class ReprintTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Equal(("CONFIRMED", authorization, "ACCEPTED", OperationsHost.Supervisor), (result.GetProperty("outcome").GetString(),
             exceptional.GetProperty("authorizationId").GetInt64(), exceptional.GetProperty("duplicateRisk").GetString(),
             exceptional.GetProperty("approvedBy").GetString()));
-        Assert.Equal(1, s.Metrics.Total(MetricNames.ExceptionalReprints, ("risk", "ACCEPTED")));
+        Assert.Equal(1, s.Metrics.Total(MetricNames.ExceptionalReprints, ("risk", "ACCEPTED"), ("result", "EXECUTED")));
+        Assert.Equal(1, await s.CountAsync("FROM dbo.PrintJob WHERE DetectionId = @d", c => c.Parameters.AddWithValue("@d", row.DetectionId), Ct));   // ningún job nuevo
     }
 
     /// <summary>
@@ -184,6 +188,14 @@ public sealed class ReprintTests(SqlServerFixture sql) : IAsyncLifetime
         var reprint = (await s.AttemptsAsync(job, Ct)).Single(a => a.Kind == AttemptKind.ExceptionalReprint);
         Assert.Equal((s.ManualPrinterId, AttemptOutcome.Transmitted), (reprint.PrinterId, reprint.Outcome));
         Assert.Equal(1, rig.Printer.TransmissionsOf(serial));
+        var reused = await s.FailsAsync("""
+            INSERT INTO dbo.PrintAttempt (AttemptId, PrintJobId, AttemptNumber, Kind, AuthorizationId, PrinterId, OwnerInstanceId, LeaseToken,
+                Outcome, MayHaveSent, AttemptPayloadHash, ClaimedAt)
+            SELECT NEWID(), pa.PrintJobId, 99, 'EXCEPTIONAL_REPRINT', pa.AuthorizationId, pa.PrinterId, N'x', 1, 'NOT_SENT', 0, pa.AttemptPayloadHash, SYSUTCDATETIME()
+            FROM dbo.PrintAttempt AS pa WHERE pa.AttemptId = @a
+            """, c => c.Parameters.AddWithValue("@a", reprint.AttemptId), "EXCEPTION", Ct);
+        Assert.Equal(2601, reused.Number);   // UX_PrintAttempt_Authorization: ninguna autorización se usa dos veces
+        Assert.Contains("UX_PrintAttempt_Authorization", reused.Message, StringComparison.Ordinal);
         Assert.Equal(new[] { ("EXPIRED", toExpire), ("REVOKED", toRevoke), ("EXECUTED", toExecute) }.OrderBy(x => x.Item2),
             (await s.QueryAsync("SELECT Status, AuthorizationId FROM dbo.ReprintAuthorization WHERE PrintJobId = @id ORDER BY AuthorizationId",
                 c => c.Parameters.AddWithValue("@id", job), r => (r.GetString(0), r.GetInt64(1)), Ct)));
@@ -203,7 +215,7 @@ public sealed class ReprintTests(SqlServerFixture sql) : IAsyncLifetime
         var result = LastResult(await s.ResultsAsync(job, Ct));
         Assert.Equal(("CONFIRMED", "REPLACES_EXISTING_LABEL"), (result.GetProperty("outcome").GetString(),
             result.GetProperty("exceptionalReprint").GetProperty("duplicateRisk").GetString()));
-        Assert.Equal(1, s.Metrics.Total(MetricNames.ExceptionalReprints, ("risk", "REPLACES_EXISTING_LABEL")));
+        Assert.Equal(1, s.Metrics.Total(MetricNames.ExceptionalReprints, ("risk", "REPLACES_EXISTING_LABEL"), ("result", "EXECUTED")));
 
         // La autorización de otro job y la impresora de línea como destino.
         var other = await s.ReadyJobAsync(831, Ct);
@@ -278,6 +290,70 @@ public sealed class ReprintTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Equal(AttemptOutcome.Confirmed, (await s.AttemptsAsync(job, Ct)).Single(a => a.Kind == AttemptKind.ExceptionalReprint).Outcome);
         Assert.Equal("CONFIRMED", LastResult(await s.ResultsAsync(job, Ct)).GetProperty("outcome").GetString());
         Assert.Equal(1, rig.Printer.TransmissionsOf(serial));   // una etiqueta de reimpresión, en la impresora manual
+    }
+
+    /// <summary>
+    /// Revisión de la Fase 5, M3: una autorización que TX-X rechaza (LABEL_DAMAGED sin el retiro registrado) no bloquea a la
+    /// aprobada después para otro job, que se ejecuta en la vuelta siguiente; la rechazada se vuelve a intentar pasada la
+    /// espera y, ya con el retiro registrado, se ejecuta. El riesgo de duplicado sale de TX-X.
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T41")]
+    public async Task A_rejected_authorization_does_not_block_the_ones_approved_after_it()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        await using var ops = await OperationsHost.StartAsync(s, Ct);
+        await using var rig = ManualRig.Create(s);
+        var (damaged, _) = await s.TransmittedJobAsync(850, Ct);
+        await s.EvidenceAsync(s.Verified(850, (await s.JobAsync(damaged, Ct)).LabelSerial), Ct);
+        var blocked = await AuthorizeAsync(ops, damaged, "LABEL_DAMAGED", "REPLACES_EXISTING_LABEL");
+        var (uncertain, _) = await s.UnknownJobAsync(851, Ct);
+        var next = await AuthorizeAsync(ops, uncertain, "UNKNOWN_NOT_RESOLVED", "ACCEPTED");
+
+        var first = (await rig.Sender.ExecuteNextAsync(Ct))!;
+        Assert.Equal((blocked, (ReprintExecution?)null), (first.AuthorizationId, first.Execution));
+        var second = (await rig.Sender.ExecuteNextAsync(Ct))!;
+        Assert.Equal((next, true, "ACCEPTED"), (second.AuthorizationId, second.WriteInvoked, second.Execution!.DuplicateRisk));
+        Assert.Equal(1, rig.Printer.TransmissionsOf((await s.JobAsync(uncertain, Ct)).LabelSerial));
+        Assert.Null(await rig.Sender.ExecuteNextAsync(Ct));   // la rechazada espera
+
+        using (var auditor = ops.As(OperationsHost.Auditor))
+        {
+            Assert.Equal(200, (await auditor.CallAsync($"api/ops/reprints/{blocked}/original-label-removed", null, Ct)).Status);
+        }
+
+        s.AdvanceMs(ManualReprintSender.RejectedRetryDelay.TotalMilliseconds + 1);
+        var retried = (await rig.Sender.ExecuteNextAsync(Ct))!;
+        Assert.Equal((blocked, true), (retried.AuthorizationId, retried.WriteInvoked));
+        Assert.Equal(1, s.Metrics.Total(MetricNames.ExceptionalReprints, ("risk", "REPLACES_EXISTING_LABEL"), ("result", "EXECUTED")));
+        Assert.Equal(1, s.Metrics.Total(MetricNames.ExceptionalReprints, ("risk", "ACCEPTED"), ("result", "EXECUTED")));
+    }
+
+    /// <summary>
+    /// Revisión de la Fase 5, M4 (regla 12, I02, en el sender manual): la impresora manual corta el canal a mitad de la
+    /// reimpresión. La escritura se invocó: intento UNKNOWN y, en la misma TX-C, X03 (job UNKNOWN con
+    /// EXCEPTIONAL_REPRINT_UNRESOLVED), nunca NOT_SENT; ningún reintento.
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T43")]
+    public async Task A_reprint_cut_mid_write_is_unknown_and_unresolved_never_not_sent()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        await using var ops = await OperationsHost.StartAsync(s, Ct);
+        await using var rig = ManualRig.Create(s);
+        var (job, _) = await s.UnknownJobAsync(870, Ct);
+        var authorization = await AuthorizeAsync(ops, job, "UNKNOWN_NOT_RESOLVED", "ACCEPTED");
+        rig.Printer.Mode = PrinterMode.CutMidWrite;
+
+        var executed = await rig.Sender.ExecuteAsync(authorization, Ct);
+        Assert.True(executed.WriteInvoked);
+        Assert.Equal(AttemptOutcome.Unknown, executed.Write!.AttemptOutcome);
+        Assert.Equal(AttemptOutcome.Unknown, (await s.AttemptsAsync(job, Ct)).Single(a => a.Kind == AttemptKind.ExceptionalReprint).Outcome);
+        var row = await s.JobAsync(job, Ct);
+        Assert.Equal((JobStatus.Unknown, JobReason.ExceptionalReprintUnresolved), (row.Status, row.Reason));
+        Assert.Equal(1, s.Metrics.Total(MetricNames.ExceptionalReprints, ("result", "UNRESOLVED")));
+        Assert.Empty(rig.Printer.Received);
+        Assert.Null(await rig.Sender.ExecuteNextAsync(Ct));   // EXECUTED: no se reintenta
     }
 
     /// <summary>Sender de la impresora manual con su lease, su impresora simulada y la evidencia.</summary>

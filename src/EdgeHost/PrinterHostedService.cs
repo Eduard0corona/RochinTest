@@ -64,12 +64,16 @@ public sealed class PrinterHostedService : BackgroundService
         _startup = startup;
         _clockGuard = stationClockGuard ?? new ClockGuard(clock);
         _logger = loggers.CreateLogger<PrinterHostedService>();
-        _ownership = new PrinterOwnership(options.PrinterId, $"{Environment.MachineName}:{Environment.ProcessId}", Environment.MachineName,
+        // Único por arranque: dos contenedores con el mismo nombre de host y el mismo PID no son el mismo dueño.
+        _ownership = new PrinterOwnership(options.PrinterId, $"{Environment.MachineName}:{Environment.ProcessId}:{Guid.NewGuid():N}", Environment.MachineName,
             new PrinterLeaseStore(db), clock, metrics, options.LeaseDurationMs, options.LeaseGraceMs, loggers.CreateLogger<PrinterOwnership>());
         _runner = new OwnedPrinterRunner(_ownership, new SenderRecovery(new Txr0Recovery(db), clock, metrics, loggers.CreateLogger<SenderRecovery>()),
             clock, loggers.CreateLogger<OwnedPrinterRunner>());
 
-        startup.Add(StartupStage.Ownership, $"lock y lease de {options.PrinterId}", _runner.AcquireAsync);
+        // Sin la impresora de línea el arranque no sigue (se reintenta); la manual no detiene la estación: la toma el ciclo
+        // de propiedad, con TX-R0, antes de su primera reimpresión.
+        startup.Add(StartupStage.Ownership, $"lock y lease de {options.PrinterId}",
+            role == PrinterRole.Line ? _runner.AcquireOrFailAsync : _runner.AcquireAsync);
         startup.Add(StartupStage.SendingRecovered, $"TX-R0 de {options.PrinterId}", _runner.RecoverAsync);
         startup.Add(StartupStage.DeviceQueue, $"cola de {options.PrinterId}", _ =>
         {
@@ -83,8 +87,23 @@ public sealed class PrinterHostedService : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        await _startup.WhenReached(StartupStage.Swept).WaitAsync(stoppingToken);
-        await _runner.RunAsync(RunSenderAsync, stoppingToken);
+        try
+        {
+            await _startup.WhenReached(StartupStage.Swept).WaitAsync(stoppingToken);
+            await _runner.RunAsync(RunSenderAsync, stoppingToken);
+        }
+        catch (SenderHaltedException)
+        {
+            // El host se detiene con un código distinto de 0, para que el supervisor lo relance y el arranque siguiente
+            // ejecute TX-R0 (segunda revisión de la Fase 4, B-3).
+            Environment.ExitCode = 70;
+            throw;
+        }
+        finally
+        {
+            // Ya no hay envío en curso: el lease queda libre para la instancia siguiente.
+            await _runner.ReleaseAsync();
+        }
     }
 
     private async Task RunSenderAsync(LeaseGrant lease, CancellationToken ct)

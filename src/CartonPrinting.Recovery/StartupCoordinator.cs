@@ -40,7 +40,7 @@ public enum StartupStage
 /// </summary>
 public sealed class StartupCoordinator(TimeProvider time, ILogger<StartupCoordinator>? logger = null)
 {
-    private readonly ILogger _logger = logger ?? NullLogger<StartupCoordinator>.Instance;
+    private ILogger _logger = logger ?? NullLogger<StartupCoordinator>.Instance;
     private readonly object _gate = new();
     private readonly List<(StartupStage Stage, string Name, Func<CancellationToken, Task> Run)> _steps = [];
     private readonly Dictionary<StartupStage, TaskCompletionSource> _reached =
@@ -62,6 +62,9 @@ public sealed class StartupCoordinator(TimeProvider time, ILogger<StartupCoordin
 
     public TimeSpan MaxBackoff { get; init; } = TimeSpan.FromSeconds(30);
 
+    /// <summary>Pasos que fallaron (cada reintento cuenta), como "etapa:nombre".</summary>
+    public int Failures { get; private set; }
+
     public void Add(StartupStage stage, string name, Func<CancellationToken, Task> step)
     {
         lock (_gate)
@@ -78,8 +81,17 @@ public sealed class StartupCoordinator(TimeProvider time, ILogger<StartupCoordin
     /// <summary>Se completa cuando terminaron todos los pasos de la etapa (y de las anteriores).</summary>
     public Task WhenReached(StartupStage stage) => _reached[stage].Task;
 
-    public async Task RunAsync(CancellationToken ct)
+    /// <summary>
+    /// Ejecuta las etapas. El EdgeHost crea el coordinador antes de tener sus servicios, así que pasa aquí su logger: sin él,
+    /// los fallos del arranque no quedarían en ningún registro (revisión de la Fase 5, M1).
+    /// </summary>
+    public async Task RunAsync(CancellationToken ct, ILogger? logger = null)
     {
+        if (logger is not null)
+        {
+            _logger = logger;
+        }
+
         List<(StartupStage Stage, string Name, Func<CancellationToken, Task> Run)> steps;
         lock (_gate)
         {
@@ -107,6 +119,7 @@ public sealed class StartupCoordinator(TimeProvider time, ILogger<StartupCoordin
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
                 {
+                    Failures++;
                     _logger.LogError(ex, "Arranque: falló {Stage}:{Step}; se reintenta en {Backoff} sin pasar a la etapa siguiente", stage, step.Name, backoff);
                     await Task.Delay(backoff, time, ct);
                     backoff = TimeSpan.FromTicks(Math.Min(backoff.Ticks * 2, MaxBackoff.Ticks));
