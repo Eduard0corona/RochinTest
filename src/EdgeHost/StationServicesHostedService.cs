@@ -1,25 +1,53 @@
 using CartonPrinting.ErpSync;
 using CartonPrinting.Infrastructure.Time;
 using CartonPrinting.Orchestration;
+using CartonPrinting.Recovery;
 
 namespace CartonPrinting.EdgeHost;
 
 /// <summary>
 /// Servicios por estación que no son la ingesta: sincronización ERP (sondeo con señal de la ingesta) y
 /// barrido TX-S. Corren en paralelo y fuera del camino de ingesta; un error en una pasada se registra y
-/// se reintenta en la siguiente.
+/// se reintenta en la siguiente. En el arranque ordenado, el primer barrido es la etapa 6 y los bucles empiezan
+/// después de ella.
 /// </summary>
-public sealed class StationServicesHostedService(StationSweepService sweep, ErpSnapshotSync? erp, TimeSpan sweepInterval, TimeProvider time) : BackgroundService
+public sealed class StationServicesHostedService : BackgroundService
 {
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    private readonly StationSweepService _sweep;
+    private readonly ErpSnapshotSync? _erp;
+    private readonly TimeSpan _sweepInterval;
+    private readonly TimeProvider _time;
+    private readonly StartupCoordinator? _startup;
+
+    public StationServicesHostedService(
+        StationSweepService sweep, ErpSnapshotSync? erp, TimeSpan sweepInterval, TimeProvider time, StartupCoordinator? startup = null, string? stationId = null)
     {
+        _sweep = sweep;
+        _erp = erp;
+        _sweepInterval = sweepInterval;
+        _time = time;
+        _startup = startup;
+        startup?.Add(StartupStage.Swept, $"barrido de {stationId}", sweep.SweepOnceAsync);
+    }
+
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        if (_startup is not null)
+        {
+            await _startup.WhenReached(StartupStage.Swept).WaitAsync(stoppingToken);
+        }
+
+        var sweep = _sweep;
+        var erp = _erp;
+        var sweepInterval = _sweepInterval;
+        var time = _time;
         var tasks = new List<Task> { sweep.RunAsync(sweepInterval, time, stoppingToken) };
         if (erp is not null)
         {
             tasks.Add(erp.RunAsync(time, stoppingToken));
         }
 
-        return Task.WhenAll(tasks);
+        await Task.WhenAll(tasks);
     }
 }
 
@@ -62,6 +90,7 @@ public static class StationComposition
         }
 
         services.AddHostedService(sp => new StationServicesHostedService(sp.GetRequiredService<StationSweepService>(), sp.GetService<ErpSnapshotSync>(),
-            TimeSpan.FromMilliseconds(ingest.SweepIntervalMs), sp.GetRequiredService<EdgeClock>().TimeProvider));
+            TimeSpan.FromMilliseconds(ingest.SweepIntervalMs), sp.GetRequiredService<EdgeClock>().TimeProvider, sp.GetService<StartupCoordinator>(),
+            ingest.StationId));
     }
 }

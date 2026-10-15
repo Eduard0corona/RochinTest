@@ -3,10 +3,11 @@ using CartonPrinting.Infrastructure.Observability;
 using CartonPrinting.Infrastructure.Time;
 using CartonPrinting.Infrastructure.Transactions;
 using CartonPrinting.PrintAgent;
+using CartonPrinting.Recovery;
 
 namespace CartonPrinting.EdgeHost;
 
-/// <summary>Configuración del sender de la impresora de línea (sección "Printer").</summary>
+/// <summary>Configuración de una impresora (secciones "Printer" y "ManualPrinter").</summary>
 public sealed class PrinterHostOptions
 {
     public string PrinterId { get; set; } = string.Empty;
@@ -20,34 +21,136 @@ public sealed class PrinterHostOptions
     public int PollIntervalMs { get; set; } = 50;
 }
 
-/// <summary>
-/// Sender único de la impresora de línea en el EdgeHost (Fase 4): toma el lease, ejecuta la recuperación de
-/// arranque (TX-R0) antes de enviar nada y después envía en orden. El lock de sistema operativo, la renovación
-/// del lease y la parada ante su pérdida llegan en la Fase 5 (propiedad de la impresora). El claim comparte el
-/// ClockGuard de la estación con el barrido (CLOCK_JUMP).
-/// </summary>
-public sealed class PrinterHostedService(
-    PrinterHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers, IServiceProvider services) : BackgroundService
+/// <summary>Impresora de línea (envíos ordinarios) o manual (reimpresiones excepcionales autorizadas).</summary>
+public enum PrinterRole
 {
+    Line,
+    Manual,
+}
+
+/// <summary>
+/// Dueño y sender único de una impresora en el EdgeHost (I11, ADR 0010). En el arranque ordenado toma el lock de
+/// sistema operativo y el lease (etapa 2), ejecuta TX-R0 (etapa 3) y, sin una capacidad confirmada de vaciar la
+/// cola del dispositivo (OT-07), lo registra (etapa 4). Envía solo después del barrido inicial (etapa 6) y solo
+/// mientras tiene el lock y el lease: sin ellos, cero envíos y una alerta por intento
+/// (<c>printer_owner_conflicts_total</c>); si el lease se pierde, el sender se detiene y vuelve a intentar tomar la
+/// impresora, con TX-R0 otra vez antes de enviar. La impresora de línea comparte el ClockGuard de la estación con
+/// el barrido; la manual ejecuta TX-X por la misma conexión única.
+/// </summary>
+public sealed class PrinterHostedService : BackgroundService
+{
+    private readonly PrinterRole _role;
+    private readonly PrinterHostOptions _options;
+    private readonly SqlDb _db;
+    private readonly EdgeClock _clock;
+    private readonly CartonMetrics _metrics;
+    private readonly ILoggerFactory _loggers;
+    private readonly StartupCoordinator _startup;
+    private readonly ClockGuard _clockGuard;
+    private readonly PrinterOwnership _ownership;
+    private readonly SenderRecovery _recovery;
+    private readonly ILogger _logger;
+    private volatile bool _owned;
+
+    public PrinterHostedService(
+        PrinterRole role, PrinterHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers, StartupCoordinator startup,
+        ClockGuard? stationClockGuard = null)
+    {
+        _role = role;
+        _options = options;
+        _db = db;
+        _clock = clock;
+        _metrics = metrics;
+        _loggers = loggers;
+        _startup = startup;
+        _clockGuard = stationClockGuard ?? new ClockGuard(clock);
+        _logger = loggers.CreateLogger<PrinterHostedService>();
+        _ownership = new PrinterOwnership(options.PrinterId, $"{Environment.MachineName}:{Environment.ProcessId}", Environment.MachineName,
+            new PrinterLeaseStore(db), clock, metrics, options.LeaseDurationMs, options.LeaseGraceMs, loggers.CreateLogger<PrinterOwnership>());
+        _recovery = new SenderRecovery(new Txr0Recovery(db), clock, metrics, loggers.CreateLogger<SenderRecovery>());
+
+        startup.Add(StartupStage.Ownership, $"lock y lease de {options.PrinterId}", async ct => _owned = await _ownership.TryAcquireAsync(ct) is not null);
+        startup.Add(StartupStage.SendingRecovered, $"TX-R0 de {options.PrinterId}", async ct =>
+        {
+            if (_owned)
+            {
+                await _recovery.RecoverAsync(options.PrinterId, ct);
+            }
+        });
+        startup.Add(StartupStage.DeviceQueue, $"cola de {options.PrinterId}", _ =>
+        {
+            _logger.LogInformation("Impresora {Printer}: sin capacidad confirmada de vaciar la cola del dispositivo (OT-07); no se vacía", options.PrinterId);
+            return Task.CompletedTask;
+        });
+    }
+
+    /// <summary>Este proceso es dueño de la impresora (lock y lease).</summary>
+    public bool Owned => _owned;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var logger = loggers.CreateLogger<PrinterHostedService>();
-        var owner = $"{Environment.MachineName}:{Environment.ProcessId}";
-        var leases = new PrinterLeaseStore(db);
-        LeaseGrant? lease;
-        while ((lease = await leases.AcquireAsync(options.PrinterId, owner, Environment.MachineName, options.LeaseDurationMs, options.LeaseGraceMs,
-                   clock.UtcNow, stoppingToken)) is null)
+        await _startup.WhenReached(StartupStage.Swept).WaitAsync(stoppingToken);
+        while (!stoppingToken.IsCancellationRequested)
         {
-            logger.LogWarning("La impresora {Printer} tiene otro propietario vigente; este EdgeHost no envía", options.PrinterId);
-            await Task.Delay(TimeSpan.FromMilliseconds(options.LeaseDurationMs), clock.TimeProvider, stoppingToken);
+            if (!_owned)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(_options.LeaseDurationMs), _clock.TimeProvider, stoppingToken);
+                if (await _ownership.TryAcquireAsync(stoppingToken) is null)
+                {
+                    continue;
+                }
+
+                await _recovery.RecoverAsync(_options.PrinterId, stoppingToken);
+                _owned = true;
+            }
+
+            using var lost = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            var renewal = _ownership.RenewAsync(lost, stoppingToken);
+            try
+            {
+                await RunSenderAsync(_ownership.Lease!, lost.Token);
+            }
+            catch (OperationCanceledException) when (lost.IsCancellationRequested && !stoppingToken.IsCancellationRequested)
+            {
+                _logger.LogError("Impresora {Printer}: lease perdido; el sender se detuvo y no envía hasta volver a tomarla", _options.PrinterId);
+            }
+
+            _owned = false;
+            await lost.CancelAsync();
+            try
+            {
+                await renewal;
+            }
+            catch (OperationCanceledException)
+            {
+                // Detención o lease perdido.
+            }
         }
+    }
 
-        await new SenderRecovery(new Txr0Recovery(db), clock, metrics, loggers.CreateLogger<SenderRecovery>()).RecoverAsync(options.PrinterId, stoppingToken);
+    private async Task RunSenderAsync(LeaseGrant lease, CancellationToken ct)
+    {
+        await using var transport = new TcpPrinterTransport(_options.Transport, _clock.TimeProvider);
+        var evidence = new EvidenceService(new TxdEvidence(_db), _db, _clock, _metrics);
+        var poll = TimeSpan.FromMilliseconds(_options.PollIntervalMs);
+        if (_role == PrinterRole.Line)
+        {
+            var sender = new PrinterSenderService(_options.PrinterId, _db, new ClaimService(_db, new TxbClaim(_db), _metrics, _clock, _clockGuard),
+                new TxcWriteResult(_db), new StationConfigStore(_db), lease, transport, _clock, _metrics,
+                logger: _loggers.CreateLogger<PrinterSenderService>(), evidence: evidence);
+            await sender.RunAsync(poll, _clock.TimeProvider, null, ct);
+        }
+        else
+        {
+            var sender = new ManualReprintSender(_options.PrinterId, _db, new TxxReprint(_db), new TxcWriteResult(_db), lease, transport, _clock, _metrics,
+                evidence: evidence, logger: _loggers.CreateLogger<ManualReprintSender>());
+            await sender.RunAsync(poll, _clock.TimeProvider, ct);
+        }
+    }
 
-        await using var transport = new TcpPrinterTransport(options.Transport, clock.TimeProvider);
-        var evidence = new EvidenceService(new TxdEvidence(db), db, clock, metrics);
-        var sender = new PrinterSenderService(options.PrinterId, db, new ClaimService(db, new TxbClaim(db), metrics, clock, services.GetService<ClockGuard>() ?? new ClockGuard(clock)), new TxcWriteResult(db),
-            new StationConfigStore(db), lease, transport, clock, metrics, logger: loggers.CreateLogger<PrinterSenderService>(), evidence: evidence);
-        await sender.RunAsync(TimeSpan.FromMilliseconds(options.PollIntervalMs), clock.TimeProvider, null, stoppingToken);
+    public override void Dispose()
+    {
+        _ownership.Dispose();
+        base.Dispose();
     }
 }
