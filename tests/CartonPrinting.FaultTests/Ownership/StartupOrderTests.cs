@@ -30,9 +30,12 @@ public sealed class StartupOrderTests(SqlServerFixture sql) : IAsyncLifetime
     [Fact]
     public async Task Startup_recovers_and_sweeps_before_subscribing_and_raises_labeling_ready_last()
     {
-        var s = await StationScenario.CreateAsync(_db, ct: Ct, time: TimeProvider.System);
+        // Presupuesto largo para que la carga de la máquina no venza el claim del job que queda en SENDING; el job que
+        // debe vencer se registra con un DetectionTimestamp que le deja poco más de un segundo.
+        var s = await StationScenario.CreateAsync(_db, r => r with { TransitBudgetMs = 60_000 }, Ct, TimeProvider.System);
         var (sending, _) = await s.SendingJobAsync(600, Ct);   // la caída dejó este envío en SENDING
-        var expired = await s.ReadyJobAsync(601, Ct);
+        var registered = await s.RegisterAsync(s.Cycle(601, detectionTimestamp: DateTime.UtcNow.AddMilliseconds(-58_000)), ct: Ct);
+        var expired = registered.PrintJobId ?? throw new InvalidOperationException($"El ciclo 601 quedó {registered.FinalStatus}.");
         await Task.Delay((await s.JobAsync(expired, Ct)).DeadlineAt - DateTime.UtcNow + TimeSpan.FromMilliseconds(200), Ct);
 
         await using var h = await OpcHarness.StartAsync(s.StationId, new EdgeClock(TimeProvider.System));
