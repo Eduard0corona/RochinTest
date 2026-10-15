@@ -24,9 +24,10 @@ public sealed record ClaimOutcome(bool Claimed, Guid AttemptId, int AttemptNumbe
 /// <summary>
 /// Claim de un job por el sender de su impresora (TX-B). Si no obtiene fila, relee el job para saber
 /// por qué: si la causa es plazo u orden de envío aplica J03; otro sender o un reintento duplicado
-/// cuentan como conflicto. Nunca lanza por un claim perdido.
+/// cuentan como conflicto. Nunca lanza por un claim perdido. Con un <see cref="ClockGuard"/> de la
+/// estación, antes de evaluar el plazo comprueba que el reloj de pared no saltó (CLOCK_JUMP, T37).
 /// </summary>
-public sealed class ClaimService(SqlDb db, TxbClaim txb, CartonMetrics metrics, EdgeClock clock)
+public sealed class ClaimService(SqlDb db, TxbClaim txb, CartonMetrics metrics, EdgeClock clock, ClockGuard? clockGuard = null)
 {
     public async Task<JobContext?> LoadAsync(Guid printJobId, CancellationToken ct) =>
         await db.ReadAsync(async conn =>
@@ -59,6 +60,17 @@ public sealed class ClaimService(SqlDb db, TxbClaim txb, CartonMetrics metrics, 
         activity?.SetTag(CartonTelemetry.Tags.CorrelationId, context.Job.DetectionId);
         activity?.SetTag(CartonTelemetry.Tags.IdempotencyKey, context.Job.Identity.IdempotencyKey);
         activity?.SetTag(CartonTelemetry.Tags.LabelSerial, context.Job.LabelSerial);
+
+        if (clockGuard is not null
+            && await StationSweepService.ClockJumpedAsync(new StationConfigStore(db),
+                new StationSettings(context.Job.SiteId, context.Job.StationId, string.Empty, string.Empty), clockGuard, context.Active, clock, metrics,
+                Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance, ct))
+        {
+            // Ningún claim se evalúa con un reloj saltado.
+            metrics.Increment(MetricNames.ClaimRejected, ("cause", "clock_jump"));
+            activity?.SetTag("claimRejection", nameof(ClaimRejection.ClockJump));
+            return new ClaimOutcome(false, Guid.Empty, 0, ClaimRejection.ClockJump, context, clock.UtcNow);
+        }
 
         var now = clock.UtcNow;
         var request = new ClaimRequest(printJobId, Guid.NewGuid(), lease.OwnerInstanceId, lease.FencingToken, now,

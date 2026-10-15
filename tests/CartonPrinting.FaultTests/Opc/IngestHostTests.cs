@@ -32,7 +32,6 @@ public sealed class IngestHostTests(SqlServerFixture sql) : IAsyncLifetime
             StationId = s.StationId,
             LabelSerialPrefix = s.SerialPrefix,
             LabelingReadyIntervalMs = 100,
-            GapSweepIntervalMs = 200,
             Opc = new OpcIngestOptions
             {
                 EndpointUrl = $"opc.tcp://localhost:{h.ServerPort}/CartonPlc",

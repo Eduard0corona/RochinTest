@@ -1,0 +1,67 @@
+using CartonPrinting.ErpSync;
+using CartonPrinting.Infrastructure.Time;
+using CartonPrinting.Orchestration;
+
+namespace CartonPrinting.EdgeHost;
+
+/// <summary>
+/// Servicios por estación que no son la ingesta: sincronización ERP (sondeo con señal de la ingesta) y
+/// barrido TX-S. Corren en paralelo y fuera del camino de ingesta; un error en una pasada se registra y
+/// se reintenta en la siguiente.
+/// </summary>
+public sealed class StationServicesHostedService(StationSweepService sweep, ErpSnapshotSync? erp, TimeSpan sweepInterval) : BackgroundService
+{
+    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        var tasks = new List<Task> { sweep.RunAsync(sweepInterval, TimeProvider.System, stoppingToken) };
+        if (erp is not null)
+        {
+            tasks.Add(erp.RunAsync(TimeProvider.System, stoppingToken));
+        }
+
+        return Task.WhenAll(tasks);
+    }
+}
+
+/// <summary>Composición de los servicios de una estación a partir de la configuración.</summary>
+public static class StationComposition
+{
+    public static void AddStationServices(this IServiceCollection services, IConfiguration configuration)
+    {
+        var ingest = configuration.GetSection("Ingest").Get<CartonPrinting.OpcIngest.IngestHostOptions>();
+        if (string.IsNullOrWhiteSpace(ingest?.StationId))
+        {
+            return;
+        }
+
+        var station = new StationSettings(ingest.SiteId, ingest.StationId, ingest.LabelSerialPrefix, ingest.Opc.RecordNodeId);
+        services.AddSingleton(station);
+        services.AddSingleton(sp => new ClockGuard(sp.GetRequiredService<EdgeClock>()));
+        services.AddSingleton(sp => new StationSweepService(station, new CartonPrinting.Infrastructure.Transactions.TxsSweep(sp.GetRequiredService<CartonPrinting.Infrastructure.Data.SqlDb>()),
+            new CartonPrinting.Infrastructure.Data.StationConfigStore(sp.GetRequiredService<CartonPrinting.Infrastructure.Data.SqlDb>()), sp.GetRequiredService<ClockGuard>(),
+            sp.GetRequiredService<EdgeClock>(), sp.GetRequiredService<CartonPrinting.Infrastructure.Observability.CartonMetrics>(),
+            sp.GetRequiredService<ILogger<StationSweepService>>()));
+
+        var erpOptions = configuration.GetSection("ErpSync").Get<ErpSyncOptions>();
+        if (!string.IsNullOrWhiteSpace(erpOptions?.BaseUrl))
+        {
+            services.AddSingleton(erpOptions);
+            services.AddHttpClient<HttpErpClient>(http => http.BaseAddress = new Uri(erpOptions.BaseUrl));
+            services.AddSingleton(sp =>
+            {
+                var db = sp.GetRequiredService<CartonPrinting.Infrastructure.Data.SqlDb>();
+                var clock = sp.GetRequiredService<EdgeClock>();
+                var metrics = sp.GetRequiredService<CartonPrinting.Infrastructure.Observability.CartonMetrics>();
+                var stations = new CartonPrinting.Infrastructure.Data.StationConfigStore(db);
+                var arrivals = new ErpArrivalService(new CartonPrinting.Infrastructure.Transactions.TxeErpArrival(db), stations,
+                    new CartonPrinting.Infrastructure.Data.LabelSerialSource(db), station, clock, metrics);
+                return new ErpSnapshotSync(station, sp.GetRequiredService<HttpErpClient>(), db, new CartonPrinting.Infrastructure.Data.ErpCacheStore(db), arrivals,
+                    clock, metrics, erpOptions, sp.GetRequiredService<ILogger<ErpSnapshotSync>>());
+            });
+            services.AddSingleton<IErpDemand>(sp => sp.GetRequiredService<ErpSnapshotSync>());
+        }
+
+        services.AddHostedService(sp => new StationServicesHostedService(sp.GetRequiredService<StationSweepService>(), sp.GetService<ErpSnapshotSync>(),
+            TimeSpan.FromMilliseconds(ingest.SweepIntervalMs)));
+    }
+}

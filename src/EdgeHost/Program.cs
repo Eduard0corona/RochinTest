@@ -56,10 +56,15 @@ var ingest = builder.Configuration.GetSection("Ingest").Get<IngestHostOptions>()
 if (!string.IsNullOrWhiteSpace(ingest?.Opc.EndpointUrl))
 {
     builder.Services.AddSingleton(ingest);
-    builder.Services.AddHostedService<IngestHostedService>();
+    builder.Services.AddHostedService(sp => new IngestHostedService(ingest, sp.GetRequiredService<SqlDb>(), sp.GetRequiredService<EdgeClock>(),
+        sp.GetRequiredService<CartonMetrics>(), sp.GetRequiredService<ILoggerFactory>(), sp.GetService<CartonPrinting.Orchestration.IErpDemand>()));
 }
 
-// Los demás módulos (ERP, senders, recuperación, Operations API) se registran en sus fases.
+// Sincronización ERP y barrido TX-S de la estación (Fase 3): con la estación configurada en "Ingest";
+// el ERP solo con "ErpSync:BaseUrl".
+builder.Services.AddStationServices(builder.Configuration);
+
+// Los demás módulos (senders, recuperación, Operations API) se registran en sus fases.
 
 var app = builder.Build();
 app.MapHealthChecks("/health/live", new() { Predicate = _ => false });

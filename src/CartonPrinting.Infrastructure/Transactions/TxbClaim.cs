@@ -28,6 +28,9 @@ public enum ClaimRejection
     LeaseInvalid,
     MissingSendOrder,
     PrinterBusy,
+
+    /// <summary>El reloj de pared saltó: la estación se bloqueó con CLOCK_JUMP sin evaluar el claim.</summary>
+    ClockJump,
 }
 
 /// <summary>
