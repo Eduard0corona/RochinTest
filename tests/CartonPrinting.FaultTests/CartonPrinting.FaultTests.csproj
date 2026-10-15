@@ -23,6 +23,7 @@
     <ProjectReference Include="..\..\src\CartonPrinting.PrintAgent\CartonPrinting.PrintAgent.csproj" />
     <ProjectReference Include="..\..\src\CartonPrinting.Outbox\CartonPrinting.Outbox.csproj" />
     <ProjectReference Include="..\..\src\CartonPrinting.Simulators\CartonPrinting.Simulators.csproj" />
+    <ProjectReference Include="..\..\src\CartonPrinting.OpcIngest\CartonPrinting.OpcIngest.csproj" />
   </ItemGroup>
 
   <ItemGroup>
