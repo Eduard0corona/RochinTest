@@ -250,7 +250,7 @@
       "profile": "EXTENDIDO",
       "preconditions": "PLC con FIFO de ciclos.",
       "initialData": "Marca alta en el ciclo 1000.",
-      "injection": "Desconectar el gateway mientras pasan 20 cajas; reconectar.",
+      "injection": "Desconectar el gateway mientras pasan 20 cajas; reconectar cuando el registro actual ya es la caja siguiente (1021).",
       "expectedStates": "Hueco 1001-1020 OPEN; la FIFO entrega los 20 como RECOVERED y EXPIRED por LATE_ARRIVAL; hueco RECOVERED.",
       "publishedEvents": "20 CartonDetected y 20 PrintJobResult EXPIRED sin job.",
       "physicalEffects": "Ninguna impresión tardía.",
