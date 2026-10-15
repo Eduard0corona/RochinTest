@@ -80,7 +80,27 @@ public sealed class StationIngestService
     /// <summary>Reconstruye el estado de secuencia desde SQL (al arrancar y tras una acción manual sobre épocas).</summary>
     public async Task ReloadAsync(CancellationToken ct)
     {
+        await _serial.WaitAsync(ct);
+        try
+        {
+            await ReloadCoreAsync(ct);
+        }
+        finally
+        {
+            _serial.Release();
+        }
+    }
+
+    /// <summary>Recarga con el consumidor ya serializado. Cuenta las épocas confirmadas por una persona que aparecen.</summary>
+    private async Task ReloadCoreAsync(CancellationToken ct)
+    {
+        var known = _classifier.Epochs.Select(e => e.Epoch).ToHashSet();
         var epochs = await _sequence.LoadEpochsAsync(_station.SiteId, _station.StationId, ct);
+        foreach (var confirmed in epochs.Where(e => e.AcceptanceMode == PlcEpochStore.OperatorConfirmed && !known.Contains(e.Epoch) && known.Count > 0))
+        {
+            _metrics.Increment(MetricNames.PlcEpochChanges, ("mode", confirmed.AcceptanceMode));
+        }
+
         _classifier = new SequenceClassifier(epochs);
     }
 
@@ -134,27 +154,46 @@ public sealed class StationIngestService
 
         var (state, revision) = await _stations.GetActiveAsync(_station.SiteId, _station.StationId, ct)
             ?? throw new InvalidOperationException($"La estación {_station.SiteId}/{_station.StationId} no tiene StationConfig.");
-        _ = state;
 
+        // Un registro incoherente (campos de ciclos distintos) no alimenta el estado de secuencia: no acepta
+        // épocas, no mueve la marca alta ni abre huecos. Con su época ya aceptada queda BLOCKED con
+        // INCOHERENT_SNAPSHOT; con una época desconocida, se retiene y la estación se bloquea (falla cerrada).
+        if (!record.Coherent)
+        {
+            if (_classifier.Epochs.Any(e => e.Epoch == record.PlcEpoch))
+            {
+                var blocked = await _registration.RegisterAsync(record, _station, revision, SequenceDecision.InOrder, ct);
+                activity?.SetTag("sequence", "INCOHERENT");
+                return new IngestOutcome(IngestKind.Registered, record, null, blocked, blocked.AnomalyId);
+            }
+
+            var retainedId = await RetainAsync(record, revision, _clock.UtcNow, ct);
+            return new IngestOutcome(IngestKind.Retained, record, AnomalyId: retainedId);
+        }
+
+        var reloaded = false;
         for (var guard = 0; ; guard++)
         {
             var now = _clock.UtcNow;
             var verdict = _classifier.Classify(record, revision, now);
             switch (verdict)
             {
-                case SequenceVerdict.AcceptEpoch accept when guard == 0:
+                case SequenceVerdict.AcceptEpoch accept when guard < 2:
                     await AcceptEpochAsync(record, accept, revision, now, ct);
                     continue;
 
                 case SequenceVerdict.AcceptEpoch:
                     throw new UnreachableException("La época aceptada no quedó como actual.");
 
+                case SequenceVerdict.RetainEpochUnexpected when !reloaded:
+                    // Antes de retener, una vez: la época pudo confirmarla una persona (CONFIRM_EPOCH) u otra
+                    // instancia después de la última carga.
+                    await ReloadCoreAsync(ct);
+                    reloaded = true;
+                    continue;
+
                 case SequenceVerdict.RetainEpochUnexpected retain:
-                    var anomalyId = await _sequence.RetainAsync(new AnomalyRow(
-                        record.SiteId, record.StationId, record.PlcEpoch, record.CycleId, AnomalyType.EpochUnexpected, AnomalySeverity.Blocking,
-                        null, null, record.SourceFingerprint(), RetainedRecords.ToJson(record), now, revision.ConfigRevisionId),
-                        BlockReason.EpochUnexpected, ct);
-                    _metrics.Increment(MetricNames.PlcSequenceAnomaly, ("type", AnomalyType.EpochUnexpected));
+                    var anomalyId = await RetainAsync(record, revision, now, ct);
                     _logger.LogWarning("EPOCH_UNEXPECTED en {Key}: {Detail}. Registro retenido (anomalía {AnomalyId}); estación bloqueada.",
                         record.Identity.IdempotencyKey, retain.Detail, anomalyId);
                     activity?.SetTag("sequence", "EPOCH_UNEXPECTED");
@@ -182,22 +221,43 @@ public sealed class StationIngestService
         }
     }
 
+    private async Task<long> RetainAsync(CycleRecord record, StationRevision revision, DateTime now, CancellationToken ct)
+    {
+        var anomalyId = await _sequence.RetainAsync(new AnomalyRow(
+            record.SiteId, record.StationId, record.PlcEpoch, record.CycleId, AnomalyType.EpochUnexpected, AnomalySeverity.Blocking,
+            null, null, record.SourceFingerprint(), RetainedRecords.ToJson(record), now, revision.ConfigRevisionId),
+            BlockReason.EpochUnexpected, ct);
+        _metrics.Increment(MetricNames.PlcSequenceAnomaly, ("type", AnomalyType.EpochUnexpected));
+        return anomalyId;
+    }
+
     /// <summary>Primera época de la estación (INITIAL) o actual + 1 con AUTO_INCREMENT_BY_ONE: nueva fila en PlcEpochHistory.</summary>
     private async Task AcceptEpochAsync(CycleRecord record, SequenceVerdict.AcceptEpoch accept, StationRevision revision, DateTime now, CancellationToken ct)
     {
+        // El orden entre épocas lo da AcceptedAt: nunca anterior a la época actual, aunque el reloj de pared retroceda.
+        var acceptedAt = CanonicalTimestamp.Truncate(now);
+        if (_classifier.Current is { } current && acceptedAt <= current.AcceptedAt)
+        {
+            acceptedAt = current.AcceptedAt.AddMilliseconds(1);
+        }
+
         try
         {
             await _epochs.InsertAsync(new PlcEpoch(record.SiteId, record.StationId, accept.Epoch, "PLC", accept.AcceptanceMode, record.CycleId,
-                CanonicalTimestamp.Truncate(now), "SYSTEM", revision.ConfigRevisionId, null), ct);
-            _metrics.Increment(MetricNames.PlcEpochChanges, ("mode", accept.AcceptanceMode));
-            _classifier.AcceptEpoch(accept.Epoch, CanonicalTimestamp.Truncate(now));
+                acceptedAt, "SYSTEM", revision.ConfigRevisionId, null), ct);
+            if (accept.AcceptanceMode != PlcEpochStore.Initial)
+            {
+                _metrics.Increment(MetricNames.PlcEpochChanges, ("mode", accept.AcceptanceMode));
+            }
+
+            _classifier.AcceptEpoch(accept.Epoch, acceptedAt, accept.AcceptanceMode);
             _logger.LogInformation("Época {Epoch} aceptada ({Mode}) en {Station} desde el ciclo {Cycle}",
                 accept.Epoch, accept.AcceptanceMode, record.StationId, record.CycleId);
         }
         catch (SqlException ex) when (SequenceStore.IsEpochAlreadyAccepted(ex))
         {
-            // Otro proceso o un intento anterior ya la aceptó: el orden de épocas sale de SQL.
-            await ReloadAsync(ct);
+            // Otro proceso o un intento anterior ya la aceptó (o tomó ese AcceptedAt): el orden de épocas sale de SQL.
+            await ReloadCoreAsync(ct);
         }
     }
 
@@ -209,16 +269,26 @@ public sealed class StationIngestService
     /// </summary>
     public async Task<IngestOutcome> ReingestAsync(long anomalyId, string performedBy, string resolution, CancellationToken ct)
     {
-        await ReloadAsync(ct);
         var retained = (await _sequence.ListRetainedAsync(_station.SiteId, _station.StationId, ct)).FirstOrDefault(a => a.AnomalyId == anomalyId)
             ?? throw new InvalidOperationException($"La anomalía {anomalyId} no es un registro retenido sin resolver de la estación {_station.StationId}.");
         var record = RetainedRecords.Reingest(retained.IncomingRecord);
-        if (!_classifier.Epochs.Any(e => e.Epoch == record.PlcEpoch))
+        IngestOutcome outcome;
+        await _serial.WaitAsync(ct);
+        try
         {
-            throw new InvalidOperationException($"La época {record.PlcEpoch} no está aceptada: el registro retenido no se puede reingresar.");
+            await ReloadCoreAsync(ct);
+            if (!_classifier.Epochs.Any(e => e.Epoch == record.PlcEpoch))
+            {
+                throw new InvalidOperationException($"La época {record.PlcEpoch} no está aceptada: el registro retenido no se puede reingresar.");
+            }
+
+            outcome = await ClassifyAndRegisterAsync(record, ct);
+        }
+        finally
+        {
+            _serial.Release();
         }
 
-        var outcome = await ProcessRecordAsync(record, ct);
         await _manual.ResolveAnomalyAsync(anomalyId, _station.SiteId, _station.StationId, performedBy, resolution, _clock.UtcNow, ct);
         return outcome;
     }
