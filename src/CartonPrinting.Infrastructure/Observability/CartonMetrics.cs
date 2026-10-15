@@ -21,6 +21,9 @@ public sealed class CartonMetrics : IDisposable
     /// <summary>Muestras que se conservan en memoria por serie: las más recientes (el exportador recibe todas).</summary>
     public const int MaxSamplesPerSeries = 50_000;
 
+    /// <summary>Marcas de recepción pendientes de consumir por el sender.</summary>
+    public const int MaxReceivedMarks = 10_000;
+
     public CartonMetrics()
     {
         Meter = new Meter(CartonTelemetry.SourceName, "1.1");
@@ -55,13 +58,17 @@ public sealed class CartonMetrics : IDisposable
 
     /// <summary>
     /// Marca monotónica de la recepción OPC de una detección con job, para medir <c>opc_receive_to_send_start_ms</c> en el
-    /// sender (otro componente del mismo proceso). Se consume una vez; si se acumulan sin consumir, se descartan.
+    /// sender (otro componente del mismo proceso). Se consume una vez. Si se acumulan sin consumir (jobs que vencieron o nunca se
+    /// enviaron), se descartan las más antiguas, no las de los jobs en curso.
     /// </summary>
     public void MarkReceived(Guid detectionId, long receivedTimestamp)
     {
-        if (_received.Count > 10_000)
+        if (_received.Count >= MaxReceivedMarks)
         {
-            _received.Clear();
+            foreach (var stale in _received.OrderBy(e => e.Value).Take(MaxReceivedMarks / 10).Select(e => e.Key).ToList())
+            {
+                _received.TryRemove(stale, out _);
+            }
         }
 
         _received[detectionId] = receivedTimestamp;
@@ -95,6 +102,10 @@ public sealed class CartonMetrics : IDisposable
     /// <summary>Total acumulado; sin etiquetas devuelve la suma de todas las series.</summary>
     public long Total(string name, params (string Key, string Value)[] tags) =>
         _totals.TryGetValue(Key(name, tags), out var v) ? v : 0;
+
+    /// <summary>Total de cada serie etiquetada de un contador (para reportes), con las etiquetas como texto.</summary>
+    public IReadOnlyDictionary<string, long> Series(string name) =>
+        _totals.Where(kv => kv.Key.StartsWith(name + "{", StringComparison.Ordinal)).ToDictionary(kv => kv.Key[name.Length..], kv => kv.Value);
 
     public IReadOnlyList<double> Samples(string name, params (string Key, string Value)[] tags) =>
         _samples.TryGetValue(Key(name, tags), out var q) ? q.ToArray() : [];

@@ -21,7 +21,7 @@ namespace CartonPrinting.FaultTests.Hardening;
 public sealed class BrokerOutageTests(SqlServerFixture sql, RabbitMqFixture rabbit) : IAsyncLifetime, IClassFixture<RabbitMqFixture>
 {
     private const string Consumer = "mes-t08";
-    private static readonly TimeSpan Before = TimeSpan.FromSeconds(60);
+    private static readonly TimeSpan Before = TimeSpan.FromMinutes(2);
     private static readonly TimeSpan Outage = TimeSpan.FromMinutes(10);
     private static readonly TimeSpan After = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan BoxInterval = TimeSpan.FromSeconds(1);
@@ -61,8 +61,9 @@ public sealed class BrokerOutageTests(SqlServerFixture sql, RabbitMqFixture rabb
     [Trait("Spec", "T08")]
     public async Task Ten_minutes_without_rabbitmq_change_nothing_in_printing_and_lose_no_event()
     {
-        // Plazo de 5 s: la prueba corre en paralelo con el resto de la suite y no mide si el plazo nominal alcanza (eso es T12).
-        var s = await StationScenario.CreateAsync(_db, r => r with { TransitBudgetMs = 5_000 }, Ct, TimeProvider.System);
+        // Plazo nominal de laboratorio, el de T12 (TransitBudgetMs 1500, DeviceLeadTimeMs 400, ClockSkewToleranceMs 50, SendMarginMs 250):
+        // una caja cuya impresión se demora durante la caída vence, y la prueba falla. T08 corre sola (colección sin paralelismo).
+        var s = await StationScenario.CreateAsync(_db, r => r with { SendMarginMs = 250 }, Ct, TimeProvider.System);
         var broker = new Uri(rabbit.Uri);
         await using var proxy = new TcpProxy(broker.Host, broker.Port).Start();
         var viaProxy = new UriBuilder(broker) { Host = "127.0.0.1", Port = proxy.Port }.Uri.ToString();
@@ -80,11 +81,19 @@ public sealed class BrokerOutageTests(SqlServerFixture sql, RabbitMqFixture rabb
         var lease = s.KeepLeaseAsync(stop.Token);
         await relay.StartAsync(Ct);
 
-        ulong cycle = 1000;
+        ulong cycle = 990;
         long publishedAtCut;
         ulong firstInOutage, lastInOutage;
+        DateTime outageStartedAt;
         try
         {
+            // Calentamiento, fuera de la medición: la primera caja abre la conexión con la impresora y compila el código, y con el plazo
+            // nominal puede vencer. Las cajas 990 a 999 terminan antes de empezar.
+            cycle = await BoxesAsync(s, cycle, TimeSpan.FromSeconds(10));
+            await WaitAsync(async () => await s.CountAsync("FROM dbo.PrintJob WHERE CycleId < 1000 AND Status IN ('CONFIRMED', 'EXPIRED', 'FAILED', 'UNKNOWN')",
+                null, Ct) == (int)(cycle - 990), "las cajas de calentamiento terminadas");
+            cycle = 1000;
+
             // Carga nominal con el broker disponible.
             cycle = await BoxesAsync(s, cycle, Before);
             await WaitAsync(async () => await PendingAsync(s) == 0, "Outbox al día antes del corte");
@@ -94,6 +103,7 @@ public sealed class BrokerOutageTests(SqlServerFixture sql, RabbitMqFixture rabb
             proxy.SeverAll();
             publishedAtCut = await s.ScalarAsync<int>("SELECT COUNT(*) FROM dbo.OutboxEvent WHERE PublishedAt IS NOT NULL", null, Ct);
             firstInOutage = cycle;
+            outageStartedAt = DateTime.UtcNow;
             cycle = await BoxesAsync(s, cycle, Outage);
             lastInOutage = cycle - 1;
             await WaitAsync(async () => await JobsConfirmedAsync(s, firstInOutage, lastInOutage), "los jobs de la caída, CONFIRMED",
@@ -123,22 +133,44 @@ public sealed class BrokerOutageTests(SqlServerFixture sql, RabbitMqFixture rabb
             await relay.StopAsync(CancellationToken.None);
         }
 
-        // Detecciones y jobs avanzan igual: cada ciclo tiene su job CONFIRMED y una sola etiqueta; ninguno vence.
+        // Primero el diagnóstico, para que una falla diga qué cajas y cuándo: las que no terminaron CONFIRMED (todas las fases).
+        var output = TestContext.Current.TestOutputHelper;
         var boxes = (int)(cycle - 1000);
-        Assert.Equal(boxes, await s.CountAsync("FROM dbo.PrintJob WHERE Status = 'CONFIRMED'", null, Ct));
-        Assert.Equal(0, await s.CountAsync("FROM dbo.PrintJob WHERE Status <> 'CONFIRMED'", null, Ct));
-        Assert.Equal(boxes, rig.Printer.Received.Count);
-        Assert.Equal(boxes, rig.Printer.Received.Select(r => r.Serial).Distinct().Count());
+        foreach (var line in await s.QueryAsync("""
+            SELECT pj.CycleId, pj.Status, ISNULL(pj.Reason, '-'), cd.ReceivedAt, DATEDIFF_BIG(MILLISECOND, cd.ReceivedAt, pj.CreatedAt),
+                DATEDIFF_BIG(MILLISECOND, cd.ReceivedAt, pj.DeadlineAt), DATEDIFF_BIG(MILLISECOND, cd.ReceivedAt, pj.UpdatedAt),
+                (SELECT COUNT(*) FROM dbo.PrintAttempt AS pa WHERE pa.PrintJobId = pj.PrintJobId)
+            FROM dbo.PrintJob AS pj INNER JOIN dbo.CartonDetection AS cd ON cd.DetectionId = pj.DetectionId
+            WHERE pj.Status <> 'CONFIRMED' ORDER BY pj.CycleId
+            """, null, r => $"  sin CONFIRMED: ciclo {r.GetDecimal(0)} {r.GetString(1)}/{r.GetString(2)} a {(r.GetDateTime(3) - outageStartedAt).TotalSeconds:F1} s del corte; " +
+                $"job a {r.GetInt64(4)} ms de la recepción, plazo a {r.GetInt64(5)} ms, último cambio a {r.GetInt64(6)} ms, intentos {r.GetInt32(7)}", Ct))
+        {
+            output?.WriteLine(line);
+        }
 
-        // Latencia de impresión (recepción del ciclo a inicio de escritura) antes y durante la caída. La primera caja abre la
-        // conexión con la impresora y compila el código: queda fuera de la muestra.
-        var before = await WriteLatenciesAsync(s, 1001, firstInOutage - 1);
+        // Latencia de impresión (recepción del ciclo a inicio de escritura) antes y durante la caída: sin cambio. Las cajas más lentas de
+        // la caída van a la salida.
+        var before = await WriteLatenciesAsync(s, 1000, firstInOutage - 1);
         var during = await WriteLatenciesAsync(s, firstInOutage, lastInOutage);
-        TestContext.Current.TestOutputHelper?.WriteLine(
-            $"T08 latencia recepción→escritura (ms): antes p50={P(before, 0.5):F0} p95={P(before, 0.95):F0} máx={before.Max():F0}; " +
-            $"durante p50={P(during, 0.5):F0} p95={P(during, 0.95):F0} máx={during.Max():F0}; cajas={boxes}");
-        Assert.True(P(during, 0.95) <= Math.Max(2 * P(before, 0.95), P(before, 0.95) + 250),
+        output?.WriteLine($"T08 latencia recepción→escritura (ms): antes p50={P(before, 0.5):F0} p95={P(before, 0.95):F0} p99={P(before, 0.99):F0} " +
+            $"máx={Max(before):F0}; durante p50={P(during, 0.5):F0} p95={P(during, 0.95):F0} p99={P(during, 0.99):F0} máx={Max(during):F0}; cajas={boxes}");
+        foreach (var slow in during.OrderByDescending(d => d.Total).Take(5))
+        {
+            output?.WriteLine($"  ciclo {slow.Cycle} a {(slow.ReceivedAt - outageStartedAt).TotalSeconds:F1} s del corte: recepción→claim {slow.ToClaim:F0} ms, " +
+                $"claim→escritura {slow.ToWrite:F0} ms, intentos {slow.Attempts}");
+        }
+
+        // Detecciones y jobs avanzan igual: cada caja medida tiene su job CONFIRMED y una sola etiqueta; ninguna vence.
+        Assert.Equal(boxes, await s.CountAsync("FROM dbo.PrintJob WHERE CycleId >= 1000 AND Status = 'CONFIRMED'", null, Ct));
+        Assert.Equal(0, await s.CountAsync("FROM dbo.PrintJob WHERE CycleId >= 1000 AND Status <> 'CONFIRMED'", null, Ct));
+        Assert.Equal(await s.CountAsync("FROM dbo.PrintJob WHERE Status = 'CONFIRMED'", null, Ct), rig.Printer.Received.Count);
+        Assert.Equal(rig.Printer.Received.Count, rig.Printer.Received.Select(r => r.Serial).Distinct().Count());
+
+        Assert.True(P(during, 0.5) <= P(before, 0.5) + 20, $"p50 durante la caída {P(during, 0.5):F0} ms frente a {P(before, 0.5):F0} ms antes");
+        Assert.True(P(during, 0.95) <= Math.Max(1.5 * P(before, 0.95), P(before, 0.95) + 50),
             $"p95 durante la caída {P(during, 0.95):F0} ms frente a {P(before, 0.95):F0} ms antes");
+        Assert.True(P(during, 0.99) <= Math.Max(2 * P(before, 0.99), P(before, 0.99) + 100),
+            $"p99 durante la caída {P(during, 0.99):F0} ms frente a {P(before, 0.99):F0} ms antes");
 
         // Cero perdidos, mismo EventId, en orden de OutboxSequence y sin efectos duplicados.
         var arrivals = await s.QueryAsync("""
@@ -184,15 +216,26 @@ public sealed class BrokerOutageTests(SqlServerFixture sql, RabbitMqFixture rabb
         await s.CountAsync("FROM dbo.PrintJob WHERE CycleId BETWEEN @a AND @b AND Status = 'CONFIRMED'",
             c => { c.Parameters.AddWithValue("@a", (decimal)from); c.Parameters.AddWithValue("@b", (decimal)to); }, Ct) == (int)(to - from + 1);
 
-    private static async Task<List<double>> WriteLatenciesAsync(StationScenario s, ulong from, ulong to) =>
+    private sealed record WriteLatency(ulong Cycle, DateTime ReceivedAt, double ToClaim, double ToWrite, int Attempts)
+    {
+        public double Total => ToClaim + ToWrite;
+    }
+
+    /// <summary>Por caja: recepción → claim del intento que escribió → inicio de la escritura, y cuántos intentos tuvo el job.</summary>
+    private static async Task<List<WriteLatency>> WriteLatenciesAsync(StationScenario s, ulong from, ulong to) =>
         [.. await s.QueryAsync("""
-            SELECT DATEDIFF_BIG(MILLISECOND, cd.ReceivedAt, pa.WriteStartedAt)
+            SELECT pj.CycleId, cd.ReceivedAt, DATEDIFF_BIG(MILLISECOND, cd.ReceivedAt, pa.ClaimedAt), DATEDIFF_BIG(MILLISECOND, pa.ClaimedAt, pa.WriteStartedAt),
+                (SELECT COUNT(*) FROM dbo.PrintAttempt AS x WHERE x.PrintJobId = pj.PrintJobId)
             FROM dbo.PrintJob AS pj
             INNER JOIN dbo.CartonDetection AS cd ON cd.DetectionId = pj.DetectionId
             INNER JOIN dbo.PrintAttempt AS pa ON pa.PrintJobId = pj.PrintJobId
             WHERE pj.CycleId BETWEEN @a AND @b AND pa.WriteStartedAt IS NOT NULL
             """, c => { c.Parameters.AddWithValue("@a", (decimal)from); c.Parameters.AddWithValue("@b", (decimal)to); },
-            r => (double)r.GetInt64(0), Ct)];
+            r => new WriteLatency((ulong)r.GetDecimal(0), r.GetDateTime(1), r.GetInt64(2), r.GetInt64(3), r.GetInt32(4)), Ct)];
+
+    private static double Max(IReadOnlyList<WriteLatency> values) => values.Max(v => v.Total);
+
+    private static double P(IReadOnlyList<WriteLatency> values, double q) => P(values.Select(v => v.Total).ToList(), q);
 
     private static double P(IReadOnlyList<double> values, double q)
     {

@@ -164,12 +164,18 @@ public sealed class PrinterSenderService(
         // Desde aquí la escritura está invocada: cualquier error es UNKNOWN.
         var writeStartedAt = clock.UtcNow;
         var writeTs = clock.GetTimestamp();
-        metrics.Record(MetricNames.PresendCheckToWriteMs, clock.GetElapsedTime(checkTs, writeTs).TotalMilliseconds);
-        metrics.Record(MetricNames.PrintDeadlineSlackMs, clock.GetElapsedTime(writeTs, deadlineTs).TotalMilliseconds + context.EffectiveSendMarginMs);
-        if (metrics.TakeReceived(context.Job.DetectionId) is { } received)
+
+        // Los tramos se registran después de escribir: nada se interpone entre la comprobación y la escritura.
+        void RecordWriteStart()
         {
-            metrics.Record(MetricNames.OpcReceiveToSendStartMs, clock.GetElapsedTime(received, writeTs).TotalMilliseconds);
+            metrics.Record(MetricNames.PresendCheckToWriteMs, clock.GetElapsedTime(checkTs, writeTs).TotalMilliseconds);
+            metrics.Record(MetricNames.PrintDeadlineSlackMs, clock.GetElapsedTime(writeTs, deadlineTs).TotalMilliseconds + context.EffectiveSendMarginMs);
+            if (metrics.TakeReceived(context.Job.DetectionId) is { } received)
+            {
+                metrics.Record(MetricNames.OpcReceiveToSendStartMs, clock.GetElapsedTime(received, writeTs).TotalMilliseconds);
+            }
         }
+
         DateTime? deviceAcceptedAt;
         try
         {
@@ -178,6 +184,7 @@ public sealed class PrinterSenderService(
         }
         catch (Exception ex)
         {
+            RecordWriteStart();
             transport.Reset();
             metrics.Increment(MetricNames.PrinterUnknown, ("printer", printerId));
             metrics.Increment(MetricNames.PrintAttempts, ("outcome", AttemptOutcome.Unknown));
@@ -194,6 +201,8 @@ public sealed class PrinterSenderService(
         {
             metrics.Record(MetricNames.SendStartToDeviceAcceptMs, clock.GetElapsedTime(writeTs).TotalMilliseconds);
         }
+
+        RecordWriteStart();
 
         if (faults is not null)
         {

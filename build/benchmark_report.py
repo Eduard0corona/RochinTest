@@ -45,6 +45,7 @@ def main() -> int:
     args = parser.parse_args()
     r = json.load(open(args.report, encoding="utf-8"))
     env, opc, feas = r["environment"], r["opc"], r["feasibility"]
+    comp, errors = r.get("composition", {}), r.get("errors")
 
     out = []
     w = out.append
@@ -64,10 +65,18 @@ def main() -> int:
     w(f"| Memoria disponible para .NET | {fmt(env['memoryGiB'])} GiB |")
     w(f"| Runtime | {env['dotnet']} |")
     w(f"| SQL Server | {env['sqlServer']}, en un contenedor de Testcontainers en la misma máquina |")
-    w("| Red | Local (loopback): PLC simulado, impresora simulada y SQL Server en la misma máquina |")
+    if comp.get("rabbitMq"):
+        w(f"| RabbitMQ | {comp['rabbitMq']} |")
+    w("| Red | Local (loopback): PLC simulado, impresora simulada, SQL Server y RabbitMQ en la misma máquina |")
     w(f"| Payload de la etiqueta | {env['payloadBytes']} bytes (plantilla del simulador) |")
-    w("| Composición | La del EdgeHost: ingesta OPC UA real, señal en proceso hacia el sender (sondeo de respaldo de 50 ms), una transacción por caja, socket persistente con la impresora |")
-    w("| Evidencia | Impresora (PRINTED), aplicador (APPLIED) y escáner (VERIFIED) simulados; nivel mínimo VERIFIED |")
+    parts = [f"ingesta OPC UA real ({opc['sessionSecurity']})" if opc.get("sessionSecurity") else "ingesta OPC UA real",
+             "señal en proceso hacia el sender (sondeo de respaldo de 50 ms)", "socket persistente con la impresora"]
+    if comp.get("sweepIntervalMs"):
+        parts.append(f"barrido TX-S cada {comp['sweepIntervalMs']} ms")
+    if comp.get("outboxRelay"):
+        parts.append("Outbox Relay con publisher confirms hacia una cola quorum sin consumidor")
+    w(f"| Composición | La del EdgeHost, en un proceso de prueba: {'; '.join(parts)} |")
+    w("| Evidencia | Impresora (PRINTED), aplicador (APPLIED) y escáner (VERIFIED) simulados, aplicada por TX-D; nivel mínimo VERIFIED |")
     w(f"| Comando | `{args.comando}` |")
     if args.fecha:
         w(f"| Fecha | {args.fecha} |")
@@ -132,6 +141,35 @@ def main() -> int:
     w("")
     w("Los valores de la revisión son de laboratorio (OT-03 abierta). En planta, `TransitBudgetMs` y `DeviceLeadTimeMs` salen de la línea")
     w("real, y la desigualdad se evalúa con los p99 medidos allí.")
+    w("")
+    w("## Errores y escenarios excluidos")
+    w("")
+    if errors:
+        jobs = ", ".join(f"{k} {v}" for k, v in sorted(errors["jobsByStatus"].items()))
+        detections = ", ".join(f"{k} {v}" for k, v in sorted(errors["detectionsByStatus"].items()))
+        faults = "; ".join(errors["serviceFaults"]) or "ninguna"
+        w("| Error | Cantidad |")
+        w("| --- | --- |")
+        w(f"| Jobs por estado final | {jobs} |")
+        w(f"| Detecciones por estado | {detections} |")
+        rejected = errors["opcRecordsRejected"]
+        rejected = ", ".join(f"{v} {k}" for k, v in sorted(rejected.items())) if isinstance(rejected, dict) else str(rejected)
+        w(f"| Registros OPC rechazados (`opc_records_rejected_total`; el valor inicial vacío del registro es `EMPTY`) | {rejected or '0'} |")
+        w(f"| Notificaciones perdidas por canal lleno | {errors['opcChannelFull']} |")
+        w(f"| Rechazos de la segunda comprobación | {errors['presendCheckRejected']} |")
+        w(f"| Intentos NOT_SENT | {errors['attemptsNotSent']} |")
+        w(f"| Intentos UNKNOWN | {errors['attemptsUnknown']} |")
+        w(f"| Eventos del Outbox: escritos, publicados, pendientes al final | {errors['outboxEvents']}, {errors['outboxPublished']}, {errors['outboxPendingAtEnd']} |")
+        w(f"| Servicios de fondo que fallaron (sender, barrido) | {faults} |")
+        w("")
+    w("Escenarios excluidos de esta medición:")
+    w("")
+    w("- **Fallas.** Sin caídas de SQL Server, RabbitMQ, la impresora o el PLC: esas son T08, T19, T05 a T07 y T11, que no miden capacidad.")
+    w("- **ERP.** El snapshot de la orden está en caché durante toda la corrida: la sincronización con el ERP no participa y ningún job espera snapshot.")
+    w("- **Operación.** Sin acciones de la Operations API ni reimpresiones; una sola estación y una sola impresora de línea.")
+    w("- **Propiedad.** El lease de la impresora se renueva una vez por minuto desde la prueba, no con el ciclo de propiedad del EdgeHost.")
+    w("- **Consumidor.** La cola recibe los eventos pero nadie los consume: el costo del consumidor (MES) queda fuera.")
+    w("- **Hardware.** Impresión, aplicación y lectura son del simulador, en la misma máquina, sin tiempos físicos.")
     w("")
     print("\n".join(out))
     return 0

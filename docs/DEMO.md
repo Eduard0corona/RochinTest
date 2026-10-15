@@ -26,18 +26,24 @@ Este guion hace pasar cajas por el EdgeHost real, en su propio proceso, contra s
 dotnet build
 ```
 
-2. Ejecutar la demo con el login de la aplicación (`cp_app`). La contraseña es la de `Database__AppPassword` del aprovisionamiento y no va al repositorio:
+2. Definir la cadena de conexión del login de la aplicación (`cp_app`) en la variable `ConnectionStrings__CartonPrinting`, no en la línea de comandos: así la contraseña no queda en el historial ni en la lista de procesos. La contraseña es la de `Database__AppPassword` del aprovisionamiento y no va al repositorio. Por ejemplo, en PowerShell, con la contraseña leída sin eco:
 
-```bash
-dotnet tests/CartonPrinting.DemoHost/bin/Debug/net10.0/CartonPrinting.DemoHost.dll --connection "Server=127.0.0.1,14333;Database=CartonPrinting;User ID=cp_app;Password=<la del aprovisionamiento>;TrustServerCertificate=true" --boxes 30 --interval-ms 1000
+```powershell
+$p = Read-Host -AsSecureString "Contraseña de cp_app"; $env:ConnectionStrings__CartonPrinting = "Server=127.0.0.1,14333;Database=CartonPrinting;User ID=cp_app;Password=$([System.Net.NetworkCredential]::new('', $p).Password);TrustServerCertificate=true"
 ```
 
-Sin `--connection`, la demo usa la variable `ConnectionStrings__CartonPrinting`. Otras opciones:
+3. Ejecutar la demo:
+
+```bash
+dotnet tests/CartonPrinting.DemoHost/bin/Debug/net10.0/CartonPrinting.DemoHost.dll --boxes 30 --interval-ms 1000
+```
+
+`--connection` acepta la cadena de conexión como argumento, pero queda visible en el historial y en la lista de procesos. Otras opciones:
 
 - `--timeout-s`: espera máxima al final (120 por defecto);
 - `--edgehost`: ruta de `CartonPrinting.EdgeHost.dll`, si no está en la de la compilación.
 
-3. Opcional: ver los eventos publicados en RabbitMQ. Se define `RabbitMq__Uri` en el entorno antes de lanzar la demo, que lo pasa al EdgeHost. Por ejemplo, `amqp://<usuario>:<contraseña>@127.0.0.1:5672/`, con las credenciales del `.env`. Los mensajes del exchange `carton.events` se ven en la consola de gestión, `http://127.0.0.1:15672`. Con `amqps://` la conexión usa TLS (`RabbitMq__Tls__*`).
+4. Opcional: ver los eventos publicados en RabbitMQ. Se define `RabbitMq__Uri` en el entorno antes de lanzar la demo, que lo pasa al EdgeHost. Por ejemplo, `amqp://<usuario>:<contraseña>@127.0.0.1:5672/`, con las credenciales del `.env`, también en una variable de entorno. Los mensajes del exchange `carton.events` se ven en la consola de gestión, `http://127.0.0.1:15672`. Con `amqps://` la conexión usa TLS (`RabbitMq__Tls__*`).
 
 ## Qué se ve
 

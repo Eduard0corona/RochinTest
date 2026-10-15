@@ -17,14 +17,22 @@ public interface ILabelingReadySink
 /// <summary>
 /// Latido LabelingReady (contrato con el PLC, sección 4): el servicio escribe true mientras la estación
 /// está habilitada, la ingesta conectada y su canal sin saturar; false si la estación está bloqueada, si se
-/// pierde OPC, si el canal está lleno (ARQUITECTURA_TECNICA §2) o si no se puede leer su estado en SQL. Si el
-/// latido deja de llegar, el PLC aplica su propia política (OT).
+/// pierde OPC, si el canal está lleno (ARQUITECTURA_TECNICA §2), si la ingesta tiene SQL Server declarado no
+/// disponible (hasta que recarga el estado al volver, ESTRATEGIA_RECUPERACION §3) o si no se puede leer el estado
+/// de la estación en SQL dentro de <c>readTimeout</c>. En ese último caso, si la causa es SQL no disponible o la lectura no
+/// respondió, avisa a la ingesta (<c>onSqlUnavailable</c>): la caída es una sola para las dos, y los ciclos que llegan con
+/// LabelingReady en falso por esa caída no se registran. Si el latido deja de llegar, el PLC aplica su propia política (OT).
 /// </summary>
 public sealed class LabelingReadyHeartbeat(
     StationSettings station, StationConfigStore stations, ILabelingReadySink sink, CartonMetrics metrics,
-    ILogger<LabelingReadyHeartbeat>? logger = null, Func<bool>? overloaded = null)
+    ILogger<LabelingReadyHeartbeat>? logger = null, Func<bool>? overloaded = null, Func<bool>? sqlUnavailable = null,
+    TimeSpan? readTimeout = null, Action? onSqlUnavailable = null)
 {
     private readonly ILogger _logger = logger ?? NullLogger<LabelingReadyHeartbeat>.Instance;
+    private readonly TimeSpan _readTimeout = readTimeout ?? TimeSpan.FromSeconds(1);
+
+    // Una lectura que no terminó a tiempo: mientras siga pendiente no se lanza otra, y la señal queda en falso.
+    private Task? _pendingRead;
 
     /// <summary>Un latido: calcula la señal, la escribe y la devuelve.</summary>
     public async Task<bool> BeatAsync(CancellationToken ct)
@@ -33,16 +41,42 @@ public sealed class LabelingReadyHeartbeat(
         // no se atribuyen al primer latido posterior.
         var saturated = overloaded?.Invoke() ?? false;
         bool ready;
-        try
+        if (_pendingRead is { IsCompleted: false })
         {
-            var active = await stations.GetActiveAsync(station.SiteId, station.StationId, ct);
-            ready = active is { State.LabelingEnabled: true } && sink.Connected && !saturated;
-        }
-        catch (Exception ex) when (ex is not OperationCanceledException)
-        {
-            _logger.LogWarning(ex, "LabelingReady: no se pudo leer el estado de {Station}; se señala no lista", station.StationId);
+            _logger.LogWarning("LabelingReady: la lectura anterior del estado de {Station} sigue sin respuesta; se señala no lista", station.StationId);
+            onSqlUnavailable?.Invoke();
             ready = false;
         }
+        else
+        {
+            var read = Task.Run(() => stations.GetActiveAsync(station.SiteId, station.StationId, ct), CancellationToken.None);
+            try
+            {
+                var active = await read.WaitAsync(_readTimeout, ct);
+                ready = active is { State.LabelingEnabled: true } && sink.Connected && !saturated;
+            }
+            catch (TimeoutException)
+            {
+                _pendingRead = read.ContinueWith(t => _ = t.Exception, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+                _logger.LogWarning("LabelingReady: el estado de {Station} no se leyó en {Timeout}; se señala no lista", station.StationId, _readTimeout);
+                onSqlUnavailable?.Invoke();
+                ready = false;
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                _logger.LogWarning(ex, "LabelingReady: no se pudo leer el estado de {Station}; se señala no lista", station.StationId);
+                if (SqlAvailability.IsUnavailable(ex))
+                {
+                    onSqlUnavailable?.Invoke();
+                }
+
+                ready = false;
+            }
+        }
+
+        // Se consulta después de la lectura: una declaración de la ingesta durante la lectura no se pierde.
+        ready = ready && !(sqlUnavailable?.Invoke() ?? false);
 
         if (sink.Connected)
         {

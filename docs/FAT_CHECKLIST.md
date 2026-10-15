@@ -4,12 +4,21 @@ El MVP se probó contra simuladores: PLC por OPC UA, impresora, aplicador, escá
 
 Lo de esta lista no se puede demostrar sin la línea real: las garantías físicas y de rendimiento de `spec/docs/MATRIZ_GARANTIAS.md` y las decisiones de OT abiertas (`spec/docs/DECISIONES_ABIERTAS_OT.md`). Ninguna fila se da por aceptada hasta que la planta registre la prueba y su evidencia.
 
+## 0. Prerrequisitos que el MVP no implementa
+
+Sin ellos, la planta no puede aceptar las garantías de la sección 1:
+
+| Prerrequisito | Estado en el MVP | Sin él | Afecta a |
+| --- | --- | --- | --- |
+| Integración de evidencia en el EdgeHost: impresora, aplicador y escáner reales informando por TX-D | **No implementada.** `EvidenceService` (TX-D) existe y está probado, pero el EdgeHost no tiene una entrada de evidencia; en la demo y en las pruebas la aplica un simulador (`docs/DEMO.md`) | Con `MinConfirmationLevel` ≥ PRINTED, todo job termina en `UNKNOWN` al vencer su ventana de evidencia | G06, OT-07, OT-08, OT-15 |
+| Compuerta física (`PhysicalGateMode`, `PrintWindowCycleId`) | **No implementada** (Fase 4, decisión 3) | La etiqueta puede salir sin la caja en posición | G05, OT-01, OT-09 |
+
 ## 1. Garantías que solo acepta la planta
 
 | Garantía | Qué se acepta en planta | Cómo | Depende de | Pruebas con simulador |
 | --- | --- | --- | --- | --- |
 | G05 · Ninguna etiqueta fuera de la ventana física de su caja | La etiqueta solo se aplica con la caja correcta en posición | Compuerta del PLC o del aplicador (`PhysicalGateMode`, `PrintWindowCycleId`), probada con cajas reales, retenidas y detenidas. La compuerta no tiene implementación en el MVP (Fase 4, decisión 3) | OT-01, OT-02, OT-09 | Ninguna: no hay compuerta física simulada |
-| G06 · La etiqueta correcta en la caja correcta | Un escáner posterior a la aplicación lee `LabelSerial` y su lectura se correlaciona con el ciclo | Nivel VERIFIED con el escáner y el tracking reales. Una etiqueta ajena se lee como `SERIAL_MISMATCH` (J11 y J18) | OT-08, OT-01 | T15, T22, T44 (lecturas simuladas) |
+| G06 · La etiqueta correcta en la caja correcta | Un escáner posterior a la aplicación lee `LabelSerial` y su lectura se correlaciona con el ciclo | Nivel VERIFIED con el escáner y el tracking reales, conectados por la integración de evidencia (sección 0). Una etiqueta ajena se lee como `SERIAL_MISMATCH` (J11 y J18) | OT-08, OT-01 | T15, T22, T44 (lecturas simuladas) |
 | G07 · Una etiqueta por caja física, aun recirculada | Una caja que vuelve a pasar no recibe otra etiqueta | `CARTON_ID_REQUIRED` con un identificador físico leído antes de etiquetar | OT-05, OT-06 | T16 y T32 (identidad simulada; sin identidad, la garantía es por ciclo) |
 | G10 · Un solo transmisor por impresora | Ningún segundo proceso o nodo transmite a la impresora | Un EdgeHost por estación con lock de sistema operativo y lease. Con alta disponibilidad, el aislamiento físico del canal (red o proxy que valide tokens) | OT-10, OT-11 | T27 y T36 (dos procesos en una máquina; aislamiento simulado con un proxy TCP) |
 | G11 · Latencia compatible con el plazo | La desigualdad de factibilidad con los tiempos de la línea | `docs/BENCHMARK.md` repetido en el hardware de planta: intervalos OPC negociados con el PLC real, `DeviceLeadTimeMs` medido con el aplicador real (p99 de `send_start_to_applied_ms`) | OT-03 | T12 (hipótesis de una caja por segundo, simuladores) |
@@ -50,12 +59,13 @@ Vuelven a hacerse con el equipo real, porque su criterio físico se comprobó en
 - **T31:** cola interna y cancelación confirmada por la impresora real (OT-07).
 - **T36:** el aislamiento real del canal de la impresora al cambiar de dueño.
 - **T42:** orden de envío con la impresora real fuera de línea y de vuelta.
-- **T08 y T19:** caída real de RabbitMQ y de SQL Server en la red de planta, no un proxy TCP.
+- **T08 y T19:** caída real de RabbitMQ y de SQL Server en la red de planta, no un proxy TCP. En T19, además, lo que hace la línea mientras `LabelingReady` está en falso (OT-09).
+- **SQL Server caído y reinicio del PLC a la vez:** si el ciclo siguiente a la caída llega con una época nueva, los ciclos descartados durante la caída no quedan como hueco de la época anterior. Solo los cuenta `opc_records_rejected_total{cause=SQL_UNAVAILABLE}`, con su alerta.
 
 ## 4. Configuración y seguridad que se verifican al instalar
 
 - **OPC UA.** SignAndEncrypt con validación estricta de certificados: el certificado del PLC en el almacén de confianza del EdgeHost, sin autoaceptación (valores por defecto de `OpcIngestOptions`; `OpcSecurityTests` con el PLC simulado). También se registran los intervalos de muestreo y publicación que el PLC real negocia.
-- **RabbitMQ.** `amqps://` con el certificado del broker válido para su nombre y, si la planta lo exige, certificado de cliente (`RabbitMq__Tls__*`). Permisos por vhost.
+- **RabbitMQ.** `amqps://` con el certificado del broker válido para su nombre y, si la planta lo exige, certificado de cliente (`RabbitMq__Tls__*`). La comprobación de revocación del certificado está activa por defecto. Si la red de planta no llega a la lista de revocación, OT la desactiva de forma explícita (`RabbitMq__Tls__CheckCertificateRevocation=false`) y lo registra aquí. Permisos por vhost.
 - **Secretos.** Cadenas de conexión, contraseñas de los logins, claves de las personas de la Operations API (solo su SHA-256 en la configuración) y certificados: desde el almacén de secretos o las variables de entorno del servicio, nunca en el repositorio (`build/check_secrets.py` en la compuerta).
 - **SQL Server.** El login de la aplicación sin DDL ni escritura sobre `AllowedTransition`. Los triggers habilitados.
 - **Supervisión del servicio.** Reiniciar el EdgeHost cuando sale con un código distinto de 0 (código 70: el sender se detuvo).
@@ -69,6 +79,7 @@ En `docs/SPEC_ISSUES.md`: SI-10 y SI-12 (OT-04), SI-13 (registro incoherente fre
 | Punto | Responsable de planta | Fecha | Evidencia | Resultado |
 | --- | --- | --- | --- | --- |
 | G05 | | | | |
+| Sección 0: integración de evidencia y compuerta física | | | | |
 | G06 | | | | |
 | G07 | | | | |
 | G10 | | | | |

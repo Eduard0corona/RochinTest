@@ -15,6 +15,7 @@ public sealed class RabbitMqTlsTests
         Assert.Equal("broker.planta.local", factory.Ssl.ServerName);
         Assert.Equal(SslPolicyErrors.None, factory.Ssl.AcceptablePolicyErrors);
         Assert.Equal(SslProtocols.Tls12 | SslProtocols.Tls13, factory.Ssl.Version);
+        Assert.True(factory.Ssl.CheckCertificateRevocation);
         Assert.Equal(5671, factory.Port);
     }
 

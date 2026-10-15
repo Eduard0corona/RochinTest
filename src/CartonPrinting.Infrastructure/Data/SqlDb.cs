@@ -28,8 +28,12 @@ public sealed partial class SqlDb(DatabaseOptions options, ILogger<SqlDb>? logge
     public const int AppLockDeadlockVictim = 50205;
 
     private readonly ILogger _logger = logger ?? NullLogger<SqlDb>.Instance;
+    private long _deadlockRetries;
 
     public DatabaseOptions Options { get; } = options;
+
+    /// <summary>Transacciones reintentadas por un 1205 (o un -3 de sp_getapplock) desde que se creó esta instancia.</summary>
+    public long DeadlockRetries => Interlocked.Read(ref _deadlockRetries);
 
     public async Task<SqlConnection> OpenAsync(CancellationToken ct)
     {
@@ -69,6 +73,7 @@ public sealed partial class SqlDb(DatabaseOptions options, ILogger<SqlDb>? logge
             }
             catch (SqlException ex) when (IsDeadlock(ex) && attempt <= Options.MaxDeadlockRetries)
             {
+                Interlocked.Increment(ref _deadlockRetries);
                 _logger.LogWarning("1205 en la transacción; reintento {Attempt}", attempt);
                 await SafeRollbackAsync(tx);
                 await ClearSessionContextAsync(conn);

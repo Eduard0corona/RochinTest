@@ -131,6 +131,9 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
 
     public uint RevisedQueueSize { get; private set; }
 
+    /// <summary>Modo de seguridad y política del endpoint de la sesión (T12 los reporta).</summary>
+    public string? SessionSecurity { get; private set; }
+
     public int ReconnectCount { get; private set; }
 
     /// <summary>Eventos de conexión (keep-alive, reconexión, recuperación) con el reloj del EdgeHost.</summary>
@@ -166,6 +169,7 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
             throw new InvalidOperationException("El servidor no ofrece SignAndEncrypt.");
         }
 
+        SessionSecurity = $"{endpoint.SecurityMode} ({SecurityPolicies.GetDisplayName(endpoint.SecurityPolicyUri)})";
         var configured = new ConfiguredEndpoint(null, endpoint, EndpointConfiguration.Create(_config));
         var session = await new DefaultSessionFactory(Telemetry).CreateAsync(_config, configured, false, "CartonPrinting.OpcIngest",
             _options.SessionTimeoutMs, new UserIdentity(new AnonymousIdentityToken()), null, ct);

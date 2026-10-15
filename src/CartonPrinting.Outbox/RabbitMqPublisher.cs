@@ -20,7 +20,8 @@ public sealed class RabbitMqOptions
 
     /// <summary>
     /// La fábrica de conexiones del publicador y de los consumidores. Con TLS (Uri <c>amqps://</c> o <see cref="RabbitMqTlsOptions.Enabled"/>)
-    /// exige TLS 1.2 o 1.3 y un certificado del broker válido para el nombre esperado, sin errores de política aceptados.
+    /// exige TLS 1.2 o 1.3 y un certificado del broker válido para el nombre esperado, sin errores de política aceptados, y comprueba
+    /// su revocación salvo que la planta la desactive (<see cref="RabbitMqTlsOptions.CheckCertificateRevocation"/>).
     /// </summary>
     public ConnectionFactory CreateConnectionFactory(string clientName)
     {
@@ -36,6 +37,7 @@ public sealed class RabbitMqOptions
                 CertPassphrase = Tls.ClientCertificatePassphrase ?? string.Empty,
                 Version = SslProtocols.Tls12 | SslProtocols.Tls13,
                 AcceptablePolicyErrors = SslPolicyErrors.None,
+                CheckCertificateRevocation = Tls.CheckCertificateRevocation,
             };
         }
 
@@ -59,6 +61,12 @@ public sealed class RabbitMqTlsOptions
     public string? ClientCertificatePath { get; set; }
 
     public string? ClientCertificatePassphrase { get; set; }
+
+    /// <summary>
+    /// Comprueba la revocación del certificado del broker (lista de revocación u OCSP). Activa por defecto; una red de planta sin
+    /// acceso a la lista de revocación la desactiva de forma explícita (decisión de OT, en <c>docs/FAT_CHECKLIST.md</c>).
+    /// </summary>
+    public bool CheckCertificateRevocation { get; set; } = true;
 }
 
 /// <summary>Evento leído del Outbox para publicar.</summary>

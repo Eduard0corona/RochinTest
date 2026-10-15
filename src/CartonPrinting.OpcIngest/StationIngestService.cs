@@ -28,6 +28,19 @@ public enum IngestKind
     Registered,
 }
 
+/// <summary>
+/// Falla cerrada con SQL Server fuera de servicio, perfil mínimo (ESTRATEGIA_RECUPERACION §3). Los tiempos son de E/S, en tiempo
+/// real: no deciden el plazo de ninguna caja.
+/// </summary>
+public sealed record SqlFailClosedOptions
+{
+    /// <summary>Tiempo máximo de cada intento de registrar un ciclo, o de recargar el estado al volver SQL.</summary>
+    public TimeSpan AttemptTimeout { get; init; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>Cada cuánto se prueba si SQL volvió mientras la ingesta lo tiene declarado caído.</summary>
+    public TimeSpan RecoveryProbeInterval { get; init; } = TimeSpan.FromSeconds(1);
+}
+
 public sealed record IngestOutcome(
     IngestKind Kind,
     CycleRecord? Record = null,
@@ -57,15 +70,18 @@ public sealed class StationIngestService
     private readonly CycleDecoder _decoder;
     private readonly IErpDemand? _erpDemand;
     private readonly SemaphoreSlim _serial = new(1, 1);
+    private readonly SqlFailClosedOptions _failClosed;
     private SequenceClassifier _classifier = new([]);
-    private bool _sqlUnavailable;
+    private volatile bool _sqlUnavailable;
+    private long _recoveredAt = long.MinValue;
 
     public StationIngestService(
         StationSettings station, RegistrationService registration, StationConfigStore stations, PlcEpochStore epochs, SequenceStore sequence,
         TxsSweep sweep, TxmManualActions manual, EdgeClock clock, CartonMetrics metrics, ILogger<StationIngestService>? logger = null,
-        IErpDemand? erpDemand = null)
+        IErpDemand? erpDemand = null, SqlFailClosedOptions? failClosed = null)
     {
         _erpDemand = erpDemand;
+        _failClosed = failClosed ?? new SqlFailClosedOptions();
         _station = station;
         _registration = registration;
         _stations = stations;
@@ -80,6 +96,26 @@ public sealed class StationIngestService
     }
 
     public SequenceClassifier Classifier => _classifier;
+
+    /// <summary>
+    /// true desde que la ingesta declara SQL Server no disponible hasta que, al volver, recarga el estado de la estación. Mientras
+    /// tanto el latido mantiene LabelingReady en falso.
+    /// </summary>
+    public bool SqlUnavailable => _sqlUnavailable;
+
+    /// <summary>
+    /// El latido no pudo leer el estado de la estación porque SQL no responde: la caída se declara para la ingesta también, y
+    /// la recuperación la decide <see cref="RecoverWhileUnavailableAsync"/>.
+    /// </summary>
+    public void DeclareSqlUnavailable()
+    {
+        if (!_sqlUnavailable)
+        {
+            _sqlUnavailable = true;
+            _logger.LogError("SQL Server no responde a la lectura del latido en {Station}: falla cerrada; los ciclos hasta que vuelva serán un hueco",
+                _station.StationId);
+        }
+    }
 
     /// <summary>Reconstruye el estado de secuencia desde SQL (al arrancar y tras una acción manual sobre épocas).</summary>
     public async Task ReloadAsync(CancellationToken ct)
@@ -109,16 +145,40 @@ public sealed class StationIngestService
     }
 
     /// <summary>
-    /// Consume el canal hasta que se cancele. Con SQL Server fuera de servicio, el registro no se registra (será un hueco
-    /// al volver SQL; ver <see cref="ProcessAsync"/>). Cualquier otra excepción de SQL detiene el consumidor: no se salta
-    /// un registro por un defecto.
+    /// Consume el canal hasta que se cancele, con la vigilancia de la recuperación de SQL Server en paralelo. Con SQL fuera de
+    /// servicio, el registro no se registra (será un hueco al volver SQL; ver <see cref="ProcessLiveAsync"/>). Cualquier otra
+    /// excepción de SQL detiene el consumidor: no se salta un registro por un defecto.
     /// </summary>
     public async Task RunAsync(ChannelReader<RawNotification> reader, CancellationToken ct)
     {
         await ReloadAsync(ct);
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var consumer = ConsumeAsync(reader, stop.Token);
+        var recovery = RecoverWhileUnavailableAsync(stop.Token);
+        await Task.WhenAny(consumer, recovery);
+        await stop.CancelAsync();
+        await IgnoreCancellationAsync(consumer);
+        await IgnoreCancellationAsync(recovery);
+        ct.ThrowIfCancellationRequested();
+    }
+
+    private async Task ConsumeAsync(ChannelReader<RawNotification> reader, CancellationToken ct)
+    {
         await foreach (var raw in reader.ReadAllAsync(ct))
         {
             await ProcessAsync(raw, ct);
+        }
+    }
+
+    private static async Task IgnoreCancellationAsync(Task task)
+    {
+        try
+        {
+            await task;
+        }
+        catch (OperationCanceledException)
+        {
+            // Detención: quien llama decide con su propio token.
         }
     }
 
@@ -141,31 +201,30 @@ public sealed class StationIngestService
     }
 
     /// <summary>
-    /// SQL Server fuera de servicio, perfil mínimo (ESTRATEGIA_RECUPERACION §3, T19): falla cerrada.
+    /// SQL Server fuera de servicio, perfil mínimo (ESTRATEGIA_RECUPERACION §3, T19): falla cerrada, decidida por la recepción del
+    /// ciclo y no por el momento en que se procesa.
     /// <list type="bullet">
-    /// <item>Hasta dos reintentos cortos. Después, el ciclo no se registra: al volver SQL será parte de un hueco
-    /// (SequenceGap), nunca una detección.</item>
-    /// <item>El latido ya baja LabelingReady, porque no puede leer la estación.</item>
-    /// <item>Al volver, antes del primer registro, se recarga el estado de la estación desde SQL.</item>
+    /// <item>Cada intento dura como máximo <see cref="SqlFailClosedOptions.AttemptTimeout"/>, y hay hasta dos reintentos cortos.
+    /// Si fallan, la ingesta declara SQL no disponible: el latido baja LabelingReady y el ciclo no se registra.</item>
+    /// <item>Mientras está declarado, cada ciclo se rechaza sin ir a SQL.</item>
+    /// <item>Al volver, <see cref="RecoverWhileUnavailableAsync"/> recarga el estado y marca la recuperación. Un ciclo recibido antes
+    /// de esa marca se rechaza aunque se procese después (seguía en el canal): es parte del hueco, nunca una detección.</item>
     /// </list>
     /// </summary>
     private async Task<IngestOutcome> ProcessLiveAsync(CycleRecord record, CancellationToken ct)
     {
         for (var attempt = 1; ; attempt++)
         {
+            if (ReceivedDuringOutage(record))
+            {
+                return RejectUnavailable(record);
+            }
+
             try
             {
-                if (_sqlUnavailable)
-                {
-                    await ReloadAsync(ct);
-                    _sqlUnavailable = false;
-                    _logger.LogWarning("SQL Server volvió: estado de la estación {Station} recargado; los ciclos de la caída serán un hueco",
-                        _station.StationId);
-                }
-
-                return await ProcessRecordAsync(record, ct);
+                return await WithinAttemptAsync(t => ProcessRecordAsync(record, t), ct);
             }
-            catch (Exception ex) when (SqlAvailability.IsUnavailable(ex) && !ct.IsCancellationRequested)
+            catch (Exception ex) when (!ct.IsCancellationRequested && IsUnavailable(ex))
             {
                 if (attempt < 3)
                 {
@@ -174,11 +233,102 @@ public sealed class StationIngestService
                 }
 
                 _sqlUnavailable = true;
-                _metrics.Increment(MetricNames.OpcRecordsRejected, ("cause", "SQL_UNAVAILABLE"), ("transport", record.Transport));
-                _logger.LogError("SQL Server no disponible: el ciclo {Key} no se registra (falla cerrada; será un hueco al volver SQL)",
-                    record.Identity.IdempotencyKey);
-                return new IngestOutcome(IngestKind.Rejected, record, Rejection: "SQL_UNAVAILABLE");
+                _logger.LogError(ex, "SQL Server no disponible en {Station}: falla cerrada. LabelingReady baja y los ciclos hasta que vuelva serán un hueco",
+                    _station.StationId);
+                return RejectUnavailable(record);
             }
+        }
+    }
+
+    private bool ReceivedDuringOutage(CycleRecord record) =>
+        _sqlUnavailable || (record.ReceivedTimestamp is { } received && received < Interlocked.Read(ref _recoveredAt));
+
+    private IngestOutcome RejectUnavailable(CycleRecord record)
+    {
+        _metrics.Increment(MetricNames.OpcRecordsRejected, ("cause", "SQL_UNAVAILABLE"), ("transport", record.Transport));
+        _logger.LogWarning("El ciclo {Key}, recibido con SQL Server no disponible, no se registra (falla cerrada; será un hueco)",
+            record.Identity.IdempotencyKey);
+        return new IngestOutcome(IngestKind.Rejected, record, Rejection: "SQL_UNAVAILABLE");
+    }
+
+    private static bool IsUnavailable(Exception ex) => ex is TimeoutException || SqlAvailability.IsUnavailable(ex);
+
+    /// <summary>
+    /// Un intento acotado por <see cref="SqlFailClosedOptions.AttemptTimeout"/>. Al vencer se cancela y se deja de esperar
+    /// (TimeoutException): SqlClient no siempre corta enseguida una conexión que dejó de responder, y parte de su API asíncrona
+    /// bloquea (BeginTransactionAsync), por eso corre en el pool de hilos. El intento abandonado conserva el lock del consumidor
+    /// hasta terminar, así que nada más toca el estado en memoria mientras tanto.
+    /// </summary>
+    private async Task<T> WithinAttemptAsync<T>(Func<CancellationToken, Task<T>> action, CancellationToken ct)
+    {
+        var attempt = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var task = Task.Run(() => action(attempt.Token), CancellationToken.None);
+        _ = task.ContinueWith(t =>
+        {
+            _ = t.Exception;
+            attempt.Dispose();
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        try
+        {
+            return await task.WaitAsync(_failClosed.AttemptTimeout, ct);
+        }
+        catch (TimeoutException)
+        {
+            try
+            {
+                await attempt.CancelAsync();
+            }
+            catch (ObjectDisposedException)
+            {
+                // El intento terminó justo al vencer.
+            }
+
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Mientras SQL Server está declarado no disponible, prueba cada <see cref="SqlFailClosedOptions.RecoveryProbeInterval"/> si
+    /// volvió, sin esperar a que llegue un ciclo: con LabelingReady en falso, la línea puede no mandar ninguno. Al volver recarga
+    /// revisión, épocas y marca alta (arranque, etapa 5) y marca la recuperación con el reloj monotónico; solo entonces el latido
+    /// puede volver a levantar LabelingReady (etapa 8). El barrido de la estación sigue con su propio intervalo (etapa 6).
+    /// </summary>
+    private async Task RecoverWhileUnavailableAsync(CancellationToken ct)
+    {
+        while (true)
+        {
+            await Task.Delay(_failClosed.RecoveryProbeInterval, ct);
+            if (!_sqlUnavailable)
+            {
+                continue;
+            }
+
+            try
+            {
+                await WithinAttemptAsync(async t =>
+                {
+                    await _serial.WaitAsync(t);
+                    try
+                    {
+                        await ReloadCoreAsync(t);
+                    }
+                    finally
+                    {
+                        _serial.Release();
+                    }
+
+                    return true;
+                }, ct);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested && IsUnavailable(ex))
+            {
+                continue;
+            }
+
+            Interlocked.Exchange(ref _recoveredAt, _clock.GetTimestamp());
+            _sqlUnavailable = false;
+            _logger.LogWarning("SQL Server volvió: estado de la estación {Station} recargado; los ciclos recibidos durante la caída quedan como hueco",
+                _station.StationId);
         }
     }
 

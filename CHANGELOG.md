@@ -13,6 +13,14 @@ Cambios de la implementación. Los de la especificación están en `spec/CHANGEL
 - Seguridad: RabbitMQ con TLS configurable (`RabbitMq__Tls__*` o `amqps://`), `build/check_secrets.py` en la compuerta y `OpcSecurityTests` (SignAndEncrypt con validación estricta contra el PLC simulado).
 - Demo con el EdgeHost real como proceso (`tests/CartonPrinting.DemoHost`, `docs/DEMO.md`) y lista de aceptación en planta (`docs/FAT_CHECKLIST.md`).
 - Compuerta: paso de secretos y opción `--carga`.
+- Revisión independiente:
+  - la falla cerrada con SQL caído se decide por la recepción del ciclo: intentos acotados, una sola caída para la ingesta y el latido, vigilancia de la recuperación y `LabelingReady` en falso hasta recargar el estado (T19 con SQL congelado y con ciclos procesados después de volver);
+  - T16 concurrente, con el 1205 forzado y reintentado;
+  - T08 con el plazo nominal;
+  - el benchmark con barrido, Outbox Relay y SignAndEncrypt, y la sección de errores y escenarios excluidos;
+  - prerrequisitos de planta en `FAT_CHECKLIST.md`;
+  - la revocación del certificado TLS de RabbitMQ;
+  - logs sin el endpoint OPC.
 - Pruebas: T08, T12, T16, T19 y T32 en verde contra SQL Server y RabbitMQ reales y simuladores.
 
 ## Fase 6 · Perfil extendido (2026-10-15)

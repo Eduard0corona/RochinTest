@@ -278,14 +278,12 @@ public sealed class TxaRegisterDetection(SqlDb db)
     }
 
     /// <summary>
-    /// Recirculación (H8, CARTON_ID_REQUIRED): bloqueo de rango sobre IX_PrintJob_Carton e
-    /// IX_CartonDetection_Carton con UPDLOCK, HOLDLOCK. La comparten TX-A y TX-E.
-    /// </summary>
-    /// <summary>
-    /// Recirculación (H8): un job vivo de la caja, o una detección anterior de la caja que espera snapshot. "Anterior" por
-    /// ReceivedAt y, si empatan, por época y ciclo (el orden en que pasó la caja): en TX-A la detección nueva es siempre la
-    /// última; en TX-E, de dos detecciones de la misma caja en WAITING_ERP solo la segunda es recirculación (SI-17, decidido
-    /// por la persona; catálogo de T16).
+    /// Recirculación (H8, CARTON_ID_REQUIRED), compartida por TX-A y TX-E con bloqueo de rango (UPDLOCK, HOLDLOCK) sobre
+    /// IX_PrintJob_Carton e IX_CartonDetection_Carton: un job vivo de la caja, o una detección anterior de la caja que espera
+    /// snapshot. "Anterior" por ReceivedAt y, si empatan al milisegundo, por número de época y ciclo. De dos detecciones de la
+    /// misma caja en WAITING_ERP solo la posterior es recirculación (SI-17, decidido por la persona; catálogo de T16). Un registro
+    /// reingresado (ANOMALY_REINGEST) conserva su ReceivedAt y puede ser anterior a una detección ya registrada: si esa tiene job,
+    /// el reingreso queda bloqueado; si espera snapshot, es la posterior la que queda bloqueada en TX-E. En ningún orden hay dos jobs.
     /// </summary>
     public static async Task<bool> IsRecirculatedAsync(
         SqlConnection conn, SqlTransaction tx, string siteId, string cartonId, Guid detectionId, DateTime receivedAt, long plcEpoch, ulong cycleId,

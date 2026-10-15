@@ -1190,7 +1190,7 @@ Compuerta en verde.
 
 ### Decisiones
 
-1. **SQL caído: falla cerrada en el perfil mínimo** (ESTRATEGIA_RECUPERACION §3, OT-13 por defecto). Un ciclo que no se puede registrar no se registra: al volver SQL es parte de un hueco (`SequenceGap`), nunca una detección inventada (I07, I16). El latido baja `LabelingReady` porque no puede leer la estación.
+1. **SQL caído: falla cerrada en el perfil mínimo** (ESTRATEGIA_RECUPERACION §3, OT-13 por defecto). Un ciclo que no se puede registrar no se registra: al volver SQL es parte de un hueco (`SequenceGap`), nunca una detección inventada (I07, I16). Cómo se decide qué ciclos son de la caída, después de la revisión: decisión 7.
 2. **RabbitMQ caído: simulado con un proxy TCP** entre el Outbox Relay y el broker, que corta las conexiones y no acepta nuevas. Detener el contenedor cambiaría su puerto en Testcontainers.
    - El consumidor se conecta al broker directamente: lo que se prueba es la independencia del EdgeHost.
    - T08 corre sin otras pruebas del ensamblado en paralelo, porque compara la latencia de impresión antes y durante la caída.
@@ -1200,6 +1200,32 @@ Compuerta en verde.
    - El PLC simulado negocia la publicación en 100 ms aunque se pidan 20: está en el reporte.
 5. **La demo hace de integración de evidencia.** El EdgeHost no tiene una entrada de evidencia propia (Fase 4), así que la demo aplica por TX-D la evidencia que informan la impresora, el aplicador y el escáner simulados. El PLC simulado va sin cifrado en la demo (laboratorio); la seguridad de planta la prueba `OpcSecurityTests`.
 6. **Secretos.** La revisión excluye `tests/`, porque las credenciales de los contenedores efímeros no son de planta, y `spec/`. Las variables de sqlcmd, de entorno y de plantilla no cuentan como contraseñas.
+7. **Falla cerrada decidida por la recepción** (revisión independiente, A1 y M1).
+   - **Una sola caída** para la ingesta y el latido. La declara la ingesta cuando un ciclo agota sus tres intentos, de hasta 1 s cada uno (`SqlAttemptTimeoutMs`). También la declara el latido cuando no puede leer la estación: sin respuesta en ese mismo tiempo, o con SQL no disponible.
+   - **Mientras está declarada:** `LabelingReady` en falso, y cada ciclo se rechaza sin ir a SQL.
+   - **Vigilancia de la recuperación.** Prueba cada segundo si SQL volvió, sin esperar ciclos: con `LabelingReady` en falso, la línea puede no mandar ninguno. Al volver:
+     - recarga el estado (etapa 5 del arranque);
+     - marca la recuperación con el reloj monotónico;
+     - recién entonces el latido levanta `LabelingReady` (etapa 8). El barrido sigue con su intervalo (etapa 6).
+   - **Regla de recepción.** Un ciclo recibido antes de esa marca se rechaza aunque se procese después: es parte del hueco, nunca una detección.
+   - **Tiempos.** Los tiempos de los intentos son de E/S, en tiempo real, y no deciden ningún plazo. Un intento que vence se abandona, porque SqlClient no siempre corta enseguida una conexión que dejó de responder. Conserva el lock del consumidor hasta terminar.
+   - **Costos aceptados.**
+     - Tras volver SQL, los ciclos que llegan antes de que la vigilancia lo note (hasta 1 s) también son hueco, todavía con `LabelingReady` en falso.
+     - Un TX-A abandonado que sí alcanzó a confirmar deja registrada una detección real; el claim vuelve a comprobar su plazo.
+8. **Benchmark con la composición declarada** (M4). `StationPipeline` agrega:
+   - el barrido cada 200 ms;
+   - OPC UA con SignAndEncrypt y validación estricta, con el certificado del PLC en el almacén de confianza;
+   - en T12, el Outbox Relay con publisher confirms hacia RabbitMQ.
+
+   El reporte declara la composición, los errores de la corrida y los escenarios excluidos: fallas, ERP en caché, operación, propiedad, consumidor y hardware.
+9. **T08 con el plazo nominal** (M3): `TransitBudgetMs` 1500, `DeviceLeadTimeMs` 400 y `SendMarginMs` 250, como T12.
+   - Una caja demorada durante la caída vence, y la prueba falla.
+   - "Latencias de impresión sin cambio" no tiene un número en el catálogo. Los márgenes son de ruido de una sola máquina:
+     - p50 durante la caída ≤ p50 antes + 20 ms;
+     - p95 ≤ el mayor entre 1,5 veces y + 50 ms;
+     - p99 ≤ el mayor entre 2 veces y + 100 ms.
+   - El máximo lo acota el plazo.
+   - Diez cajas de calentamiento quedan fuera de la medición.
 
 ### Comandos y resultados
 
@@ -1216,6 +1242,21 @@ Durante el desarrollo:
 - **La tercera corrida pasó** las comprobaciones funcionales (690 cajas, ninguna perdida ni duplicada), pero no la de latencia (p95 de 509 ms durante la caída frente a 46 ms antes). La caída coincidió con las compilaciones y mutaciones de las revisiones de las Fases 4 y 5. Desde entonces T08 corre sola y se repitió con la máquina en reposo.
 - **`LatencySegmentsTests`** falló dos veces bajo la carga de esas revisiones. La primera caja en frío tardaba 1,7 s, con conexión y JIT, y el resto arrastraba el backlog. Además, un job venció sin la señal con un plazo de 5 s. Ahora tiene tres cajas de calentamiento, un plazo de 15 s y la comparación sobre diez cajas a una por segundo: tres corridas seguidas en verde.
 - **La corrida corta de T12** (1 minuto y 30 segundos) mostró que la desigualdad se cumplía y el margen no. Ver la decisión 4.
+
+Después de la revisión independiente, con la máquina en reposo:
+
+- **T19, las tres pruebas** (`--filter FullyQualifiedName~SqlOutageTests`): correctas en 18, 26 y 44 s.
+- **T16 y T32** (`--filter FullyQualifiedName~RecirculationTests`): las cuatro correctas.
+- **`OpcSecurityTests`, `DemoTests` y `LatencySegmentsTests`** con la composición nueva (SignAndEncrypt y barrido): correctas.
+- **T12, corrida corta** (fases de 1 minuto y 30 s, revertidas después) con el Outbox Relay y SignAndEncrypt: correcta. 130 jobs `CONFIRMED`, 260 eventos publicados, ninguna falla de servicio.
+- **T08 con el plazo nominal**, sin calentamiento, 2026-10-15 07:41: falló, con 2 de 750 jobs sin `CONFIRMED` (`Expected: 750, Actual: 748`).
+- **T08 con calentamiento y diagnóstico**, 2026-10-15 07:58:
+
+```
+  Correctas CartonPrinting.FaultTests.Hardening.BrokerOutageTests.Ten_minutes_without_rabbitmq_change_nothing_in_printing_and_lose_no_event [12 m 41 s]
+ T08 latencia recepción→escritura (ms): antes p50=39 p95=41 p99=43 máx=63; durante p50=39 p95=43 p99=64 máx=141; cajas=750
+   ciclo 1539 a 419.0 s del corte: recepción→claim 34 ms, claim→escritura 107 ms, intentos 1
+```
 
 T12, corrida completa con la máquina en reposo, terminada el 2026-10-15 a las 06:46 hora local (13:46 UTC):
 
@@ -1240,7 +1281,38 @@ Pruebas totales: 1
 
 ### Pruebas de la fase
 
-- **T08, T12, T16, T19 y T32: PASA** (detalle en `docs/TEST_STATUS.md`). T12 corre aparte, con `Category=Load`, y en la compuerta de la fase con `--carga`.
+{PRUEBAS}
+
+### Revisión independiente
+
+Subagente `revisor-adversarial` sobre `4b06425` (2026-10-15). No ejecutó `dotnet build` ni `dotnet test`, porque la compuerta de la fase corría en la misma máquina y sus pruebas comparan latencias. Ejecutó el verificador, la revisión de secretos y la trazabilidad de la fase, y contrastó `docs/BENCHMARK.md` con el JSON de la corrida. Resultado: 1 ALTA, 6 MEDIA y 10 BAJA.
+
+La compuerta de `4b06425` corría a la par y se detuvo para corregir. Antes de detenerla había pasado las pruebas sin carga: 171, 99 y 102, entre ellas T08, T16, T19 y T32. Esa corrida no cuenta como evidencia de la fase, porque el código cambió después.
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| A1: la falla cerrada se decidía al procesar el registro, no al recibirlo. Con SQL colgado (sin cortar conexiones), los ciclos encolados durante la caída se registraban al volver SQL, algunos con job e impresión, sin hueco | Alta | Decisión 7. Pruebas `Sql_that_stops_answering_with_pooled_connections_…` (proxy congelado, pool y tiempos por defecto) y `A_cycle_received_during_the_outage_and_processed_after_sql_returns_is_part_of_the_gap` (la prueba entrega al consumidor, después de la recuperación, ciclos recibidos durante la caída) |
+| M1: `LabelingReady` no dependía de la ingesta: con TX-A sin respuesta y lecturas que funcionan seguía en verdadero; con SQL colgado el latido quedaba bloqueado; al volver subía con la primera lectura, sin la recarga | Media | Decisión 7. La prueba anterior incluye un latido que lee SQL sin el proxy: en falso mientras la ingesta tiene la caída declarada, en verdadero después de la recarga. T19 comprueba además el gauge `labeling_ready` en cada muestra de la caída |
+| M2: T16 no ejercitaba el bloqueo de rango ni el reintento del 1205 | Media | Pruebas `Two_cycles_of_the_same_carton_registered_at_once_end_with_one_job_after_a_deadlock_retry`, con el 1205 forzado (contador `SqlDb.DeadlockRetries`), y `A_snapshot_arrival_and_a_new_cycle_of_the_same_carton_at_once_end_with_one_job` (TX-A contra TX-E) |
+| M3: T08 usaba un plazo de 5 s y una tolerancia de p95 amplia; la corrida registrada tuvo un máximo de 3941 ms durante la caída | Media | Decisión 9. La primera corrida con el plazo nominal falló: 2 de 750 jobs sin `CONFIRMED`, fuera de la caída (la espera de los jobs de la caída se había cumplido), y la prueba no decía cuáles. La causa probable es el arranque en frío de las primeras cajas, que con un plazo efectivo de unos 800 ms ya no alcanza. No quedó demostrado. Se agregaron diez cajas de calentamiento fuera de la medición y un diagnóstico antes de las aserciones (las cajas sin `CONFIRMED` y las cinco más lentas de la caída). En la segunda corrida, todas `CONFIRMED`. La pausa de 3,9 s de la corrida anterior no se repitió |
+| M4: `docs/BENCHMARK.md` decía "la composición del EdgeHost" sin barrido, sin Outbox Relay y con OPC UA sin cifrado; no tenía la sección de errores y escenarios excluidos | Media | Decisión 8 |
+| M5: pruebas dadas por pasadas sin evidencia registrada; la corrida de T08 era anterior al commit que cambió la fábrica de conexiones de RabbitMQ | Media | `TEST_STATUS.md` se llena con la compuerta final de la fase, que corre T08 y T12 sobre el código final. El registro dice qué corrida respalda cada resultado |
+| M6: `FAT_CHECKLIST.md` no decía que el EdgeHost no tiene entrada de evidencia | Media | Nueva sección 0, de prerrequisitos que el MVP no implementa: la integración de evidencia y la compuerta física |
+| BAJA 1: el EdgeHost no pasaba la señal a TX-E | Baja | `StationServicesHostedService` pasa `ReadyJobSignal` a `ErpArrivalService` |
+| BAJA 2: el registro de tres métricas quedaba entre `writeTs` y la escritura | Baja | Se registran después de invocar la escritura (también si falla) |
+| BAJA 3: SI-17 afirmaba que en TX-A la detección nueva es siempre la última; resumen duplicado | Baja | SI-17 corregido (el reingreso conserva su `ReceivedAt` y sigue habiendo un solo job) y un solo resumen |
+| BAJA 4: con `CARTON_ID_REQUIRED` activa y una detección sin `CartonId`, TX-E crea el job y TX-A la bloquea | Baja | Registrado como extensión de SI-04 (clase B, abierto): D08 no tiene un motivo para ese caso. No se rodea en el código |
+| BAJA 5: la variante de T16 del catálogo es inalcanzable | Baja | SI-19 (clase A), con el parche propuesto; pendiente de aprobación. La prueba ejercita el escenario alcanzable |
+| BAJA 6: con una época nueva después de la caída, los ciclos descartados no abren hueco | Baja | Registrado en `FAT_CHECKLIST.md` (sección 3) y en los riesgos: solo los cuenta `opc_records_rejected_total{cause=SQL_UNAVAILABLE}` |
+| BAJA 7: endpoint OPC en los logs; contraseña en la línea de comandos de la demo; TLS sin comprobar revocación | Baja | Los logs nombran la estación, no el endpoint. La demo toma la cadena de conexión de una variable de entorno. `RabbitMqTlsOptions.CheckCertificateRevocation`, activa por defecto, en `FAT_CHECKLIST.md` |
+| BAJA 8: las marcas de recepción se vaciaban todas al llegar a 10 000 | Baja | Se descartan las más antiguas |
+| BAJA 9: T19 afirmaba al menos un rechazo, no 25 | Baja | Exactamente 25 (y 20 y 5 en las variantes) |
+| BAJA 10: T08 no fuerza una entrega duplicada | Baja | La deduplicación por `InboxMessage` la ejercita T14 (Fase 1). T08 comprueba que cada `EventId` se aplica una vez |
+
+Mutaciones ejecutadas después de las correcciones, cada una revertida:
+
+- **Sin la regla de recepción (solo el estado declarado):** la variante con el proxy congelado sigue pasando, porque el canal se vacía durante la caída. La prueba que entrega los ciclos después de la recuperación falla: 4 detecciones de 502 a 505.
+- **Sin `UPDLOCK, HOLDLOCK` sobre `CartonDetection`:** falla la prueba concurrente de T16, porque no hay interbloqueo que reintentar. Con el rango de `PrintJob` solo, el resultado igual es un job.
 
 ### Lo que no se verificó
 
@@ -1251,8 +1323,12 @@ Pruebas totales: 1
 - **OPC UA con SignAndEncrypt:** se prueba contra el PLC simulado con certificados autofirmados en directorios temporales; la PKI de planta (emisor, revocación) no se probó.
 - **La revisión de secretos** busca patrones conocidos (certificados, claves privadas, contraseñas literales, credenciales en Uri de RabbitMQ). No reemplaza una herramienta de detección de secretos.
 - **La demo** hace de integración de evidencia (el EdgeHost no tiene una propia) y conecta el PLC simulado sin cifrado.
+- **SQL Server sin respuesta** se simula con el proxy congelado. No se probó cuánto tarda SqlClient en soltar una conexión que no responde ni una caída de red real. La ingesta no depende de eso, porque abandona el intento a los 1 s.
+- **Logs.** Los mensajes del EdgeHost ya no nombran el endpoint OPC, pero el texto de una excepción del cliente OPC UA o de SqlClient puede incluir la dirección del servidor. No se revisaron todas.
 
 ### Riesgos
 
 - Las pruebas que comparan latencias (T08 y `LatencySegmentsTests`) dependen de que la máquina no esté cargada. T08 corre sola; las demás tienen calentamiento y márgenes amplios.
 - La compuerta completa con `--carga` tarda más de una hora.
+- **Falla cerrada.** Una lectura lenta del latido (más de `SqlAttemptTimeoutMs`) declara la caída. Hasta que la vigilancia recarga el estado, en alrededor de 1 s, los ciclos que llegan son hueco: es una falla cerrada más sensible que la de antes.
+- **Caída de SQL Server y reinicio del PLC a la vez.** Si el ciclo siguiente a la caída llega con una época nueva, los ciclos descartados no quedan como hueco de la época anterior. Solo los cuenta `opc_records_rejected_total{cause=SQL_UNAVAILABLE}` (revisión, BAJA-6; en `docs/FAT_CHECKLIST.md`).

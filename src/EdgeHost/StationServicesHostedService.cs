@@ -82,7 +82,8 @@ public static class StationComposition
                 var metrics = sp.GetRequiredService<CartonPrinting.Infrastructure.Observability.CartonMetrics>();
                 var stations = new CartonPrinting.Infrastructure.Data.StationConfigStore(db);
                 var arrivals = new ErpArrivalService(new CartonPrinting.Infrastructure.Transactions.TxeErpArrival(db), stations,
-                    new CartonPrinting.Infrastructure.Data.LabelSerialSource(db), station, clock, metrics);
+                    new CartonPrinting.Infrastructure.Data.LabelSerialSource(db), station, clock, metrics,
+                    sp.GetService<CartonPrinting.Infrastructure.Signals.ReadyJobSignal>());
                 return new ErpSnapshotSync(station, sp.GetRequiredService<HttpErpClient>(), db, new CartonPrinting.Infrastructure.Data.ErpCacheStore(db), arrivals,
                     clock, metrics, erpOptions, sp.GetRequiredService<ILogger<ErpSnapshotSync>>());
             });

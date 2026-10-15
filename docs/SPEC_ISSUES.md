@@ -25,6 +25,7 @@ Clasificación de `CLAUDE.md`:
 | SI-16 | B (vacío) | 3 | `DOCUMENTO_PRINCIPAL.md` secciones 10.2 y 645; `docs/ESTRATEGIA_RECUPERACION.md` (trabajo pendiente tras `CLOCK_JUMP`) | Resuelto por decisión de la persona: lo pendiente vence al confirmar el salto |
 | SI-17 | B (contradicción entre fuentes) | 7 | `spec/database/sqlserver_operations_reference.sql` (recirculación en TX-E) frente al catálogo de T16 | Resuelto por decisión de la persona: solo cuentan las detecciones anteriores, con la identidad más restrictiva |
 | SI-18 | B (vacío) | 4 | `contracts/state-machine.json` (J06: un error o un apagado entre el claim y la escritura) | Resuelto por decisión de la persona: NOT_SENT sin consumir intento |
+| SI-19 | A | 7 | `spec/tests/test-catalog.json` (T16, variante) | Abierto: parche propuesto, pendiente de la aprobación de la persona; la prueba ejercita el escenario alcanzable |
 
 ## SI-01 · Rango de códigos de error en el criterio de T47
 
@@ -52,6 +53,7 @@ Clasificación de `CLAUDE.md`:
 - **Vacío.** Con `CartonIdentityMode = CARTON_ID_REQUIRED`, la especificación exige identidad física leída antes de etiquetar (sección 12, ADR 0013) y valida la recirculación con `CartonId`, pero no dice qué hacer con un registro que llega sin `CartonId`.
 - **Trabajo afectado detenido.** Como corresponde a un defecto de clase B, ese camino no se implementa con una salida propia: queda en falla cerrada. Un registro que de otro modo sería candidato a job queda `BLOCKED` con `INCOHERENT_SNAPSHOT` (el registro no trae un dato que la revisión declara obligatorio y sin él no se puede validar la recirculación), no imprime y nunca se inventa un `CartonId` (I07). Elegir `INCOHERENT_SNAPSHOT` es una decisión interina de la implementación (el motivo de bloqueo más cercano a "registro incompleto"), no algo que diga la especificación. El interino no pasa por encima de otras clasificaciones: un registro sin plazo confiable sigue D04 (`EXPIRED` con `LATE_ARRIVAL`) y uno que la secuencia ya bloqueó conserva su motivo (`ReferenceCoverageTests.Review2_b5_…`).
 - **Por qué clase B.** Elegir el motivo definitivo (u otra salida, por ejemplo esperar un lector) es una decisión de comportamiento. Pendiente de la persona. El resto de las fases no depende de este caso borde.
+- **Extensión encontrada en la Fase 7 (revisión independiente, BAJA-4).** El mismo vacío aparece en TX-E. Una detección registrada con `CYCLE_ONLY` y sin `CartonId` puede esperar snapshot mientras la revisión activa pasa a `CARTON_ID_REQUIRED`. Al llegar el snapshot, el modo más restrictivo (SI-17) es `CARTON_ID_REQUIRED`, pero D08 solo admite `STATION_DISABLED` o `RECIRCULATED_CARTON`: no hay un motivo para bloquear por falta de `CartonId`, y TX-E crea el job. TX-A, en cambio, bloquea un registro así (el interino de arriba). No se rodea en el código: queda como parte de la decisión pendiente de SI-04, que debe decir también qué hace D08 en ese caso.
 
 ## SI-05 · Registro `GATEWAY_RECEIPT` en vivo que abre un hueco: regla de negocio del verificador
 
@@ -163,8 +165,14 @@ Clasificación de `CLAUDE.md`:
 
 - **Contradicción.** TX-E repite la validación de recirculación de TX-A (D08) cuando llega el snapshot de una detección en `WAITING_ERP`. La sentencia de referencia, aplicada al pie de la letra, cuenta como recirculación cualquier otra detección de la misma caja en `WAITING_ERP`, también las posteriores. Con dos ciclos de la caja C-77 esperando snapshot, el primero queda `BLOCKED` con `RECIRCULATED_CARTON` y el segundo crea el job. El catálogo de T16 espera lo contrario: el primer paso de la caja se etiqueta y el segundo es la recirculación.
 - **Segundo vacío.** Si la revisión cambió entre TX-A y TX-E, la especificación no dice qué `CartonIdentityMode` aplica: el congelado en la detección o el de la revisión activa.
-- **Decisión de la persona (2026-10-15).** Solo cuentan las detecciones anteriores de la caja: por `ReceivedAt` y, si empatan, por época y ciclo, que es el orden en que pasó la caja. En TX-A la detección nueva es siempre la última, así que nada cambia ahí. El modo de identidad es el más restrictivo entre el congelado y el activo (`DeadlinePolicy.EffectiveRequiresCartonId`), como el plazo efectivo (SI-09, SI-14).
-- **Pruebas.** T16, con la variante de dos ciclos de la misma caja en `WAITING_ERP` (`RecirculationTests`), y la cobertura de D08 en TX-E (`ReferenceCoverageTests`).
+- **Decisión de la persona (2026-10-15).** Solo cuentan las detecciones anteriores de la caja: por `ReceivedAt` y, si empatan, por época y ciclo, que es el orden en que pasó la caja. El modo de identidad es el más restrictivo entre el congelado y el activo (`DeadlinePolicy.EffectiveRequiresCartonId`), como el plazo efectivo (SI-09, SI-14).
+- **Corrección de este registro (revisión independiente de la Fase 7, BAJA-3).** Una versión anterior decía que en TX-A la detección nueva es siempre la última. No es así: un registro reingresado (`ANOMALY_REINGEST`) conserva su `ReceivedAt` original y puede ser anterior a una detección ya registrada de la misma caja. El resultado sigue siendo un solo job: si la detección registrada tiene job, el reingreso queda `BLOCKED` con `RECIRCULATED_CARTON`; si espera snapshot, las dos esperan y TX-E bloquea la posterior. El empate de `ReceivedAt` al milisegundo se desempata por el número de época y luego por ciclo; dos pasos de la misma caja en el mismo milisegundo no son físicamente posibles.
+- **Pruebas.** T16 en `RecirculationTests`:
+  - la variante de dos ciclos de la misma caja en `WAITING_ERP`;
+  - dos TX-A concurrentes de la misma caja, con el 1205 forzado y reintentado;
+  - TX-A y TX-E concurrentes.
+
+  Además, la cobertura de D08 en TX-E (`ReferenceCoverageTests`).
 
 ## SI-18 · Un error o un apagado entre el claim y la escritura
 
@@ -176,3 +184,10 @@ Clasificación de `CLAUDE.md`:
   - Dejar el intento en `SENDING` hasta TX-R0: un `UNKNOWN` falso y la impresora ocupada hasta reiniciar.
 - **Clase B. Decisión de la persona (2026-10-15): sin consumir intento**, el interino. Queda como está en el código.
 
+## SI-19 · Variante de T16 inalcanzable con `CARTON_ID_REQUIRED`
+
+- **Evidencia.** La variante de T16 pide que, con `CartonIdentityMode = CARTON_ID_REQUIRED`, "dos ciclos de C-77 llegan sin snapshot y quedan WAITING_ERP". Con esa revisión activa, TX-A valida la recirculación del segundo ciclo y encuentra el primero en `WAITING_ERP`: lo bloquea con `RECIRCULATED_CARTON` (D05). Las dos detecciones nunca esperan snapshot a la vez. Sucede con cualquier orden y concurrencia, porque la validación toma el rango de `IX_CartonDetection_Carton`.
+- **Escenario alcanzable que la prueba ejercita.** Los dos ciclos se registran con `CYCLE_ONLY` y esperan snapshot; después se activa una revisión con `CARTON_ID_REQUIRED` y llega el snapshot. TX-E aplica el modo más restrictivo (SI-17): el primero crea el job (D06) y el segundo queda `BLOCKED` con `RECIRCULATED_CARTON` (D08). Es el resultado que espera el catálogo.
+- **Clase A.** Solo cambia el texto del escenario, no una regla.
+- **Parche mínimo propuesto** en `tests/test-catalog.json`, `injection` de T16: "Variante: dos ciclos de C-77 registrados con `CYCLE_ONLY` llegan sin snapshot y quedan WAITING_ERP; se activa `CARTON_ID_REQUIRED` y después llega el snapshot". Se regenera `tests/MATRIZ_PRUEBAS.md`.
+- **Estado.** Pendiente de la aprobación de la persona: la edición de `spec/` no se aplicó. Ningún trabajo depende de ella.

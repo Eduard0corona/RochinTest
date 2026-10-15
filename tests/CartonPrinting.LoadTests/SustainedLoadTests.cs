@@ -9,13 +9,14 @@ using CartonPrinting.Testing;
 namespace CartonPrinting.LoadTests;
 
 /// <summary>
-/// T12 · Carga sostenida y capacidad, con simuladores y la composición del EdgeHost (PLC por OPC UA, ingesta real, señal
-/// en proceso, sender con sondeo de respaldo de 50 ms, impresora, aplicador y escáner simulados), contra SQL Server real.
+/// T12 · Carga sostenida y capacidad, con simuladores y la composición del EdgeHost (<see cref="StationPipeline"/>: PLC por OPC UA
+/// con SignAndEncrypt, ingesta real, señal en proceso, sender con sondeo de respaldo de 50 ms, barrido cada 200 ms, Outbox Relay
+/// hacia RabbitMQ, impresora, aplicador y escáner simulados), contra SQL Server y RabbitMQ reales.
 /// La tasa y el payload no están acordados con OT: se usa la hipótesis declarada (una caja por segundo con el payload del
 /// simulador; 30 minutos a esa tasa y 10 al doble). Reporta p50, p95, p99 y máximo de cada tramo, el backlog y la desigualdad
 /// de factibilidad del plazo; no valida tiempos físicos (impresión, aplicación y lectura son del simulador).
 /// </summary>
-public sealed class SustainedLoadTests(SqlServerFixture sql) : IAsyncLifetime
+public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rabbit) : IAsyncLifetime, IClassFixture<RabbitMqFixture>
 {
     private static readonly (string Name, double BoxesPerSecond, TimeSpan Duration)[] Phases =
     [
@@ -51,7 +52,8 @@ public sealed class SustainedLoadTests(SqlServerFixture sql) : IAsyncLifetime
         {
             MinConfirmationLevel = EvidenceLevel.Verified, EvidenceWindowMs = 5_000, SendMarginMs = 250,
         }, Ct, TimeProvider.System);
-        await using var p = await StationPipeline.StartAsync(s, new EvidenceSources(PrinterCompletion: true, Applicator: true, Scanner: true), Ct);
+        await using var p = await StationPipeline.StartAsync(s, new EvidenceSources(PrinterCompletion: true, Applicator: true, Scanner: true), Ct,
+            rabbitUri: rabbit.Uri);
 
         // Calentamiento, fuera de la muestra: conexión con la impresora y código y planes de SQL en frío.
         ulong cycle = 1;
@@ -109,6 +111,33 @@ public sealed class SustainedLoadTests(SqlServerFixture sql) : IAsyncLifetime
             Assert.True(backlog.TakeLast(60).Max() <= 3 * (int)Math.Ceiling(rate), $"{name}: backlog del último minuto {backlog.TakeLast(60).Max()}");
         }
 
+        // El Outbox se publica entero: cada caja deja su CartonDetected y su PrintJobResult.
+        var outboxDeadline = DateTime.UtcNow.AddSeconds(60);
+        while (await s.CountAsync("FROM dbo.OutboxEvent WHERE PublishedAt IS NULL", null, Ct) > 0 && DateTime.UtcNow < outboxDeadline)
+        {
+            await Task.Delay(250, Ct);
+        }
+
+        // Errores de la corrida (RENDIMIENTO_Y_SEGURIDAD, reporte de benchmark): estados finales, rechazos y fallas de servicios.
+        var jobsByStatus = (await s.QueryAsync("SELECT Status, COUNT(*) FROM dbo.PrintJob GROUP BY Status", null, r => (r.GetString(0), r.GetInt32(1)), Ct))
+            .ToDictionary(x => x.Item1, x => x.Item2);
+        var detectionsByStatus = (await s.QueryAsync("SELECT Status, COUNT(*) FROM dbo.CartonDetection GROUP BY Status", null,
+            r => (r.GetString(0), r.GetInt32(1)), Ct)).ToDictionary(x => x.Item1, x => x.Item2);
+        var outboxEvents = await s.CountAsync("FROM dbo.OutboxEvent", null, Ct);
+        var outboxPending = await s.CountAsync("FROM dbo.OutboxEvent WHERE PublishedAt IS NULL", null, Ct);
+        var faults = p.Faults();
+        report["errors"] = new Dictionary<string, object?>
+        {
+            ["jobsByStatus"] = jobsByStatus, ["detectionsByStatus"] = detectionsByStatus,
+            ["opcRecordsRejected"] = s.Metrics.Series(MetricNames.OpcRecordsRejected),
+            ["opcChannelFull"] = s.Metrics.Total("opc_ingest_channel_full_total"),
+            ["presendCheckRejected"] = s.Metrics.Total(MetricNames.PresendCheckRejected),
+            ["attemptsNotSent"] = s.Metrics.Total(MetricNames.PrintAttempts, ("outcome", AttemptOutcome.NotSent)),
+            ["attemptsUnknown"] = s.Metrics.Total(MetricNames.PrintAttempts, ("outcome", AttemptOutcome.Unknown)),
+            ["outboxEvents"] = outboxEvents, ["outboxPublished"] = s.Metrics.Total(MetricNames.OutboxPublished), ["outboxPendingAtEnd"] = outboxPending,
+            ["serviceFaults"] = faults,
+        };
+
         // Todas las cajas (también las de calentamiento) tienen su job CONFIRMED con VERIFIED y una sola etiqueta.
         var boxes = (int)(cycle - 1);
         Assert.Equal(boxes, await s.CountAsync("FROM dbo.PrintJob WHERE Status = 'CONFIRMED'", null, Ct));
@@ -139,7 +168,12 @@ public sealed class SustainedLoadTests(SqlServerFixture sql) : IAsyncLifetime
         {
             ["requestedSamplingIntervalMs"] = 10, ["requestedPublishingIntervalMs"] = 20,
             ["revisedSamplingIntervalMs"] = p.Ingest.Source.RevisedSamplingIntervalMs, ["revisedPublishingIntervalMs"] = p.Ingest.Source.RevisedPublishingIntervalMs,
-            ["revisedQueueSize"] = p.Ingest.Source.RevisedQueueSize,
+            ["revisedQueueSize"] = p.Ingest.Source.RevisedQueueSize, ["sessionSecurity"] = p.Ingest.Source.SessionSecurity,
+        };
+        report["composition"] = new Dictionary<string, object?>
+        {
+            ["sweepIntervalMs"] = StationPipeline.SweepIntervalMs, ["outboxRelay"] = p.Relay is not null,
+            ["rabbitMq"] = await RabbitMqVersionAsync(),
         };
         report["environment"] = new Dictionary<string, object?>
         {
@@ -158,10 +192,20 @@ public sealed class SustainedLoadTests(SqlServerFixture sql) : IAsyncLifetime
         await File.WriteAllTextAsync(path, json, Ct);
         TestContext.Current.TestOutputHelper?.WriteLine(json);
 
+        Assert.Empty(faults);
+        Assert.Equal(0, outboxPending);
+        Assert.Equal(2 * boxes, outboxEvents);
+        Assert.StartsWith("SignAndEncrypt", p.Ingest.Source.SessionSecurity);
         Assert.True(left < revision.TransitBudgetMs, $"desigualdad de factibilidad: {left:F0} ms ≥ TransitBudgetMs {revision.TransitBudgetMs} ms");
         Assert.True(revision.SendMarginMs >= presendP99 + revision.ClockJumpToleranceMs,
             $"SendMarginMs {revision.SendMarginMs} no cubre p99(presend_check_to_write_ms) {presendP99} + ClockJumpToleranceMs {revision.ClockJumpToleranceMs}");
         Assert.True(revision.DeviceLeadTimeMs >= deviceLead, $"DeviceLeadTimeMs {revision.DeviceLeadTimeMs} menor que el p99 medido {deviceLead}");
+    }
+
+    private async Task<string> RabbitMqVersionAsync()
+    {
+        var result = await rabbit.Container.ExecAsync(["rabbitmqctl", "version"], Ct);
+        return $"RabbitMQ {result.Stdout.Trim()}, en un contenedor de Testcontainers en la misma máquina";
     }
 
     private static async Task<(int Pending, double OldestMs)> BacklogAsync(StationScenario s)

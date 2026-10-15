@@ -6,9 +6,10 @@ using CartonPrinting.Testing;
 namespace CartonPrinting.FaultTests.Hardening;
 
 /// <summary>
-/// Los tramos de la sección 10.4 del documento principal se miden de punta a punta con la composición del EdgeHost y
-/// simuladores (PLC por OPC UA, impresora, aplicador y escáner): cada uno tiene una muestra por caja. Con la señal en proceso
-/// (G11), el sender empieza a escribir sin esperar su sondeo. Es la base de la medición de T12, que corre aparte (carga).
+/// Los tramos de la sección 10.4 del documento principal se miden de punta a punta con <see cref="StationPipeline"/> (la composición
+/// del EdgeHost con simuladores, sin el Outbox Relay; sus exclusiones están en su descripción): cada uno tiene una muestra por caja.
+/// Con la señal en proceso (G11), el sender empieza a escribir sin esperar su sondeo. Es la base de la medición de T12, que corre
+/// aparte (carga) con el Outbox Relay hacia RabbitMQ.
 /// </summary>
 public sealed class LatencySegmentsTests(SqlServerFixture sql) : IAsyncLifetime
 {
