@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>CartonPrinting.Contracts</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="JsonSchema.Net" />
+  </ItemGroup>
+
+  <!-- Los schemas y la máquina de estados no se copian a src/: se enlazan desde spec/ al compilar
+       y viajan como recursos incrustados. spec/ sigue siendo la única fuente. -->
+  <ItemGroup>
+    <EmbeddedResource Include="$(SpecRoot)\contracts\carton-detected.v1.schema.json" LogicalName="spec/contracts/carton-detected.v1.schema.json" Link="Spec\carton-detected.v1.schema.json" />
+    <EmbeddedResource Include="$(SpecRoot)\contracts\print-job-result.v1.schema.json" LogicalName="spec/contracts/print-job-result.v1.schema.json" Link="Spec\print-job-result.v1.schema.json" />
+    <EmbeddedResource Include="$(SpecRoot)\contracts\state-machine.json" LogicalName="spec/contracts/state-machine.json" Link="Spec\state-machine.json" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <!-- Proceso único por estación: los módulos se alojan como hosted services. Usa el SDK web
+       porque expone health checks y, desde la Fase 5, la Operations API local. -->
+  <PropertyGroup>
+    <RootNamespace>CartonPrinting.EdgeHost</RootNamespace>
+    <AssemblyName>CartonPrinting.EdgeHost</AssemblyName>
+    <UserSecretsId>cartonprinting-edgehost</UserSecretsId>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\CartonPrinting.Contracts\CartonPrinting.Contracts.csproj" />
+    <ProjectReference Include="..\CartonPrinting.Infrastructure\CartonPrinting.Infrastructure.csproj" />
+    <ProjectReference Include="..\CartonPrinting.Orchestration\CartonPrinting.Orchestration.csproj" />
+    <ProjectReference Include="..\CartonPrinting.OpcIngest\CartonPrinting.OpcIngest.csproj" />
+    <ProjectReference Include="..\CartonPrinting.ErpSync\CartonPrinting.ErpSync.csproj" />
+    <ProjectReference Include="..\CartonPrinting.PrintAgent\CartonPrinting.PrintAgent.csproj" />
+    <ProjectReference Include="..\CartonPrinting.Outbox\CartonPrinting.Outbox.csproj" />
+    <ProjectReference Include="..\CartonPrinting.Recovery\CartonPrinting.Recovery.csproj" />
+    <ProjectReference Include="..\CartonPrinting.Operations\CartonPrinting.Operations.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />
+  </ItemGroup>
+
+</Project>
