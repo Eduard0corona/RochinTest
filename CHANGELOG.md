@@ -2,6 +2,10 @@
 
 Cambios de la implementación. Los de la especificación están en `spec/CHANGELOG.md`.
 
+## Fase 6 · Perfil extendido (2026-10-15)
+
+- Sin código: `PERFIL_EXTENDIDO=NO` y OT-14 abierta. T09 y T20 quedan `NO_APLICA (OT-14 abierta)`.
+
 ## Fase 5 · Propiedad, recuperación y operación (2026-10-15)
 
 - Propiedad por impresora: lock de sistema operativo por archivo, lease con renovación y ciclo de vida (`OwnedPrinterRunner`); sin propiedad, cero envíos y alerta.
