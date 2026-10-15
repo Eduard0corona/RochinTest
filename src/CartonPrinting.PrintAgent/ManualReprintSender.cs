@@ -76,10 +76,12 @@ public sealed class ManualReprintSender(
                 await transport.ConnectAsync(ct);
             }
         }
-        catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+        catch (Exception ex)
         {
+            // Abrir el canal no es escribir: NOT_SENT, también al detener el servicio (sin el token de la operación).
             transport.Reset();
-            var notSent = await txc.NotSentAsync(attemptId, clock.UtcNow, $"Conexión fallida: {ex.Message}", NotSentCause.ConnectionFailed, 0, 0, clock.UtcNow, ct);
+            var notSent = await ResultRecorder.RecordAsync(() => txc.NotSentAsync(attemptId, clock.UtcNow, $"Conexión fallida: {ex.Message}",
+                NotSentCause.ConnectionFailed, 0, 0, clock.UtcNow, CancellationToken.None), printerId, attemptId, _logger);
             return new ReprintSendResult(authorizationId, execution, notSent, false);
         }
 
@@ -95,7 +97,8 @@ public sealed class ManualReprintSender(
             transport.Reset();
             metrics.Increment(MetricNames.PrinterUnknown, ("printer", printerId));
             metrics.Increment(MetricNames.ExceptionalReprints, ("result", "UNRESOLVED"));
-            var unknown = await txc.UnknownAsync(attemptId, writeStartedAt, $"Escritura interrumpida: {ex.Message}", clock.UtcNow, CancellationToken.None);
+            var unknown = await ResultRecorder.RecordAsync(() => txc.UnknownAsync(attemptId, writeStartedAt, $"Escritura interrumpida: {ex.Message}",
+                clock.UtcNow, CancellationToken.None), printerId, attemptId, _logger);
             return new ReprintSendResult(authorizationId, execution, unknown, true);
         }
 
@@ -104,8 +107,8 @@ public sealed class ManualReprintSender(
             await faults.OnPointAsync(SenderPoint.AfterWriteBeforeResult, attemptId, ct);
         }
 
-        var transmitted = await txc.TransmittedAsync(attemptId, writeStartedAt, clock.UtcNow, writeStartedAt,
-            accepted is { } a ? CanonicalTimestamp.Truncate(a) : null, clock.UtcNow, CancellationToken.None);
+        var transmitted = await ResultRecorder.RecordAsync(() => txc.TransmittedAsync(attemptId, writeStartedAt, clock.UtcNow, writeStartedAt,
+            accepted is { } a ? CanonicalTimestamp.Truncate(a) : null, clock.UtcNow, CancellationToken.None), printerId, attemptId, _logger);
         if (evidence is not null)
         {
             var job = await db.ReadAsync(conn => JobQueries.GetJobAsync(conn, null, execution.PrintJobId, ct), ct);
@@ -124,12 +127,14 @@ public sealed class ManualReprintSender(
         {
             try
             {
-                if (await ExecuteNextAsync(ct) is not null)
+                // Solo una autorización ejecutada sigue de inmediato; una no ejecutable (por ejemplo, LABEL_DAMAGED sin el
+                // retiro registrado) espera el intervalo de sondeo.
+                if (await ExecuteNextAsync(ct) is { Execution: not null })
                 {
                     continue;
                 }
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (Exception ex) when (ex is not OperationCanceledException and not SenderHaltedException)
             {
                 _logger.LogError(ex, "Sender manual de {Printer}: error fuera de la escritura; se reintenta", printerId);
             }
