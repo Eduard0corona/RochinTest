@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using CartonPrinting.Contracts;
 using CartonPrinting.Infrastructure.Data;
 using CartonPrinting.Infrastructure.Observability;
@@ -21,20 +22,44 @@ public sealed class ManualReprintSender(
     string printerId, SqlDb db, TxxReprint txx, TxcWriteResult txc, LeaseGrant lease, IPrinterTransport transport, EdgeClock clock, CartonMetrics metrics,
     ISenderFaults? faults = null, EvidenceService? evidence = null, ILogger<ManualReprintSender>? logger = null)
 {
-    private readonly ILogger _logger = logger ?? NullLogger<ManualReprintSender>.Instance;
+    /// <summary>Espera antes de volver a intentar una autorización que TX-X rechazó.</summary>
+    public static readonly TimeSpan RejectedRetryDelay = TimeSpan.FromSeconds(5);
 
-    /// <summary>La siguiente autorización APPROVED vigente dirigida a esta impresora.</summary>
-    public Task<long?> NextApprovedAsync(CancellationToken ct) =>
-        db.ReadAsync(async conn =>
+    private readonly ILogger _logger = logger ?? NullLogger<ManualReprintSender>.Instance;
+    private readonly ConcurrentDictionary<long, DateTime> _rejectedUntil = new();
+
+    /// <summary>
+    /// La siguiente autorización APPROVED vigente dirigida a esta impresora. Una que TX-X rechazó (por ejemplo, LABEL_DAMAGED
+    /// sin el retiro registrado) espera <see cref="RejectedRetryDelay"/> y no bloquea a las aprobadas después (revisión de
+    /// la Fase 5, M3).
+    /// </summary>
+    public async Task<long?> NextApprovedAsync(CancellationToken ct)
+    {
+        var approved = await db.ReadAsync<IReadOnlyList<long>>(async conn =>
         {
             await using var cmd = conn.Command(null, """
-                SELECT TOP (1) AuthorizationId FROM dbo.ReprintAuthorization
+                SELECT TOP (50) AuthorizationId FROM dbo.ReprintAuthorization
                 WHERE TargetPrinterId = @printer AND Status = 'APPROVED' AND ExpiresAt > @now
                 ORDER BY ApprovedAt, AuthorizationId;
                 """);
             cmd.NVarChar("@printer", printerId, 64).DateTime2("@now", clock.UtcNow);
-            return await cmd.ExecuteScalarAsync(ct) is long id ? (long?)id : null;
+            var ids = new List<long>();
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            while (await r.ReadAsync(ct))
+            {
+                ids.Add(r.GetInt64(0));
+            }
+
+            return ids;
         }, ct);
+        var now = clock.UtcNow;
+        foreach (var stale in _rejectedUntil.Keys.Except(approved))
+        {
+            _rejectedUntil.TryRemove(stale, out _);
+        }
+
+        return approved.Cast<long?>().FirstOrDefault(id => !_rejectedUntil.TryGetValue(id!.Value, out var until) || now >= until);
+    }
 
     public async Task<ReprintSendResult?> ExecuteNextAsync(CancellationToken ct) =>
         await NextApprovedAsync(ct) is { } id ? await ExecuteAsync(id, ct) : null;
@@ -50,27 +75,25 @@ public sealed class ManualReprintSender(
         catch (SqlException ex) when (ex.Number is TxxReprint.NotExecutable or TxxReprint.AttemptRejected)
         {
             // Sin autorización ejecutable (revocada, vencida, de otro job), o el trigger rechaza el intento (por ejemplo,
-            // LABEL_DAMAGED sin el retiro de la etiqueta original registrado): nada se envía.
+            // LABEL_DAMAGED sin el retiro de la etiqueta original registrado): nada se envía, y se vuelve a intentar después.
+            _rejectedUntil[authorizationId] = clock.UtcNow + RejectedRetryDelay;
             _logger.LogWarning("Autorización {Authorization} no ejecutable en {Printer}: {Error}", authorizationId, printerId, ex.Message);
             return new ReprintSendResult(authorizationId, null, null, false);
         }
 
-        var risk = await db.ReadAsync(async conn =>
-        {
-            await using var cmd = conn.Command(null, "SELECT DuplicateRisk FROM dbo.ReprintAuthorization WHERE AuthorizationId = @id");
-            cmd.BigInt("@id", authorizationId);
-            return (string)(await cmd.ExecuteScalarAsync(ct))!;
-        }, ct);
-        metrics.Increment(MetricNames.ExceptionalReprints, ("risk", risk));
+        _rejectedUntil.TryRemove(authorizationId, out _);
+        metrics.Increment(MetricNames.ExceptionalReprints, ("risk", execution.DuplicateRisk), ("result", "EXECUTED"));
         var claimedAt = clock.UtcNow;
 
-        if (faults is not null)
-        {
-            await faults.OnPointAsync(SenderPoint.AfterClaimCommit, attemptId, ct);
-        }
-
+        // Entre TX-X y la escritura nada se invocó: cualquier error o un apagado es NOT_SENT, nunca un intento en SENDING que
+        // ocuparía la impresora manual hasta reiniciar (revisión de la Fase 5, M3; la misma regla que el sender de línea).
         try
         {
+            if (faults is not null)
+            {
+                await faults.OnPointAsync(SenderPoint.AfterClaimCommit, attemptId, ct);
+            }
+
             if (!transport.Connected)
             {
                 await transport.ConnectAsync(ct);
@@ -78,9 +101,8 @@ public sealed class ManualReprintSender(
         }
         catch (Exception ex)
         {
-            // Abrir el canal no es escribir: NOT_SENT, también al detener el servicio (sin el token de la operación).
             transport.Reset();
-            var notSent = await ResultRecorder.RecordAsync(() => txc.NotSentAsync(attemptId, clock.UtcNow, $"Conexión fallida: {ex.Message}",
+            var notSent = await ResultRecorder.RecordAsync(() => txc.NotSentAsync(attemptId, clock.UtcNow, $"Antes de escribir: {ex.Message}",
                 NotSentCause.ConnectionFailed, 0, 0, clock.UtcNow, CancellationToken.None), printerId, attemptId, _logger);
             return new ReprintSendResult(authorizationId, execution, notSent, false);
         }

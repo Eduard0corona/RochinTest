@@ -9,6 +9,7 @@ Cambios de la implementación. Los de la especificación están en `spec/CHANGEL
 - Operations API (`CartonPrinting.Operations`): autenticación por persona con claves de hash en la configuración, acciones manuales por TX-M y reimpresión con regla de dos personas; el sender de la impresora manual ejecuta TX-X.
 - Métricas `exceptional_reprints_total{risk,result}` y `unknown_resolution_total{result}`.
 - Pruebas: T27, T34, T36, T40, T41 y T43 en verde contra SQL Server real, la impresora simulada, el PLC simulado y procesos reales.
+- Revisión independiente: el arranque no sigue sin la impresora de línea (y el lease se libera al detener); una renovación que falla cuenta como lease perdido; TX-R0 antes de volver a enviar, probado con un `SENDING` heredado; los fallos del arranque se registran; una autorización rechazada no bloquea a las demás; validación de la API (400) y solicitud pendiente tras un rechazo.
 
 ## Fase 4 · Print Agent (2026-10-15)
 

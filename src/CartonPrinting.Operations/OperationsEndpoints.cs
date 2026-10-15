@@ -39,7 +39,8 @@ public sealed record ReconcileBody(string Reason, string DeviceNotPrintedEvidenc
 
 public sealed record CloseBody(string Reason, string CartonDisposition);
 
-public sealed record ConfirmEpochBody(ulong FirstCycleId, string Reason);
+/// <summary>FirstCycleId es la cadena decimal canónica de un CycleId (regla 9), como en los contratos.</summary>
+public sealed record ConfirmEpochBody(string FirstCycleId, string Reason);
 
 public sealed record ReprintRequestBody(Guid PrintJobId, string Reason, string DuplicateRisk, string CartonReference, string InspectionEvidence, bool ReprintMarker);
 
@@ -87,15 +88,32 @@ public static class OperationsEndpoints
             }));
 
         ops.MapPost("/stations/{site}/{station}/unblock", (string site, string station, ReasonBody body, ClaimsPrincipal user, HttpContext http) =>
-            RunAsync(http, (s, ct) => s.Txm.UnblockStationAsync(site, station, Who(user), body.Reason, s.Clock.UtcNow, ct)));
+            RunAsync(http, async (s, ct) =>
+            {
+                // Una estación que no está bloqueada no se "desbloquea": sin esto quedaría una OperatorAction UNBLOCK_STATION
+                // sin efecto (revisión de la Fase 5).
+                var (state, _) = await s.Stations.GetActiveAsync(site, station, ct)
+                    ?? throw new ManualActionRejectedException($"La estación {site}/{station} no existe.");
+                if (state.LabelingEnabled)
+                {
+                    throw new ManualActionRejectedException($"La estación {site}/{station} no está bloqueada.");
+                }
+
+                return await s.Txm.UnblockStationAsync(site, station, Who(user), body.Reason, s.Clock.UtcNow, ct);
+            }));
 
         ops.MapPost("/stations/{site}/{station}/epochs/{epoch:long}/confirm",
             (string site, string station, long epoch, ConfirmEpochBody body, ClaimsPrincipal user, HttpContext http) =>
                 RunAsync(http, async (s, ct) =>
                 {
+                    if (!Identity.TryParseCycleId(body.FirstCycleId, out var firstCycleId))
+                    {
+                        throw new InvalidRequestException("firstCycleId debe ser la cadena decimal canónica de un ciclo.");
+                    }
+
                     var (_, active) = await s.Stations.GetActiveAsync(site, station, ct)
                         ?? throw new ManualActionRejectedException($"La estación {site}/{station} no existe.");
-                    return await s.Txm.ConfirmEpochAsync(site, station, epoch, body.FirstCycleId, active.ConfigRevisionId, Who(user), body.Reason,
+                    return await s.Txm.ConfirmEpochAsync(site, station, epoch, firstCycleId, active.ConfigRevisionId, Who(user), body.Reason,
                         s.Clock.UtcNow, ct);
                 }));
 
@@ -125,6 +143,11 @@ public static class OperationsEndpoints
         ops.MapPost("/reprints/requests", (ReprintRequestBody body, ClaimsPrincipal user, HttpContext http) =>
             OnJobAsync(http, body.PrintJobId, (s, job, ct) =>
             {
+                if (new[] { body.Reason, body.DuplicateRisk, body.CartonReference, body.InspectionEvidence }.Any(string.IsNullOrWhiteSpace))
+                {
+                    throw new InvalidRequestException("reason, duplicateRisk, cartonReference e inspectionEvidence son obligatorios.");
+                }
+
                 var request = s.Requests.Add(new PendingReprint(Guid.NewGuid(), body.PrintJobId, body.Reason, body.DuplicateRisk, body.CartonReference,
                     body.InspectionEvidence, body.ReprintMarker, Who(user), s.Clock.UtcNow));
                 return Task.FromResult<object>(new { requestId = request.RequestId, requestedBy = request.RequestedBy });
@@ -150,8 +173,12 @@ public static class OperationsEndpoints
                 return Results.NotFound(new { error = "La solicitud ya se aprobó." });
             }
 
-            return await GuardAsync(async () =>
+            // Si TX-M la rechaza, la solicitud vuelve a quedar pendiente: no hay que pedirla otra vez (revisión de la Fase 5).
+            var approved = false;
+            try
             {
+                var result = await GuardAsync(async () =>
+                {
                 var job = await s.Db.ReadAsync(conn => JobQueries.GetJobAsync(conn, null, pending.PrintJobId, http.RequestAborted), http.RequestAborted)
                     ?? throw new ManualActionRejectedException("El job no existe.");
                 var (_, active) = await s.Stations.GetActiveAsync(job.SiteId, job.StationId, http.RequestAborted)
@@ -166,8 +193,18 @@ public static class OperationsEndpoints
                     pending.CartonReference, pending.InspectionEvidence, manualPrinter, pending.ReprintMarker,
                     active.EvidenceWindowMs ?? s.Options.DefaultReprintEvidenceWindowMs, pending.RequestedBy, pending.RequestedAt, Who(user), now,
                     now.AddMinutes(s.Options.AuthorizationValidityMinutes)), http.RequestAborted);
-                return Results.Created($"/api/ops/reprints/{id}", new { authorizationId = id, targetPrinterId = manualPrinter });
-            });
+                    approved = true;
+                    return Results.Created($"/api/ops/reprints/{id}", new { authorizationId = id, targetPrinterId = manualPrinter });
+                });
+                return result;
+            }
+            finally
+            {
+                if (!approved)
+                {
+                    s.Requests.Add(pending);
+                }
+            }
         });
 
         ops.MapPost("/reprints/{authorizationId:long}/revoke", (long authorizationId, ClaimsPrincipal user, HttpContext http) =>
@@ -221,9 +258,21 @@ public static class OperationsEndpoints
         {
             return Results.Problem(ex.Message, statusCode: StatusCodes.Status409Conflict);
         }
+        catch (InvalidRequestException ex)
+        {
+            return Results.Problem(ex.Message, statusCode: StatusCodes.Status400BadRequest);
+        }
         catch (SqlException ex) when (ex.Number is >= 50000 or 547 or 2601 or 2627)
         {
             return Results.Problem(ex.Message, statusCode: StatusCodes.Status409Conflict, extensions: new Dictionary<string, object?> { ["sqlError"] = ex.Number });
         }
+        catch (SqlException ex) when (ex.Number == 515)
+        {
+            // Un dato obligatorio ausente en la solicitud.
+            return Results.Problem(ex.Message, statusCode: StatusCodes.Status400BadRequest, extensions: new Dictionary<string, object?> { ["sqlError"] = ex.Number });
+        }
     }
 }
+
+/// <summary>Una solicitud mal formada (400): falta un dato obligatorio o no tiene el formato del contrato.</summary>
+public sealed class InvalidRequestException(string message) : Exception(message);

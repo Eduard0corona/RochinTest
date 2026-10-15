@@ -25,7 +25,8 @@ public static class ReprintPayload
     }
 }
 
-public sealed record ReprintExecution(long AuthorizationId, Guid PrintJobId, Guid AttemptId, int AttemptNumber, int EvidenceWindowMs, string Payload);
+public sealed record ReprintExecution(
+    long AuthorizationId, Guid PrintJobId, Guid AttemptId, int AttemptNumber, int EvidenceWindowMs, string Payload, string DuplicateRisk);
 
 /// <summary>
 /// TX-X: reimpresión excepcional. La ejecuta el sender de TargetPrinterId con su lease vigente, por
@@ -60,14 +61,15 @@ public sealed class TxxReprint(SqlDb db)
         var execution = await db.InTransactionAsync(async (conn, tx) =>
         {
             await using var cmd = conn.Command(tx, """
-                DECLARE @executed TABLE (AuthorizationId BIGINT NOT NULL, PrintJobId UNIQUEIDENTIFIER NOT NULL, EvidenceWindowMs INT NOT NULL);
+                DECLARE @executed TABLE (AuthorizationId BIGINT NOT NULL, PrintJobId UNIQUEIDENTIFIER NOT NULL, EvidenceWindowMs INT NOT NULL,
+                    DuplicateRisk VARCHAR(30) NOT NULL);
                 BEGIN TRY
                     EXEC sys.sp_set_session_context @key = N'TransitionKind', @value = 'EXCEPTION';
 
                     UPDATE ra
                     SET Status = 'EXECUTED', ExecutedAt = @EdgeNowUtc
-                    OUTPUT inserted.AuthorizationId, inserted.PrintJobId, inserted.EvidenceWindowMs
-                        INTO @executed (AuthorizationId, PrintJobId, EvidenceWindowMs)
+                    OUTPUT inserted.AuthorizationId, inserted.PrintJobId, inserted.EvidenceWindowMs, inserted.DuplicateRisk
+                        INTO @executed (AuthorizationId, PrintJobId, EvidenceWindowMs, DuplicateRisk)
                     FROM dbo.ReprintAuthorization AS ra
                     INNER JOIN dbo.PrintJob AS pj ON pj.PrintJobId = ra.PrintJobId
                     WHERE ra.AuthorizationId = @AuthorizationId
@@ -99,7 +101,7 @@ public sealed class TxxReprint(SqlDb db)
                     FROM @executed AS e INNER JOIN dbo.PrintJob AS pj ON pj.PrintJobId = e.PrintJobId;
 
                     EXEC sys.sp_set_session_context @key = N'TransitionKind', @value = NULL;
-                    SELECT e.AuthorizationId, e.PrintJobId, @attemptNumber, e.EvidenceWindowMs
+                    SELECT e.AuthorizationId, e.PrintJobId, @attemptNumber, e.EvidenceWindowMs, e.DuplicateRisk
                     FROM @executed AS e INNER JOIN dbo.PrintJob AS pj ON pj.PrintJobId = e.PrintJobId;
                 END TRY
                 BEGIN CATCH
@@ -116,7 +118,7 @@ public sealed class TxxReprint(SqlDb db)
                 throw new InvalidOperationException("TX-X no devolvió la ejecución.");
             }
 
-            return new ReprintExecution(r.GetInt64(0), r.GetGuid(1), attemptId, r.GetInt32(2), r.GetInt32(3), reprintPayload);
+            return new ReprintExecution(r.GetInt64(0), r.GetGuid(1), attemptId, r.GetInt32(2), r.GetInt32(3), reprintPayload, r.GetString(4));
         }, ct);
         return execution;
     }
