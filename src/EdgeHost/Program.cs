@@ -1,8 +1,10 @@
 using CartonPrinting.EdgeHost;
+using CartonPrinting.Infrastructure.Data;
 using CartonPrinting.Infrastructure.Health;
 using CartonPrinting.Infrastructure.Observability;
 using CartonPrinting.Infrastructure.Sql;
 using CartonPrinting.Infrastructure.Time;
+using CartonPrinting.Outbox;
 using OpenTelemetry;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
@@ -19,6 +21,19 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<EdgeClock>();
+builder.Services.AddSingleton<CartonMetrics>();
+builder.Services.AddSingleton(new DatabaseOptions { ConnectionString = builder.Configuration.GetConnectionString("CartonPrinting") ?? string.Empty });
+builder.Services.AddSingleton<SqlDb>();
+
+// Outbox Relay (Fase 1): solo con RabbitMQ configurado. Sin broker la impresión sigue y el Outbox acumula.
+var rabbit = builder.Configuration.GetSection("RabbitMq").Get<RabbitMqOptions>();
+if (!string.IsNullOrWhiteSpace(rabbit?.Uri))
+{
+    builder.Services.AddSingleton(rabbit);
+    builder.Services.AddSingleton(builder.Configuration.GetSection("OutboxRelay").Get<OutboxRelayOptions>() ?? new OutboxRelayOptions());
+    builder.Services.AddSingleton<IOutboxPublisher, RabbitMqPublisher>();
+    builder.Services.AddHostedService<OutboxRelay>();
+}
 
 builder.Services.AddHealthChecks()
     .AddCheck("sqlserver", new SqlServerHealthCheck(() =>
@@ -34,8 +49,7 @@ if (!string.IsNullOrWhiteSpace(builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOIN
     otel.UseOtlpExporter();
 }
 
-// Fase 0: el EdgeHost arranca sin módulos activos. Los hosted services de cada módulo se
-// registran en las fases siguientes.
+// Los demás módulos (ingesta, ERP, senders, recuperación, Operations API) se registran en sus fases.
 
 var app = builder.Build();
 app.MapHealthChecks("/health/live", new() { Predicate = _ => false });

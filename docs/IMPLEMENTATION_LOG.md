@@ -167,3 +167,45 @@ El revisor notó archivos sin seguimiento que aparecían en el árbol durante su
 - **Pruebas que la cierran:** T01 (tag duplicado), T02 (concurrencia en el claim), T10 (cambio de lote en carrera), T14 (resultado republicado) y T47 (DDL y sentencias de referencia: cada sentencia con 0 y con N filas, cada `THROW` 51001 a 51032 y 52001 con su código exacto).
 - **Decisiones previstas:** la capa de datos implementa ya todas las transacciones porque T47 exige ejecutar cada sentencia de referencia; los servicios que las usan (ingesta, sender, barrido, API) llegan en sus fases. En T01 el "sender" es un arnés de prueba que reclama y escribe a un simulador en memoria que cuenta transmisiones; en la Fase 4 se repite con el sender real y el simulador TCP.
 - **Riesgos:** que una sentencia de referencia o un trigger no ejecute en SQL Server real (sería un defecto de la especificación: sección 6 del prompt); interbloqueos en el claim concurrente.
+
+### Lo hecho
+
+- **Capa de datos** (`CartonPrinting.Infrastructure`): `SqlDb` (transacciones con `SET XACT_ABORT ON`, READ COMMITTED sobre RCSI, reintento completo ante 1205, limpieza de `SESSION_CONTEXT` también al fallar); parámetros tipados (`DATETIME2(3)` truncado, `DECIMAL(20,0)` para `CycleId`); una clase por transacción: `TxaRegisterDetection`, `TxbClaim`, `TxcWriteResult`, `TxdEvidence`, `TxeErpArrival`, `TxsSweep`, `TxmManualActions`, `TxxReprint`, `Txr0Recovery`. Las sentencias son las de `spec/database/sqlserver_operations_reference.sql`; todo DML sobre una tabla con triggers usa `OUTPUT ... INTO` una variable de tabla. `ResultPublisher` y `OutboxWriter` escriben cada `PrintJobResult` en la misma transacción que su transición y validan el contrato (schema y reglas de negocio) antes de insertarlo.
+- **TX-A**: serial antes de la transacción (`LabelSerialSource`), payload y `PayloadHash` (SHA-256 de UTF-8) antes de insertar; inserción primero; clave existente reconocida por el nombre de la restricción (`UQ_CartonDetection_Identity`, `UQ_CartonDetection_IdempotencyKey` o `PK_CartonDetection`) y clasificada en otra transacción (duplicado o `IDENTITY_COLLISION` con bloqueo de estación); recirculación con `UPDLOCK, HOLDLOCK`; huecos (G01, G02) y anomalías en la misma transacción.
+- **Orquestación**: `RegistrationService`, `DeadlinePolicy` (plazo por referencia; efectivo = mínimo entre congelado y recalculado; margen efectivo = máximo; intentos = mínimo; compuerta con la frescura menor), `LabelRenderer`.
+- **Print Agent**: `ClaimService` (TX-B, diagnóstico del rechazo, J03 por plazo u orden, métricas).
+- **Outbox**: `OutboxRelay` (orden de `OutboxSequence`, publisher confirms, `mandatory`, `PublishedAt` solo tras el confirm, espera exponencial), `RabbitMqPublisher` (`message-id` = EventId, cabecera `ordering-key`), `InboxConsumer` (cola quorum, ACK manual tras el commit del Inbox). El EdgeHost aloja el relay si hay `RabbitMq:Uri`.
+- **Métricas**: `CartonMetrics` con las de la sección 19 y del catálogo; las pruebas leen los totales en memoria.
+
+### Decisiones
+
+1. **Todas las transacciones en la Fase 1.** T47 exige ejecutar cada sentencia de referencia con 0 y con N filas; por eso la capa de datos completa está aquí. Los servicios que las usan (sender, barrido, API) llegan en sus fases.
+2. **Arnés de sender en T01.** El catálogo pide "1 PrintAttempt" y "como máximo una transmisión". En esta fase, cada una de las 100 señales intenta el claim y solo el ganador escribe a una impresora en memoria (`CountingPrinter`); el resultado medido es una transmisión. En la Fase 4 T01 se repite con el sender real y el simulador TCP.
+3. **`mandatory` en la publicación.** Un evento sin cola enlazada vuelve como error (`PublishReturnException`) y el relay se detiene sin marcarlo publicado, en lugar de perderlo. Configurable (`RabbitMq:Mandatory`).
+4. **Validación de contratos antes del Outbox.** Un evento que no cumple su schema o sus reglas de negocio revierte la transacción: emitir un contrato inválido es un defecto. Única tolerancia: SI-05.
+5. **SI-04 y SI-05** (ver `docs/SPEC_ISSUES.md`): `CARTON_ID_REQUIRED` sin `CartonId` queda `BLOCKED` con `INCOHERENT_SNAPSHOT` (falla cerrada, pendiente de la persona); un registro `GATEWAY_RECEIPT` en vivo que abre un hueco se registra sin plazo según la máquina de estados, aunque la regla del verificador no vea el hueco.
+6. **Plazo efectivo sin referencia activa.** Si la revisión activa no puede dar un plazo confiable para un registro (por ejemplo, cambió a `PLC_TIMESTAMP` y el registro no trae `DetectionTimestamp`), el plazo efectivo es su recepción: el job ya no se envía. Es la lectura más restrictiva de "nunca más permisivo que el congelado".
+
+### Comandos y resultados
+
+Compuerta completa, 2026-10-14 19:30 (`powershell -File build/ci.ps1`):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error: 0, Superado: 122, Omitido: 0, Total: 122, Duración: 10 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error: 0, Superado: 56, Omitido: 0, Total: 56, Duración: 1 m 10 s - CartonPrinting.IntegrationTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 1 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=3 destino(s), 40 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
+Durante el desarrollo, dos pruebas fallaron por errores de la prueba que el sistema detectó como debía: un segundo claim en la misma impresora con un intento todavía en `SENDING` (`UX_PrintAttempt_PrinterInFlight`, 2601) y un claim de un ciclo anterior al último reclamado (`OUT_OF_ORDER`). Se corrigió la prueba, no el sistema.
+
+### Pruebas de la fase
+
+- **T01, T02, T10, T14 y T47: PASA** (detalle en `docs/TEST_STATUS.md`).
+- T47 ejecuta, además del criterio del catálogo, una prueba que lee el DDL y la referencia, extrae los 33 códigos `THROW` y exige que cada uno tenga su prueba negativa.
