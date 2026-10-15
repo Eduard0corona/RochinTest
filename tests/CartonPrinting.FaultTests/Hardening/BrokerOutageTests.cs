@@ -14,8 +14,10 @@ namespace CartonPrinting.FaultTests.Hardening;
 /// corta las conexiones y no acepta nuevas. Detecciones, jobs e impresión siguen igual; las filas del Outbox quedan
 /// pendientes y outbox_pending_age_seconds crece. Al volver, todos los eventos se publican con su EventId, en orden de
 /// OutboxSequence, y el consumidor (con InboxMessage) los aplica una sola vez: cero perdidos, cero efectos duplicados.
-/// RabbitMQ y SQL Server reales; el consumidor se conecta al broker directamente.
+/// RabbitMQ y SQL Server reales; el consumidor se conecta al broker directamente. Corre sola (sin otras pruebas del ensamblado
+/// en paralelo): compara la latencia de impresión antes y durante la caída, y la carga de otras pruebas la falsearía.
 /// </summary>
+[Collection(nameof(BrokerOutageCollection))]
 public sealed class BrokerOutageTests(SqlServerFixture sql, RabbitMqFixture rabbit) : IAsyncLifetime, IClassFixture<RabbitMqFixture>
 {
     private const string Consumer = "mes-t08";
@@ -220,3 +222,7 @@ public sealed class BrokerOutageTests(SqlServerFixture sql, RabbitMqFixture rabb
         return $"Jobs: {string.Join(", ", statuses)}. Sender: {sender.Status}{(sender.Exception is { } e ? " " + e.GetBaseException().Message : string.Empty)}.";
     }
 }
+
+/// <summary>Colección sin paralelismo: T08 corre cuando terminan las demás pruebas del ensamblado.</summary>
+[CollectionDefinition(nameof(BrokerOutageCollection), DisableParallelization = true)]
+public sealed class BrokerOutageCollection;
