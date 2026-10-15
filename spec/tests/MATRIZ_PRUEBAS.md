@@ -239,7 +239,7 @@ Origen: v1.0 · Nivel: FAULT · Perfil: EXTENDIDO · Estado: No ejecutada
 | --- | --- |
 | Precondiciones | PLC con FIFO de ciclos. |
 | Datos iniciales | Marca alta en el ciclo 1000. |
-| Inyección | Desconectar el gateway mientras pasan 20 cajas; reconectar. |
+| Inyección | Desconectar el gateway mientras pasan 20 cajas; reconectar cuando el registro actual ya es la caja siguiente (1021). |
 | Estados esperados | Hueco 1001-1020 OPEN; la FIFO entrega los 20 como RECOVERED y EXPIRED por LATE_ARRIVAL; hueco RECOVERED. |
 | Eventos publicados | 20 CartonDetected y 20 PrintJobResult EXPIRED sin job. |
 | Efectos físicos esperados | Ninguna impresión tardía. |

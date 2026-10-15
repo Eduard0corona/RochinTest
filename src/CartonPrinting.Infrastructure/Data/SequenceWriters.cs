@@ -21,6 +21,9 @@ public sealed record RetainedRecord
     [JsonPropertyName("opcNodeId")] public required string OpcNodeId { get; init; }
     [JsonPropertyName("opcSourceTimestamp")][JsonConverter(typeof(UtcMillisecondsConverter))] public DateTime? OpcSourceTimestamp { get; init; }
     [JsonPropertyName("sourceFingerprint")] public required string SourceFingerprint { get; init; }
+
+    /// <summary>false si el registro no pasó la comprobación de coherencia del registro latched.</summary>
+    [JsonPropertyName("coherent")] public bool Coherent { get; init; } = true;
 }
 
 public sealed record AnomalyRow(

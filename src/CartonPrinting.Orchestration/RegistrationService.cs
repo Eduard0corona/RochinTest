@@ -66,11 +66,13 @@ public sealed class RegistrationService(
         var deadline = DeadlinePolicy.Compute(revision, record.DetectionTimestamp, record.ReceivedAt, record.Transport, record.QueueOverflow,
             opensGap: sequence.Gap is not null);
 
-        if (record.WorkOrderId is null)
+        if (!record.Coherent || record.WorkOrderId is null)
         {
-            // Registro sin orden de trabajo (obligatoria en el contrato con el PLC): datos incoherentes.
-            // Va antes que cualquier otra clasificación terminal porque una detección sin orden solo puede
-            // quedar BLOCKED (CK_CartonDetection_WorkOrder), salvo que la secuencia ya la bloqueara.
+            // Registro incoherente (campos de ciclos distintos, ADR 0001) o sin orden de trabajo (obligatoria
+            // en el contrato con el PLC): D05 con INCOHERENT_SNAPSHOT. Va antes que cualquier otra
+            // clasificación terminal porque una detección sin orden solo puede quedar BLOCKED
+            // (CK_CartonDetection_WorkOrder) y una con datos mezclados no debe parecer un simple vencimiento;
+            // se respeta un bloqueo que la secuencia ya decidió.
             if (terminalStatus != DetectionStatus.Blocked)
             {
                 (terminalStatus, terminalReason) = (DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot);

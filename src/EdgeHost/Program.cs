@@ -4,6 +4,7 @@ using CartonPrinting.Infrastructure.Health;
 using CartonPrinting.Infrastructure.Observability;
 using CartonPrinting.Infrastructure.Sql;
 using CartonPrinting.Infrastructure.Time;
+using CartonPrinting.OpcIngest;
 using CartonPrinting.Outbox;
 using OpenTelemetry;
 using OpenTelemetry.Metrics;
@@ -49,7 +50,16 @@ if (!string.IsNullOrWhiteSpace(builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOIN
     otel.UseOtlpExporter();
 }
 
-// Los demás módulos (ingesta, ERP, senders, recuperación, Operations API) se registran en sus fases.
+// Ingesta OPC UA de una estación (Fase 2): solo con la sección "Ingest" configurada. Los endpoints y
+// certificados de planta no van en el repositorio: se configuran en el entorno.
+var ingest = builder.Configuration.GetSection("Ingest").Get<IngestHostOptions>();
+if (!string.IsNullOrWhiteSpace(ingest?.Opc.EndpointUrl))
+{
+    builder.Services.AddSingleton(ingest);
+    builder.Services.AddHostedService<IngestHostedService>();
+}
+
+// Los demás módulos (ERP, senders, recuperación, Operations API) se registran en sus fases.
 
 var app = builder.Build();
 app.MapHealthChecks("/health/live", new() { Predicate = _ => false });

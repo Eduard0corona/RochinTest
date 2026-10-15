@@ -149,6 +149,12 @@ public static class AnomalyType
     public const string AmbiguousDecrease = "AMBIGUOUS_DECREASE";
 }
 
+public static class AnomalySeverity
+{
+    public const string Blocking = "BLOCKING";
+    public const string Warning = "WARNING";
+}
+
 public static class BlockReason
 {
     public const string IdentityCollision = "IDENTITY_COLLISION";

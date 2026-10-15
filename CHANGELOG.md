@@ -2,6 +2,17 @@
 
 Cambios de la implementación. Los de la especificación están en `spec/CHANGELOG.md`.
 
+## Fase 2 · Ingesta OPC simulada (2026-10-14)
+
+- PLC simulado como servidor OPC UA en proceso (registro latched con eco de cierre, FIFO, `LabelingReady`, `PrintWindowCycleId`) y proxy TCP para inyectar fallas.
+- Cliente OPC UA real (`OpcUaCycleSource`): transporte por mensaje (`READ`, `SUBSCRIPTION`, `REPUBLISH`, `PLC_FIFO`), bit Overflow, Republish explícito y lecturas de recuperación al reconectar.
+- `CycleDecoder` (solo StatusCode Good; registros incoherentes), `SequenceClassifier` (sección 9.2), `StationIngestService` (épocas, retención y reingreso, huecos), `LabelingReadyHeartbeat` e `IngestHostedService` en el EdgeHost.
+- Pruebas: T11, T13, T24, T25, T26, T30, T35 y T45 en verde contra SQL Server real y el PLC simulado.
+- Registrados SI-10 (mecanismo de coherencia del registro, OT-04) y SI-11 (escenario de T11).
+- Correcciones de las dos revisiones independientes: numeración por suscripción y `READ` al recrearla (también por instancia), recuperación que termina sin esperar una caja, Republish desde la suscripción viva, marca de la última reconexión conservada, época confirmada visible en la ingesta en ejecución, dos instancias sin huecos espurios, registro incoherente con la misma regla en memoria y desde SQL, `LabelingReady` baja con el canal saturado, sesión cerrada si el arranque falla y anomalía resuelta una sola vez.
+- Registrados SI-12 (valor de arranque de la marca alta en una época nueva) y SI-13 (registro incoherente frente a la secuencia); la persona mantuvo los interinos de SI-10, SI-12 y SI-13.
+- Especificación 1.1.4 (aprobada por la persona): SI-11, escenario de reconexión de T11.
+
 ## Fase 1 · Datos e idempotencia lógica (2026-10-14)
 
 - Capa de datos (`CartonPrinting.Infrastructure`) con una clase por transacción: TX-A, TX-B, TX-C, TX-D, TX-E, TX-S, TX-M, TX-X y TX-R0, sobre las sentencias de `spec/database/sqlserver_operations_reference.sql`; inserción primero, reintento de 1205, `OUTPUT ... INTO`, `SESSION_CONTEXT` limpiado también al fallar, contrato validado antes de escribir el Outbox.
