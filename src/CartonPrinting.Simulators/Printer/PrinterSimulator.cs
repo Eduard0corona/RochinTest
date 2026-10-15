@@ -88,8 +88,20 @@ public sealed class PrinterSimulator : IAsyncDisposable
             {
                 if (value == PrinterMode.RejectConnections && _mode != PrinterMode.RejectConnections)
                 {
+                    // Fuera de línea: deja de aceptar y corta las conexiones abiertas.
                     _listener?.Stop();
                     _listener = null;
+                    foreach (var client in _clients)
+                    {
+                        try
+                        {
+                            Abort(client);
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                            // Ya cerrada.
+                        }
+                    }
                 }
                 else if (value != PrinterMode.RejectConnections && _listener is null)
                 {

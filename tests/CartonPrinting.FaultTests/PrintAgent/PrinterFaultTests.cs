@@ -235,6 +235,7 @@ public sealed class PrinterFaultTests(SqlServerFixture sql) : IAsyncLifetime
         // Reintento del mismo job: después de un NOT_SENT, el siguiente claim del mismo job se permite.
         var m = await s.ReadyJobAsync(52, Ct);
         rig.Printer.Mode = PrinterMode.RejectConnections;
+        rig.Transport.Reset();   // el sender detectó la caída del canal y reconecta antes del próximo envío
         Assert.Equal(JobStatus.RetryWait, (await rig.Sender.SendAsync(m, Ct)).Write!.JobStatus);
         rig.Printer.Mode = PrinterMode.Normal;
         s.AdvanceMs(150);
