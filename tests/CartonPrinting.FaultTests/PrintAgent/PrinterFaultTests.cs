@@ -152,7 +152,7 @@ public sealed class PrinterFaultTests(SqlServerFixture sql) : IAsyncLifetime
         var s = await StationScenario.CreateAsync(_db, r => r with { MinConfirmationLevel = EvidenceLevel.Applied }, Ct);
         await using (var rig = PrintRig.Create(s, new PrinterCapabilities(ConfirmsCancellation: false), new EvidenceSources(PrinterCompletion: true)))
         {
-            var control = new SimulatedDeviceControl(rig.Printer, s);
+            var control = new DeviceCancellation(new SimulatedDeviceControl(rig.Printer), s.Sql, s.Txd, s.Clock);
             var ok = await s.ReadyJobAsync(40, Ct);              // referencia: impresa y aplicada a tiempo
             rig.EvidenceSim.Sources = new EvidenceSources(PrinterCompletion: true, Applicator: true);
             await rig.SendAsync(ok, Ct);
@@ -166,7 +166,7 @@ public sealed class PrinterFaultTests(SqlServerFixture sql) : IAsyncLifetime
             Assert.Equal(JobStatus.Transmitted, heldRow.Status);
             Assert.Single(rig.Printer.Queue);
 
-            Assert.False(await control.CancelAsync(held, heldRow.LabelSerial, Ct));   // "no impreso" sin confirmar cancelación
+            Assert.False(await control.CancelAsync(held, Ct));   // "no impreso" sin confirmar cancelación
             Assert.Equal(JobStatus.Transmitted, (await s.JobAsync(held, Ct)).Status);
 
             s.AdvanceMs(s.Revision.EvidenceWindowMs!.Value + 10);
@@ -185,12 +185,12 @@ public sealed class PrinterFaultTests(SqlServerFixture sql) : IAsyncLifetime
         var v2 = await StationScenario.CreateAsync(_db, r => r with { MinConfirmationLevel = EvidenceLevel.Applied }, Ct);
         await using (var rig = PrintRig.Create(v2, new PrinterCapabilities(ConfirmsCancellation: true), new EvidenceSources(PrinterCompletion: true)))
         {
-            var control = new SimulatedDeviceControl(rig.Printer, v2);
+            var control = new DeviceCancellation(new SimulatedDeviceControl(rig.Printer), v2.Sql, v2.Txd, v2.Clock);
             rig.Printer.Mode = PrinterMode.Hold;
             var held = await v2.ReadyJobAsync(42, Ct);
             await rig.SendAsync(held, Ct);
             var serial = (await v2.JobAsync(held, Ct)).LabelSerial;
-            Assert.True(await control.CancelAsync(held, serial, Ct));
+            Assert.True(await control.CancelAsync(held, Ct));
             Assert.Empty(rig.Printer.Queue);
             var row = await v2.JobAsync(held, Ct);
             Assert.Equal((JobStatus.Failed, JobReason.DeviceReportedNotPrinted), (row.Status, row.Reason));
@@ -243,23 +243,10 @@ public sealed class PrinterFaultTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Equal(AttemptOutcome.Transmitted, (await rig.Sender.SendAsync(m, Ct)).Write!.AttemptOutcome);
     }
 
-    /// <summary>
-    /// Control del job en el dispositivo simulado: pide cancelar; solo si el dispositivo confirma que lo canceló y
-    /// lo sacó de su cola (OT-07) se aplica A07 y J12. Un "no impreso" sin esa confirmación no cambia nada.
-    /// </summary>
-    private sealed class SimulatedDeviceControl(PrinterSimulator printer, StationScenario s)
+    /// <summary>El dispositivo simulado como control de jobs (OT-07): confirma la cancelación solo si lo declara.</summary>
+    private sealed class SimulatedDeviceControl(PrinterSimulator printer) : IDeviceJobControl
     {
-        public async Task<bool> CancelAsync(Guid jobId, string serial, CancellationToken ct)
-        {
-            if (!printer.Cancel(serial))
-            {
-                return false;
-            }
-
-            var attempt = (await s.AttemptsAsync(jobId, ct)).Single(a => a.Outcome == AttemptOutcome.Transmitted);
-            await s.Txd.DeviceNotPrintedAsync(attempt.AttemptId, "Cancelación confirmada por el dispositivo; cola sin el job", s.Clock.UtcNow, ct);
-            return true;
-        }
+        public Task<bool> CancelAndConfirmAsync(string labelSerial, CancellationToken ct) => Task.FromResult(printer.Cancel(labelSerial));
     }
 
     /// <summary>Suspende el sender 2 s (reloj del escenario) entre el commit del claim y la escritura.</summary>
