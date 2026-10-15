@@ -79,7 +79,7 @@ public sealed class PrintAgentReviewTests(SqlServerFixture sql) : IAsyncLifetime
         await evidence.SubmitAsync(s.Verified(912, otherSerial) with { SourceReference = "SCN-912-B" }, Ct);
         await s.TransmitAsync(claimC.AttemptId, Ct);
         Assert.Equal(JobStatus.Transmitted, (await s.JobAsync(c, Ct)).Status);
-        await new EvidenceService(s.Txd, s.Sql, s.Clock, s.Metrics).ReapplyOpenAsync(s.PrinterId, Ct);
+        await new EvidenceService(s.Txd, s.Sql, s.Clock, s.Metrics).ReapplyOpenAsync(StationScenario.SiteId, s.StationId, Ct);
         Assert.Equal((JobStatus.Unknown, JobReason.SerialMismatch), ((await s.JobAsync(c, Ct)).Status, (await s.JobAsync(c, Ct)).Reason));
     }
 
