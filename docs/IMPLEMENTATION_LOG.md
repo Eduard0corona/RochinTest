@@ -688,3 +688,23 @@ Durante el desarrollo:
 - T29 simula la suspensión avanzando el reloj manual en el punto posterior al claim; no suspende el proceso.
 - La alerta inmediata de T22 y T44 y el incidente físico no se prueban.
 
+
+## Fase 5 · Propiedad, recuperación y operación (T27, T34, T36, T40, T41, T43)
+
+### Plan
+
+- **Entregables:**
+  - **Propiedad por impresora:** lock de sistema operativo y lease con renovación. Sin lock o sin lease no se envía nada y se alerta (`printer_owner_conflicts_total`). Si el lease se pierde, el sender se detiene.
+  - **Arranque ordenado del EdgeHost** (sección 1 de `ESTRATEGIA_RECUPERACION.md`): `LabelingReady` bajo → propiedad → TX-R0 → cola del dispositivo → estado → barrido → suscripción → `LabelingReady`.
+  - **Sender de la impresora manual:** ejecuta las reimpresiones autorizadas (TX-X) con su lease, por su única conexión.
+  - **Operations API** (`CartonPrinting.Operations`, HTTP local con autenticación), con todas las acciones manuales en `OperatorAction` o `ReprintAuthorization`:
+    - cancelación, reconciliación negativa y cierre;
+    - desbloqueo de estación y confirmación de época;
+    - reingreso de anomalías;
+    - solicitud y aprobación de reimpresión por dos personas distintas, revocación y retiro de la etiqueta original.
+  - **Métricas:** `exceptional_reprints_total{risk,result}` y `unknown_resolution_total{result}`.
+- **Pruebas que la cierran:** T27, T34, T36, T40, T41 y T43, más pruebas del orden de arranque y de la autenticación de la API.
+- **Riesgos previstos:**
+  - Dos procesos reales en el mismo host para el lock (T27).
+  - El aislamiento de red de T36 solo se puede simular con el proxy TCP.
+  - La identidad de las personas: el proveedor real es una decisión de OT/TI; aquí, claves por persona que la configuración entrega como hash, nunca en el repositorio.
