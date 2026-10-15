@@ -64,6 +64,14 @@ public sealed class TxeErpArrival(SqlDb db)
                 return await FinishAsync(conn, tx, d, DetectionStatus.Blocked, DetectionReason.StationDisabled, plan, ct);
             }
 
+            if (plan.RequiresCartonId && d.CartonId is null)
+            {
+                // SI-04 (clase B, abierto): con CARTON_ID_REQUIRED efectivo y sin CartonId no se puede validar la recirculación, y D08
+                // no tiene un motivo para eso. Interino de falla cerrada, como en TX-A: no se crea el job; la detección sigue en
+                // WAITING_ERP y el barrido la vence con D07 a su plazo.
+                return new ErpArrivalResult(d.Status, d.Reason, null, null);
+            }
+
             if (plan.RequiresCartonId && d.CartonId is not null
                 && await TxaRegisterDetection.IsRecirculatedAsync(conn, tx, d.SiteId, d.CartonId, d.DetectionId, d.ReceivedAt, d.PlcEpoch, d.CycleId, ct))
             {

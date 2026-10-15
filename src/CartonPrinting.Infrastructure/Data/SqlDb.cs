@@ -35,9 +35,18 @@ public sealed partial class SqlDb(DatabaseOptions options, ILogger<SqlDb>? logge
     /// <summary>Transacciones reintentadas por un 1205 (o un -3 de sp_getapplock) desde que se creó esta instancia.</summary>
     public long DeadlockRetries => Interlocked.Read(ref _deadlockRetries);
 
+    // Sin el periodo de bloqueo del pool: tras una apertura fallida, el pool devolvería el mismo error durante 5 a 60 s y la
+    // vigilancia de la falla cerrada no vería volver a SQL Server hasta entonces (revisión de la Fase 7).
+    private string ConnectionString => _connectionString ??= new SqlConnectionStringBuilder(Options.ConnectionString)
+    {
+        PoolBlockingPeriod = PoolBlockingPeriod.NeverBlock,
+    }.ConnectionString;
+
+    private string? _connectionString;
+
     public async Task<SqlConnection> OpenAsync(CancellationToken ct)
     {
-        var conn = new SqlConnection(Options.ConnectionString);
+        var conn = new SqlConnection(ConnectionString);
         try
         {
             await conn.OpenAsync(ct);

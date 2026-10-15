@@ -64,8 +64,9 @@ public sealed class IngestHostedService : BackgroundService
 
     public IngestHostedService(
         IngestHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers, IErpDemand? erpDemand = null,
-        bool coordinated = false, ReadyJobSignal? readySignal = null)
+        bool coordinated = false, ReadyJobSignal? readySignal = null, SqlOutage? outage = null)
     {
+        outage ??= new SqlOutage(clock);
         _options = options;
         _clock = clock;
         _coordinated = coordinated;
@@ -78,7 +79,7 @@ public sealed class IngestHostedService : BackgroundService
             {
                 AttemptTimeout = TimeSpan.FromMilliseconds(options.SqlAttemptTimeoutMs),
                 RecoveryProbeInterval = TimeSpan.FromMilliseconds(options.SqlRecoveryProbeMs),
-            });
+            }, outage);
         _channel = Channel.CreateBounded<RawNotification>(new BoundedChannelOptions(options.ChannelCapacity)
         {
             SingleReader = true,
@@ -87,7 +88,7 @@ public sealed class IngestHostedService : BackgroundService
         _source = new OpcUaCycleSource(options.Opc, clock, metrics, loggers.CreateLogger<OpcUaCycleSource>());
         var pressure = new ChannelPressure(_channel.Reader, options.ChannelCapacity, () => _source.DroppedNotifications);
         _heartbeat = new LabelingReadyHeartbeat(station, stations, _source, metrics, loggers.CreateLogger<LabelingReadyHeartbeat>(), pressure.Overloaded,
-            () => Service.SqlUnavailable, TimeSpan.FromMilliseconds(options.SqlAttemptTimeoutMs), Service.DeclareSqlUnavailable);
+            outage, TimeSpan.FromMilliseconds(options.SqlAttemptTimeoutMs));
     }
 
     /// <summary>La ingesta (para recargar épocas o reingresar registros retenidos desde la operación).</summary>
@@ -141,6 +142,8 @@ public sealed class IngestHostedService : BackgroundService
         }
         catch (Exception ex)
         {
+            // Sale con un código distinto de 0 para que el supervisor lo note (71: la ingesta se detuvo; 70 es el sender).
+            Environment.ExitCode = 71;
             _logger.LogCritical(ex, "La ingesta de {Station} se detuvo: ningún registro se salta; revisar antes de reiniciar", _options.StationId);
             throw;
         }

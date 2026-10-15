@@ -1,6 +1,7 @@
 using CartonPrinting.Contracts;
 using CartonPrinting.Infrastructure.Data;
 using CartonPrinting.Infrastructure.Observability;
+using CartonPrinting.Infrastructure.Signals;
 using CartonPrinting.Infrastructure.Time;
 using CartonPrinting.Infrastructure.Transactions;
 using Microsoft.Extensions.Logging;
@@ -48,7 +49,7 @@ public sealed class SenderHaltedException(string message, Exception inner) : Exc
 public sealed class PrinterSenderService(
     string printerId, SqlDb db, ClaimService claims, TxcWriteResult txc, StationConfigStore stations, LeaseGrant lease, IPrinterTransport transport,
     EdgeClock clock, CartonMetrics metrics, ISenderFaults? faults = null, IPhysicalGate? gate = null, ILogger<PrinterSenderService>? logger = null,
-    EvidenceService? evidence = null)
+    EvidenceService? evidence = null, SqlOutage? sqlOutage = null)
 {
     private readonly ILogger _logger = logger ?? NullLogger<PrinterSenderService>.Instance;
 
@@ -256,7 +257,12 @@ public sealed class PrinterSenderService(
     private Task<WriteOutcome> RecordResultAsync(Guid attemptId, Func<Task<WriteOutcome>> txcCall) =>
         ResultRecorder.RecordAsync(txcCall, printerId, attemptId, _logger);
 
-    /// <summary>Bucle del sender: envía mientras haya jobs READY; si no, espera una señal o el intervalo de sondeo.</summary>
+    /// <summary>
+    /// Bucle del sender: envía mientras haya jobs READY; si no, espera una señal o el intervalo de sondeo. Con la caída de SQL Server
+    /// declarada (<paramref name="sqlOutage"/> del constructor) no reclama nada: sin árbitro no se imprime (ESTRATEGIA_RECUPERACION §3).
+    /// Un error de SQL no disponible fuera de la escritura (TX-B) declara la caída para toda la estación (DOCUMENTO_PRINCIPAL §15:
+    /// "Error en TX-A o TX-B"), y el latido baja LabelingReady.
+    /// </summary>
     public async Task RunAsync(TimeSpan pollInterval, TimeProvider loopTime, Func<CancellationToken, Task>? waitForSignal, CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
@@ -265,7 +271,7 @@ public sealed class PrinterSenderService(
             {
                 // Solo un claim obtenido sigue de inmediato; un rechazo (estación bloqueada, lease, orden, etc.) espera el
                 // intervalo de sondeo en lugar de volver a reclamar el mismo job en bucle.
-                if (await SendNextAsync(ct) is { Claim.Claimed: true })
+                if (sqlOutage is not { Declared: true } && await SendNextAsync(ct) is { Claim.Claimed: true })
                 {
                     continue;
                 }
@@ -273,6 +279,10 @@ public sealed class PrinterSenderService(
             catch (Exception ex) when (ex is not OperationCanceledException and not SenderHaltedException)
             {
                 _logger.LogError(ex, "Sender de {Printer}: error fuera de la escritura; se reintenta", printerId);
+                if (SqlAvailability.IsUnavailable(ex) && sqlOutage?.Declare() == true)
+                {
+                    _logger.LogError("SQL Server no disponible en el claim de {Printer}: falla cerrada para la estación", printerId);
+                }
             }
 
             using var interval = new CancellationTokenSource(pollInterval, loopTime);

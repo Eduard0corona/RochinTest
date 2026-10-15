@@ -1,6 +1,7 @@
 using CartonPrinting.Contracts;
 using CartonPrinting.Infrastructure.Data;
 using CartonPrinting.Infrastructure.Observability;
+using CartonPrinting.Infrastructure.Time;
 using CartonPrinting.Orchestration;
 using CartonPrinting.Testing;
 using Microsoft.Data.SqlClient;
@@ -68,8 +69,9 @@ public sealed class RecirculationTests(SqlServerFixture sql) : IAsyncLifetime
     /// T16 · La validación de TX-A con bloqueo de rango, bajo concurrencia: dos ciclos de C-99 se registran a la vez. Una sesión
     /// retiene el rango de IX_PrintJob_Carton de la caja hasta que las dos TX-A insertaron su detección y esperan ese rango; al
     /// soltarlo, cada una necesita lo que la otra tiene (el rango de PrintJob y la clave de su detección en IX_CartonDetection_Carton):
-    /// SQL Server elige una víctima (1205), que se reintenta completa y termina igual que en serie: un solo job y la otra detección
-    /// BLOCKED con RECIRCULATED_CARTON.
+    /// SQL Server elige una víctima (1205), que se reintenta completa: un solo job y la otra detección BLOCKED con RECIRCULATED_CARTON.
+    /// Cuál de las dos lleva el job depende de la víctima: un job vivo bloquea a cualquier otra detección de la caja, anterior o no
+    /// (límite registrado en SI-17).
     /// </summary>
     [Fact]
     [Trait("Spec", "T16")]
@@ -112,6 +114,32 @@ public sealed class RecirculationTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Equal(DetectionStatus.JobCreated, arrival!.FinalStatus);
         Assert.Equal((DetectionStatus.Blocked, DetectionReason.RecirculatedCarton, (Guid?)null), (again.FinalStatus, again.FinalReason, again.PrintJobId));
         Assert.Equal(1, await s.CountAsync("FROM dbo.PrintJob WHERE StationId = @st AND CartonId = 'C-98'", c => c.Parameters.AddWithValue("@st", s.StationId), Ct));
+    }
+
+    /// <summary>
+    /// SI-04 en TX-E (interino de falla cerrada, segunda revisión de la Fase 7, BAJA-8): una detección registrada con CYCLE_ONLY y sin
+    /// CartonId espera snapshot; se activa CARTON_ID_REQUIRED. Al llegar el snapshot, sin CartonId no se puede validar la
+    /// recirculación y D08 no tiene un motivo para eso: TX-E no crea el job, la detección sigue en WAITING_ERP y el barrido la vence
+    /// con D07 a su plazo, como en TX-A, que la bloquea.
+    /// </summary>
+    [Fact]
+    public async Task Without_its_carton_id_a_waiting_detection_gets_no_job_once_carton_id_required_is_effective()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        Assert.Equal(DetectionStatus.WaitingErp, (await s.RegisterAsync(s.Cycle(120, workOrder: "WO-NC"), ct: Ct)).FinalStatus);
+        await s.Stations.ActivateRevisionAsync(StationScenario.DefaultRevision(s.StationId) with { RevisionNumber = 8, CartonIdentityMode = "CARTON_ID_REQUIRED" }, Ct);
+        await s.AddSnapshotAsync("R1", "SKU-NC", "LOT-NC", Ct, "WO-NC");
+        var snapshot = (await s.Erp.FindValidAsync("WO-NC", s.Clock.UtcNow, Ct))!;
+        var arrivals = new ErpArrivalService(s.Txe, s.Stations, s.Serials, s.Settings, s.Clock, s.Metrics);
+
+        Assert.Null(await arrivals.ProcessAsync((await s.DetectionAsync(120, Ct))!, snapshot, Ct));
+        Assert.Equal(DetectionStatus.WaitingErp, (await s.DetectionAsync(120, Ct))!.Status);
+        Assert.Equal(0, await s.CountAsync("FROM dbo.PrintJob WHERE StationId = @st", c => c.Parameters.AddWithValue("@st", s.StationId), Ct));
+
+        s.Advance(TimeSpan.FromSeconds(5));
+        await new StationSweepService(s.Settings, s.Txs, s.Stations, new ClockGuard(s.Clock), s.Clock, s.Metrics).SweepOnceAsync(Ct);
+        Assert.Equal(DetectionStatus.Expired, (await s.DetectionAsync(120, Ct))!.Status);
+        Assert.Equal(0, await s.CountAsync("FROM dbo.PrintJob WHERE StationId = @st", c => c.Parameters.AddWithValue("@st", s.StationId), Ct));
     }
 
     /// <summary>

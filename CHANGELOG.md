@@ -21,6 +21,12 @@ Cambios de la implementación. Los de la especificación están en `spec/CHANGEL
   - prerrequisitos de planta en `FAT_CHECKLIST.md`;
   - la revocación del certificado TLS de RabbitMQ;
   - logs sin el endpoint OPC.
+- Segunda revisión independiente:
+  - una sola caída de SQL Server por proceso (`SqlOutage`) para la ingesta, el latido y el sender de línea (TX-B);
+  - la vigilancia la levanta solo si no quedan operaciones colgadas, si recarga el estado y si toma el rango de TX-A, con histéresis;
+  - errores de un servidor real clasificados; pool sin periodo de bloqueo; código de salida 71 si la ingesta se detiene;
+  - interino de SI-04 en TX-E; SI-20 registrado;
+  - T19 con escrituras bloqueadas, con la recarga y con un SQL Server real detenido y vuelto a arrancar.
 - Pruebas: T08, T12, T16, T19 y T32 en verde contra SQL Server y RabbitMQ reales y simuladores.
 
 ## Fase 6 · Perfil extendido (2026-10-15)

@@ -11,8 +11,8 @@ namespace CartonPrinting.Simulators.Network;
 public sealed class TcpProxy : IAsyncDisposable
 {
     private readonly TcpListener _listener;
-    private readonly string _targetHost;
-    private readonly int _targetPort;
+    private volatile string _targetHost;
+    private volatile int _targetPort;
     private readonly List<Pair> _pairs = [];
     private readonly CancellationTokenSource _cts = new();
     private volatile TaskCompletionSource _flowing = CompletedGate();
@@ -26,6 +26,13 @@ public sealed class TcpProxy : IAsyncDisposable
     }
 
     public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
+
+    /// <summary>Las conexiones nuevas van a otro destino (un contenedor que volvió a arrancar con otro puerto publicado).</summary>
+    public void Retarget(string targetHost, int targetPort)
+    {
+        _targetHost = targetHost;
+        _targetPort = targetPort;
+    }
 
     /// <summary>Si es false, las conexiones nuevas se cierran al aceptarlas.</summary>
     public bool AcceptNew { get; set; } = true;

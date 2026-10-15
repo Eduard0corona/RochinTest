@@ -53,11 +53,15 @@ public sealed class PrinterHostedService : BackgroundService
     private readonly ILogger _logger;
     private readonly ReadyJobSignal? _readySignal;
 
+    // Solo la impresora de línea participa de la falla cerrada de la estación; la manual (reimpresiones) no depende de LabelingReady.
+    private readonly SqlOutage? _sqlOutage;
+
     public PrinterHostedService(
         PrinterRole role, PrinterHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers, StartupCoordinator startup,
-        ClockGuard? stationClockGuard = null, ReadyJobSignal? readySignal = null)
+        ClockGuard? stationClockGuard = null, ReadyJobSignal? readySignal = null, SqlOutage? sqlOutage = null)
     {
         _readySignal = readySignal;
+        _sqlOutage = role == PrinterRole.Line ? sqlOutage : null;
         _role = role;
         _options = options;
         _db = db;
@@ -149,7 +153,7 @@ public sealed class PrinterHostedService : BackgroundService
         {
             var sender = new PrinterSenderService(_options.PrinterId, _db, new ClaimService(_db, new TxbClaim(_db), _metrics, _clock, _clockGuard),
                 new TxcWriteResult(_db), new StationConfigStore(_db), lease, transport, _clock, _metrics,
-                logger: _loggers.CreateLogger<PrinterSenderService>(), evidence: evidence);
+                logger: _loggers.CreateLogger<PrinterSenderService>(), evidence: evidence, sqlOutage: _sqlOutage);
             await sender.RunAsync(poll, _clock.TimeProvider, _readySignal is null ? null : _readySignal.WaitAsync, ct);
         }
         finally

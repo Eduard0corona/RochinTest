@@ -10,8 +10,11 @@ namespace CartonPrinting.Infrastructure.Data;
 public static class SqlAvailability
 {
     // -2 tiempo de espera, -1/2/53 servidor no encontrado, 64/233/10053/10054 conexión cortada, 10060/10061 sin respuesta o
-    // rechazada, 11001 host desconocido, 40613 base no disponible.
-    private static readonly HashSet<int> Unavailable = [-2, -1, 2, 53, 64, 233, 10053, 10054, 10060, 10061, 11001, 40613];
+    // rechazada, 11001 host desconocido, 40613 base no disponible. Al detener y volver a arrancar un servidor real (revisión de la
+    // Fase 7): 6005 apagado en curso, 4060 la base todavía no se puede abrir, 18456 el login falla mientras la base se recupera y
+    // 18401 el servidor está en modo de actualización. Un 18456 por una contraseña mal configurada también cae aquí: la estación
+    // queda en falla cerrada (LabelingReady en falso) con el error en el log, en lugar de detenerse.
+    private static readonly HashSet<int> Unavailable = [-2, -1, 2, 53, 64, 233, 4060, 6005, 10053, 10054, 10060, 10061, 11001, 18401, 18456, 40613];
 
     public static bool IsUnavailable(Exception ex) => ex switch
     {

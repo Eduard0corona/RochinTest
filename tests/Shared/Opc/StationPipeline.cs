@@ -87,7 +87,8 @@ public sealed class StationPipeline : IAsyncDisposable
         };
         var readySignal = new ReadyJobSignal();
         var ingest = new IngestHostedService(options, s.Sql, s.Clock, s.Metrics, NullLoggerFactory.Instance, readySignal: signal ? readySignal : null);
-        var rig = PrintRig.Create(s, sources: sources);
+        // Como en el EdgeHost, el sender de línea comparte la caída de SQL Server de la ingesta.
+        var rig = PrintRig.Create(s, sources: sources, sqlOutage: ingest.Service.Outage);
         var pipeline = new StationPipeline(s, plc, ingest, rig, readySignal);
         if (rabbitUri is not null)
         {

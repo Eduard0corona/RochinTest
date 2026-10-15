@@ -31,7 +31,7 @@ public sealed class PrintRig : IAsyncDisposable
     public EvidenceSimulator EvidenceSim { get; }
 
     public static PrintRig Create(StationScenario s, PrinterCapabilities? capabilities = null, EvidenceSources? sources = null, ISenderFaults? faults = null,
-        int acceptanceTimeoutMs = 500, EdgeClock? clock = null)
+        int acceptanceTimeoutMs = 500, EdgeClock? clock = null, CartonPrinting.Infrastructure.Signals.SqlOutage? sqlOutage = null)
     {
         var printer = PrinterSimulator.Start(capabilities);
         var transport = new TcpPrinterTransport(new PrinterTransportOptions
@@ -41,7 +41,8 @@ public sealed class PrintRig : IAsyncDisposable
         var c = clock ?? s.Clock;
         var claims = clock is null ? s.Claims : new ClaimService(s.Sql, s.Txb, s.Metrics, c, new ClockGuard(c));
         var evidence = new EvidenceService(s.Txd, s.Sql, c, s.Metrics);
-        var sender = new PrinterSenderService(s.PrinterId, s.Sql, claims, s.Txc, s.Stations, s.Lease, transport, c, s.Metrics, faults, evidence: evidence);
+        var sender = new PrinterSenderService(s.PrinterId, s.Sql, claims, s.Txc, s.Stations, s.Lease, transport, c, s.Metrics, faults, evidence: evidence,
+            sqlOutage: sqlOutage);
         var evidenceSim = new EvidenceSimulator(printer, StationScenario.SiteId, s.StationId, sources ?? new EvidenceSources(), (serial, ct) => JobBySerialAsync(s, serial, ct),
             (o, ct) => evidence.SubmitAsync(o, ct), () => c.UtcNow);
         return new PrintRig(s, printer, transport, sender, evidence, evidenceSim);

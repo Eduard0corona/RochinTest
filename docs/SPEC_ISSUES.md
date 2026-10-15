@@ -26,6 +26,7 @@ Clasificación de `CLAUDE.md`:
 | SI-17 | B (contradicción entre fuentes) | 7 | `spec/database/sqlserver_operations_reference.sql` (recirculación en TX-E) frente al catálogo de T16 | Resuelto por decisión de la persona: solo cuentan las detecciones anteriores, con la identidad más restrictiva |
 | SI-18 | B (vacío) | 4 | `contracts/state-machine.json` (J06: un error o un apagado entre el claim y la escritura) | Resuelto por decisión de la persona: NOT_SENT sin consumir intento |
 | SI-19 | A | 7 | `spec/tests/test-catalog.json` (T16, variante) | Abierto: parche propuesto, pendiente de la aprobación de la persona; la prueba ejercita el escenario alcanzable |
+| SI-20 | B (vacío) | 7 | `docs/ESTRATEGIA_RECUPERACION.md` §3 ("Al volver: arranque completo") y `DOCUMENTO_PRINCIPAL.md` §15 (SQL caído, TX-A o TX-B) | Interino recomendado aplicado con la autorización general de la persona; pendiente de su confirmación |
 
 ## SI-01 · Rango de códigos de error en el criterio de T47
 
@@ -54,6 +55,7 @@ Clasificación de `CLAUDE.md`:
 - **Trabajo afectado detenido.** Como corresponde a un defecto de clase B, ese camino no se implementa con una salida propia: queda en falla cerrada. Un registro que de otro modo sería candidato a job queda `BLOCKED` con `INCOHERENT_SNAPSHOT` (el registro no trae un dato que la revisión declara obligatorio y sin él no se puede validar la recirculación), no imprime y nunca se inventa un `CartonId` (I07). Elegir `INCOHERENT_SNAPSHOT` es una decisión interina de la implementación (el motivo de bloqueo más cercano a "registro incompleto"), no algo que diga la especificación. El interino no pasa por encima de otras clasificaciones: un registro sin plazo confiable sigue D04 (`EXPIRED` con `LATE_ARRIVAL`) y uno que la secuencia ya bloqueó conserva su motivo (`ReferenceCoverageTests.Review2_b5_…`).
 - **Por qué clase B.** Elegir el motivo definitivo (u otra salida, por ejemplo esperar un lector) es una decisión de comportamiento. Pendiente de la persona. El resto de las fases no depende de este caso borde.
 - **Extensión encontrada en la Fase 7 (revisión independiente, BAJA-4).** El mismo vacío aparece en TX-E. Una detección registrada con `CYCLE_ONLY` y sin `CartonId` puede esperar snapshot mientras la revisión activa pasa a `CARTON_ID_REQUIRED`. Al llegar el snapshot, el modo más restrictivo (SI-17) es `CARTON_ID_REQUIRED`, pero D08 solo admite `STATION_DISABLED` o `RECIRCULATED_CARTON`: no hay un motivo para bloquear por falta de `CartonId`, y TX-E crea el job. TX-A, en cambio, bloquea un registro así (el interino de arriba). No se rodea en el código: queda como parte de la decisión pendiente de SI-04, que debe decir también qué hace D08 en ese caso.
+- **Interino en TX-E (segunda revisión de la Fase 7, BAJA-8).** Se aplicó el mismo interino de falla cerrada que en TX-A, la opción recomendada, con la autorización general de la persona para seguir las recomendaciones. Con `CARTON_ID_REQUIRED` efectivo y sin `CartonId`, TX-E no crea el job: la detección sigue en `WAITING_ERP` y el barrido la vence con D07 a su plazo. Así no hace falta un motivo nuevo. Prueba: `RecirculationTests.Without_its_carton_id_a_waiting_detection_gets_no_job_once_carton_id_required_is_effective`. La decisión definitiva sigue pendiente de la persona.
 
 ## SI-05 · Registro `GATEWAY_RECEIPT` en vivo que abre un hueco: regla de negocio del verificador
 
@@ -173,6 +175,7 @@ Clasificación de `CLAUDE.md`:
   - TX-A y TX-E concurrentes.
 
   Además, la cobertura de D08 en TX-E (`ReferenceCoverageTests`).
+- **Límite con concurrencia (segunda revisión de la Fase 7, BAJA-4).** Puede ocurrir que dos TX-A de la misma caja se superpongan y la víctima del 1205 sea la del ciclo anterior. Entonces la posterior confirma primero con job, y la anterior queda `BLOCKED` por ese job vivo: la comprobación del job vivo no mira el orden, porque un job ya creado no se le quita a nadie. El resultado sigue siendo un solo job y una detección bloqueada, pero la etiqueta queda en el segundo paso. Para la misma caja física es imposible (dos pasos en el mismo instante); puede ocurrir con un reingreso que coincide con un ciclo en vivo. La prueba concurrente afirma lo que sí se garantiza: un job y la otra detección `BLOCKED`.
 
 ## SI-18 · Un error o un apagado entre el claim y la escritura
 
@@ -191,3 +194,23 @@ Clasificación de `CLAUDE.md`:
 - **Clase A.** Solo cambia el texto del escenario, no una regla.
 - **Parche mínimo propuesto** en `tests/test-catalog.json`, `injection` de T16: "Variante: dos ciclos de C-77 registrados con `CYCLE_ONLY` llegan sin snapshot y quedan WAITING_ERP; se activa `CARTON_ID_REQUIRED` y después llega el snapshot". Se regenera `tests/MATRIZ_PRUEBAS.md`.
 - **Estado.** Pendiente de la aprobación de la persona: la edición de `spec/` no se aplicó. Ningún trabajo depende de ella.
+
+## SI-20 · Qué es "arranque completo" al volver SQL Server, y TX-B en la falla cerrada
+
+- **Vacío.** ESTRATEGIA_RECUPERACION §3 dice "Al volver: arranque completo (sección 1)", sin decir si es reiniciar el proceso o repetir las etapas. Tampoco dice cuándo SQL "volvió": un servidor que responde lecturas puede seguir sin aceptar escrituras (locks, commit síncrono detenido). DOCUMENTO_PRINCIPAL §15 lista "Error en TX-A o TX-B" como síntoma de SQL caído en el perfil mínimo, pero la estrategia solo describe la ingesta.
+- **Evidencia.** Las dos revisiones independientes de la Fase 7 (A1, M1; M-1, M-2, M-3, BAJA-1 y BAJA-7): sin una regla, los ciclos encolados durante la caída se registraban al volver, `LabelingReady` oscilaba con escrituras bloqueadas y una sola conexión colgada, y un error de TX-B no bajaba la señal.
+- **Interino recomendado, aplicado con la autorización general de la persona** (decisión 7 del registro de la Fase 7):
+  - **Una sola caída por proceso** (`SqlOutage`). La declaran la ingesta (TX-A agota sus intentos dentro del plazo de la caja), el latido (no puede leer la estación) o el sender de línea (un error de SQL no disponible en TX-B).
+  - **Mientras está declarada:** `LabelingReady` en falso, ningún ciclo se registra y el sender de línea no reclama.
+  - **Quién la levanta.** Solo la vigilancia de la ingesta, y en este orden:
+    1. espera, sin ninguna operación de SQL abandonada pendiente;
+    2. recarga el estado (etapa 5);
+    3. toma, con `LOCK_TIMEOUT`, el rango donde TX-A insertará el ciclo siguiente;
+    4. marca la recuperación.
+
+    El latido levanta `LabelingReady` después (etapa 8). El barrido sigue con su intervalo (etapa 6). TX-R0 (etapa 3) no se repite: un intento que quedó en `SENDING` por la caída detiene el sender (código 70), y el reinicio del proceso lo ejecuta.
+  - **Ciclos de la caída.** Un ciclo recibido antes de la recuperación es parte del hueco.
+- **Límites declarados.**
+  - TX-B esperando un lock no se abandona: un claim confirmado después de abandonarlo dejaría un `SENDING` sin escritura. Sus jobs vencen por el barrido, y ese caso no baja `LabelingReady`.
+  - La prueba del camino de TX-A no comprueba un commit (no escribe): un commit síncrono detenido se descubre en el primer TX-A después de levantar la caída. Las recaídas seguidas alargan la espera.
+- **Alternativa.** Reiniciar el proceso al volver SQL, con el arranque ordenado completo. Es más simple de razonar, pero corta la sesión OPC UA y el sender en cada caída.

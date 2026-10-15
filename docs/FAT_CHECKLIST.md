@@ -68,7 +68,8 @@ Vuelven a hacerse con el equipo real, porque su criterio físico se comprobó en
 - **RabbitMQ.** `amqps://` con el certificado del broker válido para su nombre y, si la planta lo exige, certificado de cliente (`RabbitMq__Tls__*`). La comprobación de revocación del certificado está activa por defecto. Si la red de planta no llega a la lista de revocación, OT la desactiva de forma explícita (`RabbitMq__Tls__CheckCertificateRevocation=false`) y lo registra aquí. Permisos por vhost.
 - **Secretos.** Cadenas de conexión, contraseñas de los logins, claves de las personas de la Operations API (solo su SHA-256 en la configuración) y certificados: desde el almacén de secretos o las variables de entorno del servicio, nunca en el repositorio (`build/check_secrets.py` en la compuerta).
 - **SQL Server.** El login de la aplicación sin DDL ni escritura sobre `AllowedTransition`. Los triggers habilitados.
-- **Supervisión del servicio.** Reiniciar el EdgeHost cuando sale con un código distinto de 0 (código 70: el sender se detuvo).
+- **Supervisión del servicio.** Reiniciar el EdgeHost cuando sale con un código distinto de 0 (70: el sender se detuvo; 71: la ingesta se detuvo).
+- **SQL Server y la falla cerrada.** El EdgeHost conecta sin el periodo de bloqueo del pool (`PoolBlockingPeriod=NeverBlock`), para ver volver a SQL Server enseguida. Un login fallido (18456) cuenta como SQL no disponible: con una contraseña mal configurada, la estación queda en falla cerrada con el error en el log, en lugar de detenerse. Se verifica en planta que el servidor real vuelve después de una detención (T19 con un contenedor detenido y vuelto a arrancar es la prueba con simulador).
 
 ## 5. Defectos de la especificación que dependen de OT
 
