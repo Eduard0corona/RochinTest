@@ -1,3 +1,5 @@
+using System.Net.Security;
+using System.Security.Authentication;
 using System.Text;
 using RabbitMQ.Client;
 
@@ -12,6 +14,51 @@ public sealed class RabbitMqOptions
 
     /// <summary>Con mandatory, un mensaje sin cola enlazada vuelve como error y no se marca publicado.</summary>
     public bool Mandatory { get; set; } = true;
+
+    /// <summary>TLS hacia el broker. Un Uri <c>amqps://</c> lo activa; aquí se fijan el nombre del servidor y el certificado de cliente.</summary>
+    public RabbitMqTlsOptions Tls { get; set; } = new();
+
+    /// <summary>
+    /// La fábrica de conexiones del publicador y de los consumidores. Con TLS (Uri <c>amqps://</c> o <see cref="RabbitMqTlsOptions.Enabled"/>)
+    /// exige TLS 1.2 o 1.3 y un certificado del broker válido para el nombre esperado, sin errores de política aceptados.
+    /// </summary>
+    public ConnectionFactory CreateConnectionFactory(string clientName)
+    {
+        var uri = new Uri(Uri);
+        var factory = new ConnectionFactory { Uri = uri, ClientProvidedName = clientName };
+        if (Tls.Enabled || uri.Scheme.Equals("amqps", StringComparison.OrdinalIgnoreCase))
+        {
+            factory.Ssl = new SslOption
+            {
+                Enabled = true,
+                ServerName = string.IsNullOrWhiteSpace(Tls.ServerName) ? uri.Host : Tls.ServerName,
+                CertPath = Tls.ClientCertificatePath ?? string.Empty,
+                CertPassphrase = Tls.ClientCertificatePassphrase ?? string.Empty,
+                Version = SslProtocols.Tls12 | SslProtocols.Tls13,
+                AcceptablePolicyErrors = SslPolicyErrors.None,
+            };
+        }
+
+        return factory;
+    }
+}
+
+/// <summary>
+/// TLS hacia RabbitMQ (RENDIMIENTO_Y_SEGURIDAD: "RabbitMQ con TLS y permisos por vhost"). La ruta y la frase del certificado de
+/// cliente llegan del almacén de secretos (variables de entorno del servicio), nunca del repositorio.
+/// </summary>
+public sealed class RabbitMqTlsOptions
+{
+    /// <summary>Activa TLS aunque el Uri sea <c>amqp://</c> (con <c>amqps://</c> ya está activo).</summary>
+    public bool Enabled { get; set; }
+
+    /// <summary>Nombre esperado en el certificado del broker; por defecto, el host del Uri.</summary>
+    public string? ServerName { get; set; }
+
+    /// <summary>Certificado de cliente (PFX) para TLS mutuo.</summary>
+    public string? ClientCertificatePath { get; set; }
+
+    public string? ClientCertificatePassphrase { get; set; }
 }
 
 /// <summary>Evento leído del Outbox para publicar.</summary>
@@ -85,7 +132,7 @@ public sealed class RabbitMqPublisher(RabbitMqOptions options) : IOutboxPublishe
         }
 
         await ResetAsync();
-        var factory = new ConnectionFactory { Uri = new Uri(options.Uri), ClientProvidedName = "CartonPrinting.OutboxRelay" };
+        var factory = options.CreateConnectionFactory("CartonPrinting.OutboxRelay");
         _connection = await factory.CreateConnectionAsync(ct);
         _channel = await _connection.CreateChannelAsync(
             new CreateChannelOptions(publisherConfirmationsEnabled: true, publisherConfirmationTrackingEnabled: true), ct);

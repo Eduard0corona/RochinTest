@@ -64,7 +64,7 @@ public sealed class InboxConsumer(
     /// </summary>
     public async Task<IAsyncDisposable> SubscribeAsync(RabbitMqOptions options, string queue, IReadOnlyList<string> routingKeys, CancellationToken ct)
     {
-        var factory = new ConnectionFactory { Uri = new Uri(options.Uri), ClientProvidedName = $"CartonPrinting.Inbox.{ConsumerName}" };
+        var factory = options.CreateConnectionFactory($"CartonPrinting.Inbox.{ConsumerName}");
         var connection = await factory.CreateConnectionAsync(ct);
         var channel = await connection.CreateChannelAsync(cancellationToken: ct);
         await channel.ExchangeDeclareAsync(options.Exchange, ExchangeType.Topic, durable: true, autoDelete: false, cancellationToken: ct);

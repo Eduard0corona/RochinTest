@@ -23,6 +23,8 @@ Clasificación de `CLAUDE.md`:
 | SI-14 | B (contradicción entre fuentes) | 3 | `spec/database/sqlserver_operations_reference.sql` (J03, J14 y D07 en TX-S) frente a `contracts/state-machine.json` | Abierto: la persona decidió mantener el plazo efectivo (gana la máquina de estados) |
 | SI-15 | B (vacío) | 3 | `DOCUMENTO_PRINCIPAL.md` sección 10.2 (`CLOCK_SKEW`) | Abierto (OT): la persona decidió mantener el interino y declararlo |
 | SI-16 | B (vacío) | 3 | `DOCUMENTO_PRINCIPAL.md` secciones 10.2 y 645; `docs/ESTRATEGIA_RECUPERACION.md` (trabajo pendiente tras `CLOCK_JUMP`) | Resuelto por decisión de la persona: lo pendiente vence al confirmar el salto |
+| SI-17 | B (contradicción entre fuentes) | 7 | `spec/database/sqlserver_operations_reference.sql` (recirculación en TX-E) frente al catálogo de T16 | Resuelto por decisión de la persona: solo cuentan las detecciones anteriores, con la identidad más restrictiva |
+| SI-18 | B (vacío) | 4 | `contracts/state-machine.json` (J06: un error o un apagado entre el claim y la escritura) | Resuelto por decisión de la persona: NOT_SENT sin consumir intento |
 
 ## SI-01 · Rango de códigos de error en el criterio de T47
 
@@ -156,6 +158,13 @@ Clasificación de `CLAUDE.md`:
 
   Nada anterior al salto se imprime. El salto solo se da por confirmado cuando el bloqueo vigente es `CLOCK_JUMP`. Con otro bloqueo vigente se vence lo pendiente y el salto se retiene; al levantarse ese bloqueo, la estación queda bloqueada con `CLOCK_JUMP`.
 - **Costo aceptado.** Un job vence con `DEADLINE_PASSED` aunque su plazo real no haya pasado: falla cerrada, como el `UNKNOWN` del reinicio.
+
+## SI-17 · Recirculación al llegar el snapshot (TX-E)
+
+- **Contradicción.** TX-E repite la validación de recirculación de TX-A (D08) cuando llega el snapshot de una detección en `WAITING_ERP`. La sentencia de referencia, aplicada al pie de la letra, cuenta como recirculación cualquier otra detección de la misma caja en `WAITING_ERP`, también las posteriores. Con dos ciclos de la caja C-77 esperando snapshot, el primero queda `BLOCKED` con `RECIRCULATED_CARTON` y el segundo crea el job. El catálogo de T16 espera lo contrario: el primer paso de la caja se etiqueta y el segundo es la recirculación.
+- **Segundo vacío.** Si la revisión cambió entre TX-A y TX-E, la especificación no dice qué `CartonIdentityMode` aplica: el congelado en la detección o el de la revisión activa.
+- **Decisión de la persona (2026-10-15).** Solo cuentan las detecciones anteriores de la caja: por `ReceivedAt` y, si empatan, por época y ciclo, que es el orden en que pasó la caja. En TX-A la detección nueva es siempre la última, así que nada cambia ahí. El modo de identidad es el más restrictivo entre el congelado y el activo (`DeadlinePolicy.EffectiveRequiresCartonId`), como el plazo efectivo (SI-09, SI-14).
+- **Pruebas.** T16, con la variante de dos ciclos de la misma caja en `WAITING_ERP` (`RecirculationTests`), y la cobertura de D08 en TX-E (`ReferenceCoverageTests`).
 
 ## SI-18 · Un error o un apagado entre el claim y la escritura
 

@@ -15,6 +15,7 @@ function Step([string] $title, [scriptblock] $action) {
 
 Step '1/5 Integridad de la especificación' { & $py -B spec/tools/verify_package.py }
 Step '2/5 Artefactos derivados al día' { & $py -B spec/tools/generate_artifacts.py --check }
+Step '2b/5 Secretos fuera del repositorio' { & $py -B build/check_secrets.py }
 Step '3/5 Compilación sin advertencias' { dotnet build -warnaserror }
 Step '4/5 Pruebas (sin carga)' {
     if (Test-Path TestResults) { Remove-Item -Recurse -Force TestResults }
