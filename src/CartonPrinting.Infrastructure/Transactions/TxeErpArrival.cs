@@ -65,7 +65,7 @@ public sealed class TxeErpArrival(SqlDb db)
             }
 
             if (plan.RequiresCartonId && d.CartonId is not null
-                && await TxaRegisterDetection.IsRecirculatedAsync(conn, tx, d.SiteId, d.CartonId, d.DetectionId, ct))
+                && await TxaRegisterDetection.IsRecirculatedAsync(conn, tx, d.SiteId, d.CartonId, d.DetectionId, d.ReceivedAt, d.PlcEpoch, d.CycleId, ct))
             {
                 return await FinishAsync(conn, tx, d, DetectionStatus.Blocked, DetectionReason.RecirculatedCarton, plan, ct);
             }

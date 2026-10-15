@@ -38,7 +38,8 @@ public sealed class ErpArrivalService(
         var plan = new ErpArrivalPlan(detection.DetectionId,
             new JobInsert(Guid.NewGuid(), frozen.LabelType, frozen.PrinterId, snapshot.WorkOrderId, snapshot.Revision, snapshot.ProductId,
                 snapshot.LotId, serial, frozen.TemplateRevision, label.Payload, label.PayloadHash, detection.DeadlineAt),
-            frozen.RequiresCartonId, effectiveDeadline, margin, frozen.LabelType, now, snapshot.Gtin, active.Active.ConfigRevisionId);
+            DeadlinePolicy.EffectiveRequiresCartonId(frozen, active.Active), effectiveDeadline, margin, frozen.LabelType, now, snapshot.Gtin,
+            active.Active.ConfigRevisionId);
         var result = await txe.ExecuteAsync(plan, ct);
 
         // Solo una transición se mide: una TX-E sin efecto devuelve el estado que ya tenía la detección.

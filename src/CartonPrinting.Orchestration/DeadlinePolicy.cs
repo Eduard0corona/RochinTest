@@ -54,6 +54,12 @@ public static class DeadlinePolicy
     /// <summary>Margen efectivo: el mayor entre el congelado y el activo.</summary>
     public static int EffectiveSendMargin(StationRevision frozen, StationRevision active) => Math.Max(frozen.SendMarginMs, active.SendMarginMs);
 
+    /// <summary>
+    /// Identidad física exigida: si la exige la revisión congelada o la activa (la más restrictiva, como el plazo). TX-E repite
+    /// la validación de recirculación de TX-A con ella (D08).
+    /// </summary>
+    public static bool EffectiveRequiresCartonId(StationRevision frozen, StationRevision active) => frozen.RequiresCartonId || active.RequiresCartonId;
+
     /// <summary>Intentos automáticos efectivos: el menor entre el congelado y el activo.</summary>
     public static byte EffectiveMaxAutoAttempts(StationRevision frozen, StationRevision active) => Math.Min(frozen.MaxAutoAttempts, active.MaxAutoAttempts);
 

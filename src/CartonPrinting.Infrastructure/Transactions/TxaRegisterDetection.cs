@@ -262,7 +262,7 @@ public sealed class TxaRegisterDetection(SqlDb db)
         }
 
         if (plan.Revision.RequiresCartonId && d.CartonId is not null
-            && await IsRecirculatedAsync(conn, tx, d.SiteId, d.CartonId, d.DetectionId, ct))
+            && await IsRecirculatedAsync(conn, tx, d.SiteId, d.CartonId, d.DetectionId, d.ReceivedAt, d.PlcEpoch, d.CycleId, ct))
         {
             return (DetectionStatus.Blocked, DetectionReason.RecirculatedCarton, null);
         }
@@ -281,7 +281,15 @@ public sealed class TxaRegisterDetection(SqlDb db)
     /// Recirculación (H8, CARTON_ID_REQUIRED): bloqueo de rango sobre IX_PrintJob_Carton e
     /// IX_CartonDetection_Carton con UPDLOCK, HOLDLOCK. La comparten TX-A y TX-E.
     /// </summary>
-    public static async Task<bool> IsRecirculatedAsync(SqlConnection conn, SqlTransaction tx, string siteId, string cartonId, Guid detectionId, CancellationToken ct)
+    /// <summary>
+    /// Recirculación (H8): un job vivo de la caja, o una detección anterior de la caja que espera snapshot. "Anterior" por
+    /// ReceivedAt y, si empatan, por época y ciclo (el orden en que pasó la caja): en TX-A la detección nueva es siempre la
+    /// última; en TX-E, de dos detecciones de la misma caja en WAITING_ERP solo la segunda es recirculación (SI-17, decidido
+    /// por la persona; catálogo de T16).
+    /// </summary>
+    public static async Task<bool> IsRecirculatedAsync(
+        SqlConnection conn, SqlTransaction tx, string siteId, string cartonId, Guid detectionId, DateTime receivedAt, long plcEpoch, ulong cycleId,
+        CancellationToken ct)
     {
         await using var cmd = conn.Command(tx, $"""
             SELECT TOP (1) pj.PrintJobId
@@ -295,9 +303,12 @@ public sealed class TxaRegisterDetection(SqlDb db)
             WHERE cd.SiteId = @SiteId
               AND cd.CartonId = @CartonId
               AND cd.Status = 'WAITING_ERP'
-              AND cd.DetectionId <> @DetectionId;
+              AND cd.DetectionId <> @DetectionId
+              AND (cd.ReceivedAt < @ReceivedAt
+                   OR (cd.ReceivedAt = @ReceivedAt AND (cd.PlcEpoch < @PlcEpoch OR (cd.PlcEpoch = @PlcEpoch AND cd.CycleId < @CycleId))));
             """);
-        cmd.NVarChar("@SiteId", siteId, 64).NVarChar("@CartonId", cartonId, 128).Guid("@DetectionId", detectionId);
+        cmd.NVarChar("@SiteId", siteId, 64).NVarChar("@CartonId", cartonId, 128).Guid("@DetectionId", detectionId).DateTime2("@ReceivedAt", receivedAt)
+            .BigInt("@PlcEpoch", plcEpoch).Cycle("@CycleId", cycleId);
         await using var r = await cmd.ExecuteReaderAsync(ct);
         var liveJob = await r.ReadAsync(ct);
         await r.NextResultAsync(ct);
