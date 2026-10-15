@@ -179,6 +179,8 @@ public sealed class SqlOutageTests(SqlServerFixture sql) : IAsyncLifetime
         var consumer = ingest.RunAsync(channel.Reader, stop.Token);
         try
         {
+            // La primera notificación del monitored item es el valor inicial (vacío): antes de ella, un ciclo publicado llegaría como READ.
+            await h.NextAsync(TimeSpan.FromSeconds(60));
             await channel.Writer.WriteAsync(await ReceiveAsync(h, s, 500), Ct);
             await WaitAsync(async () => await s.DetectionAsync(500, Ct) is not null, "detección 500");
             Assert.True(await heartbeat.BeatAsync(Ct));
@@ -216,17 +218,20 @@ public sealed class SqlOutageTests(SqlServerFixture sql) : IAsyncLifetime
         await AssertGapAsync(s, metrics, 501, 505);
     }
 
-    /// <summary>El PLC publica el ciclo y la prueba toma su notificación en vivo del cliente OPC UA del arnés.</summary>
+    /// <summary>
+    /// El PLC publica el ciclo y la prueba toma su notificación del cliente OPC UA del arnés. Con la máquina cargada el cliente puede
+    /// reconectar y entregarla como READ o REPUBLISH: la regla de recepción no depende del transporte.
+    /// </summary>
     private static async Task<RawNotification> ReceiveAsync(OpcHarness h, StationScenario s, ulong cycle)
     {
         Publish(h, s, cycle);
         var decoder = new CycleDecoder(s.Settings);
         using var wait = CancellationTokenSource.CreateLinkedTokenSource(Ct);
-        wait.CancelAfter(TimeSpan.FromSeconds(30));
+        wait.CancelAfter(TimeSpan.FromSeconds(60));
         while (true)
         {
             var raw = await h.Notifications.Reader.ReadAsync(wait.Token);
-            if (raw.Transport == Transport.Subscription && decoder.Decode(raw).Record?.CycleId == cycle)
+            if (decoder.Decode(raw).Record?.CycleId == cycle)
             {
                 return raw;
             }
@@ -241,7 +246,8 @@ public sealed class SqlOutageTests(SqlServerFixture sql) : IAsyncLifetime
             c => Bind(c, s, from, to), Ct));
         Assert.Equal(1, await s.CountAsync("FROM dbo.SequenceGap WHERE StationId = @st AND FromCycleId = @from AND ToCycleId = @to AND Status = 'OPEN'",
             c => Bind(c, s, from, to), Ct));
-        Assert.Equal(count, metrics.Total(MetricNames.OpcRecordsRejected, ("cause", "SQL_UNAVAILABLE"), ("transport", Transport.Subscription)));
+        Assert.Equal(count, metrics.Series(MetricNames.OpcRecordsRejected).Where(e => e.Key.Contains("cause=SQL_UNAVAILABLE", StringComparison.Ordinal))
+            .Sum(e => e.Value));
 
         await Task.Delay(TimeSpan.FromMilliseconds(s.Revision.GapGraceMs + 200), Ct);
         await new StationSweepService(s.Settings, s.Txs, s.Stations, new ClockGuard(s.Clock), s.Clock, s.Metrics).SweepOnceAsync(Ct);
