@@ -23,6 +23,8 @@ public sealed class SustainedLoadTests(SqlServerFixture sql) : IAsyncLifetime
         ("doble de la tasa", 2.0, TimeSpan.FromMinutes(10)),
     ];
 
+    private const int WarmUpBoxes = 10;
+
     private static readonly string[] Segments =
     [
         MetricNames.PlcToOpcReceiveMs, MetricNames.OpcReceiveToJobReadyMs, MetricNames.OpcReceiveToSendStartMs, MetricNames.SendStartToDeviceAcceptMs,
@@ -43,13 +45,27 @@ public sealed class SustainedLoadTests(SqlServerFixture sql) : IAsyncLifetime
     [Trait("Spec", "T12")]
     public async Task Thirty_minutes_at_the_agreed_rate_and_ten_at_double_keep_the_backlog_stable_and_the_deadline_feasible()
     {
-        var s = await StationScenario.CreateAsync(_db, r => r with { MinConfirmationLevel = EvidenceLevel.Verified, EvidenceWindowMs = 5_000 }, Ct,
-            TimeProvider.System);
+        // Valores de laboratorio de la estación (OT-03 abierta): TransitBudgetMs 1500, DeviceLeadTimeMs 400, SendMarginMs 250 (cubre el
+        // p99 de presend_check_to_write_ms más ClockJumpToleranceMs 200), ClockSkewToleranceMs 50.
+        var s = await StationScenario.CreateAsync(_db, r => r with
+        {
+            MinConfirmationLevel = EvidenceLevel.Verified, EvidenceWindowMs = 5_000, SendMarginMs = 250,
+        }, Ct, TimeProvider.System);
         await using var p = await StationPipeline.StartAsync(s, new EvidenceSources(PrinterCompletion: true, Applicator: true, Scanner: true), Ct);
+
+        // Calentamiento, fuera de la muestra: conexión con la impresora y código y planes de SQL en frío.
+        ulong cycle = 1;
+        for (; cycle <= WarmUpBoxes; cycle++)
+        {
+            p.Publish(cycle);
+            await Task.Delay(1_000, Ct);
+        }
+
+        await DrainAsync(s, cycle - 1);
+        var warmUp = Segments.ToDictionary(m => m, m => s.Metrics.Samples(m).Count);
 
         var report = new Dictionary<string, object?>();
         var phaseReports = new List<Dictionary<string, object?>>();
-        ulong cycle = 1;
         foreach (var (name, rate, duration) in Phases)
         {
             var firstCycle = cycle;
@@ -93,7 +109,7 @@ public sealed class SustainedLoadTests(SqlServerFixture sql) : IAsyncLifetime
             Assert.True(backlog.TakeLast(60).Max() <= 3 * (int)Math.Ceiling(rate), $"{name}: backlog del último minuto {backlog.TakeLast(60).Max()}");
         }
 
-        // Todas las cajas tienen su job CONFIRMED con VERIFIED y una sola etiqueta.
+        // Todas las cajas (también las de calentamiento) tienen su job CONFIRMED con VERIFIED y una sola etiqueta.
         var boxes = (int)(cycle - 1);
         Assert.Equal(boxes, await s.CountAsync("FROM dbo.PrintJob WHERE Status = 'CONFIRMED'", null, Ct));
         Assert.Equal(0, await s.CountAsync("FROM dbo.PrintJob WHERE Status <> 'CONFIRMED'", null, Ct));
@@ -103,11 +119,12 @@ public sealed class SustainedLoadTests(SqlServerFixture sql) : IAsyncLifetime
         // Desigualdad de factibilidad (PLC_TIMESTAMP, sección 17): con los p99 medidos de toda la corrida y DeviceLeadTimeMs
         // como p99 medido de send_start_to_applied_ms.
         var revision = s.Revision;
-        var p99Flank = Percentile([.. s.Metrics.Samples(MetricNames.PlcToOpcReceiveMs)], 0.99);
-        var p99ToSend = Percentile([.. s.Metrics.Samples(MetricNames.OpcReceiveToSendStartMs)], 0.99);
-        var deviceLead = Percentile([.. s.Metrics.Samples(MetricNames.SendStartToAppliedMs)], 0.99);
+        double[] Measured(string metric) => [.. s.Metrics.Samples(metric).Skip(warmUp[metric])];
+        var p99Flank = Percentile(Measured(MetricNames.PlcToOpcReceiveMs), 0.99);
+        var p99ToSend = Percentile(Measured(MetricNames.OpcReceiveToSendStartMs), 0.99);
+        var deviceLead = Percentile(Measured(MetricNames.SendStartToAppliedMs), 0.99);
         var left = p99Flank + p99ToSend + revision.SendMarginMs + revision.ClockSkewToleranceMs + deviceLead;
-        var presendP99 = Percentile([.. s.Metrics.Samples(MetricNames.PresendCheckToWriteMs)], 0.99);
+        var presendP99 = Percentile(Measured(MetricNames.PresendCheckToWriteMs), 0.99);
         report["feasibility"] = new Dictionary<string, object?>
         {
             ["deadlineReference"] = revision.DeadlineReference, ["p99PlcToOpcReceiveMs"] = p99Flank, ["p99OpcReceiveToSendStartMs"] = p99ToSend,
@@ -133,6 +150,7 @@ public sealed class SustainedLoadTests(SqlServerFixture sql) : IAsyncLifetime
             ["payloadBytes"] = p.Rig.Printer.Received[0].Bytes,
         };
         report["boxes"] = boxes;
+        report["warmUpBoxes"] = WarmUpBoxes;
         report["finishedAt"] = DateTime.UtcNow.ToString("O", CultureInfo.InvariantCulture);
 
         var json = JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true });
@@ -141,6 +159,9 @@ public sealed class SustainedLoadTests(SqlServerFixture sql) : IAsyncLifetime
         TestContext.Current.TestOutputHelper?.WriteLine(json);
 
         Assert.True(left < revision.TransitBudgetMs, $"desigualdad de factibilidad: {left:F0} ms ≥ TransitBudgetMs {revision.TransitBudgetMs} ms");
+        Assert.True(revision.SendMarginMs >= presendP99 + revision.ClockJumpToleranceMs,
+            $"SendMarginMs {revision.SendMarginMs} no cubre p99(presend_check_to_write_ms) {presendP99} + ClockJumpToleranceMs {revision.ClockJumpToleranceMs}");
+        Assert.True(revision.DeviceLeadTimeMs >= deviceLead, $"DeviceLeadTimeMs {revision.DeviceLeadTimeMs} menor que el p99 medido {deviceLead}");
     }
 
     private static async Task<(int Pending, double OldestMs)> BacklogAsync(StationScenario s)
