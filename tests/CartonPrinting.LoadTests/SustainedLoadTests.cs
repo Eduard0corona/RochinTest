@@ -210,11 +210,12 @@ public sealed class SustainedLoadTests(SqlServerFixture sql, RabbitMqFixture rab
 
     private static async Task<(int Pending, double OldestMs)> BacklogAsync(StationScenario s)
     {
+        // ReceivedAt es del reloj del EdgeHost: la edad se mide contra el mismo reloj, no contra el del contenedor de SQL Server.
         var rows = await s.QueryAsync("""
-            SELECT COUNT(*), ISNULL(DATEDIFF_BIG(MILLISECOND, MIN(cd.ReceivedAt), SYSUTCDATETIME()), 0)
+            SELECT COUNT(*), ISNULL(DATEDIFF_BIG(MILLISECOND, MIN(cd.ReceivedAt), @now), 0)
             FROM dbo.PrintJob AS pj INNER JOIN dbo.CartonDetection AS cd ON cd.DetectionId = pj.DetectionId
             WHERE pj.Status IN ('READY', 'RETRY_WAIT', 'SENDING')
-            """, null, r => (r.GetInt32(0), (double)r.GetInt64(1)), Ct);
+            """, c => c.Parameters.Add("@now", System.Data.SqlDbType.DateTime2).Value = s.Clock.UtcNow, r => (r.GetInt32(0), (double)r.GetInt64(1)), Ct);
         return rows[0];
     }
 

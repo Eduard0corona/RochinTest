@@ -14,6 +14,18 @@ public sealed class OutboxRelayOptions
     public TimeSpan IdleDelay { get; set; } = TimeSpan.FromMilliseconds(200);
 
     public TimeSpan MaxBackoff { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Tiempo máximo de una publicación hasta su confirm. Un broker bloqueado (connection.blocked) o que dejó de responder sin cerrar
+    /// la conexión no confirma nunca: al vencer cuenta como falla, se reconecta y se republica con el mismo EventId (I22).
+    /// </summary>
+    public TimeSpan PublishTimeout { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Cada cuánto se mide outbox_pending_age_seconds, aparte de la publicación: un relay bloqueado o detenido también hace crecer
+    /// la alerta (DOCUMENTO_PRINCIPAL §19: "Más de 30 s: broker caído o relay detenido").
+    /// </summary>
+    public TimeSpan PendingAgeInterval { get; set; } = TimeSpan.FromSeconds(1);
 }
 
 /// <summary>
@@ -61,13 +73,16 @@ public sealed class OutboxRelay(
             activity?.SetTag(CartonTelemetry.Tags.EventId, message.EventId);
             activity?.SetTag(CartonTelemetry.Tags.IdempotencyKey, message.OrderingKey);
             activity?.SetTag("eventType", message.EventType);
+            using var limit = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            limit.CancelAfter(options.PublishTimeout);
             try
             {
-                await publisher.PublishAsync(message, ct);
+                await publisher.PublishAsync(message, limit.Token);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (Exception ex) when (!ct.IsCancellationRequested)
             {
-                await RecordFailureAsync(message.Sequence, ex.Message, ct);
+                await RecordFailureAsync(message.Sequence,
+                    ex is OperationCanceledException ? $"Sin confirm del broker en {options.PublishTimeout.TotalSeconds} s" : ex.Message, ct);
                 throw;
             }
 
@@ -91,6 +106,37 @@ public sealed class OutboxRelay(
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        var pendingAge = MeasurePendingAgeAsync(stoppingToken);
+        try
+        {
+            await PublishLoopAsync(stoppingToken);
+        }
+        finally
+        {
+            await pendingAge.ContinueWith(_ => { }, TaskScheduler.Default);
+        }
+    }
+
+    /// <summary>La alerta del Outbox, aparte de la publicación: crece aunque la publicación esté bloqueada esperando un confirm.</summary>
+    private async Task MeasurePendingAgeAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await UpdatePendingAgeAsync(ct);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                _logger.LogWarning(ex, "Outbox Relay: no se pudo medir la edad del pendiente");
+            }
+
+            await Task.Delay(options.PendingAgeInterval, clock.TimeProvider, ct);
+        }
+    }
+
+    private async Task PublishLoopAsync(CancellationToken stoppingToken)
+    {
         var backoff = TimeSpan.FromMilliseconds(250);
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -109,18 +155,8 @@ public sealed class OutboxRelay(
             }
             catch (Exception ex)
             {
+                // Con el broker caído, outbox_pending_age_seconds sigue creciendo: lo mide MeasurePendingAgeAsync (T08).
                 _logger.LogWarning(ex, "Outbox Relay: publicación fallida; reintento en {Backoff}", backoff);
-
-                // Con el broker caído, outbox_pending_age_seconds tiene que seguir creciendo: es la alerta de esa caída (T08).
-                try
-                {
-                    await UpdatePendingAgeAsync(stoppingToken);
-                }
-                catch (Exception gaugeError) when (gaugeError is not OperationCanceledException)
-                {
-                    _logger.LogWarning(gaugeError, "Outbox Relay: no se pudo medir la edad del pendiente");
-                }
-
                 await Task.Delay(backoff, clock.TimeProvider, stoppingToken);
                 backoff = TimeSpan.FromTicks(Math.Min(backoff.Ticks * 2, options.MaxBackoff.Ticks));
             }

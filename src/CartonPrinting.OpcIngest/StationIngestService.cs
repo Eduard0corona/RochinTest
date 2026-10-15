@@ -346,12 +346,12 @@ public sealed class StationIngestService
         while (true)
         {
             await Task.Delay(_failClosed.RecoveryProbeInterval, ct);
-            var hold = _failClosed.RecoveryProbeInterval * (1 << _outage.Relapses);
-            if (!_outage.Declared || _outage.DeclaredFor < hold || _outage.AbandonedOperations > 0)
+            if (!_outage.Declared || _outage.DeclaredFor < _outage.RecoveryHold(_failClosed.RecoveryProbeInterval) || _outage.AbandonedOperations > 0)
             {
                 continue;
             }
 
+            var probeStartedAt = _clock.GetTimestamp();
             try
             {
                 await WithinAttemptAsync(async t =>
@@ -388,7 +388,12 @@ public sealed class StationIngestService
             }
 
             lastError = null;
-            _outage.Recover();
+            if (!_outage.TryRecover(probeStartedAt))
+            {
+                // Una lectura del latido o un intento se abandonó, o alguien informó una falla, mientras se probaba.
+                continue;
+            }
+
             _logger.LogWarning("SQL Server volvió: estado de la estación {Station} recargado y camino de TX-A libre; los ciclos recibidos durante la caída quedan como hueco",
                 _station.StationId);
         }

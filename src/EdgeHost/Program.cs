@@ -67,7 +67,13 @@ if (!string.IsNullOrWhiteSpace(builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOIN
 // Ingesta OPC UA de una estación (Fase 2): solo con la sección "Ingest" configurada. Los endpoints y
 // certificados de planta no van en el repositorio: se configuran en el entorno.
 var ingest = builder.Configuration.GetSection("Ingest").Get<IngestHostOptions>();
-if (!string.IsNullOrWhiteSpace(ingest?.Opc.EndpointUrl))
+var hasIngest = !string.IsNullOrWhiteSpace(ingest?.Opc.EndpointUrl);
+
+// La impresora de línea en servicio (tomada, con TX-R0, sin pausa) condiciona LabelingReady; solo si está configurada.
+var linePrinter = builder.Configuration.GetSection("Printer").Get<PrinterHostOptions>();
+var hasLinePrinter = !string.IsNullOrWhiteSpace(linePrinter?.PrinterId) && linePrinter.Transport.Port > 0;
+var linePrinterReadiness = hasLinePrinter ? new CartonPrinting.Infrastructure.Signals.LinePrinterReadiness() : null;
+if (hasIngest && ingest is not null)
 {
     builder.Services.AddSingleton(ingest);
     builder.Services.AddSingleton(sp =>
@@ -75,7 +81,7 @@ if (!string.IsNullOrWhiteSpace(ingest?.Opc.EndpointUrl))
         var service = new IngestHostedService(ingest, sp.GetRequiredService<SqlDb>(), sp.GetRequiredService<EdgeClock>(),
             sp.GetRequiredService<CartonMetrics>(), sp.GetRequiredService<ILoggerFactory>(), sp.GetService<CartonPrinting.Orchestration.IErpDemand>(),
             coordinated: true, sp.GetRequiredService<CartonPrinting.Infrastructure.Signals.ReadyJobSignal>(),
-            sp.GetRequiredService<CartonPrinting.Infrastructure.Signals.SqlOutage>());
+            sp.GetRequiredService<CartonPrinting.Infrastructure.Signals.SqlOutage>(), linePrinterReadiness);
         startup.Add(StartupStage.StateLoaded, $"revisión, épocas y marca alta de {ingest.StationId}", service.LoadStateAsync);
         startup.Add(StartupStage.Subscribed, $"suscripción OPC UA de {ingest.StationId}", service.SubscribeAsync);
         startup.Add(StartupStage.LabelingReady, $"primer LabelingReady de {ingest.StationId}", service.FirstBeatAsync);
@@ -99,7 +105,9 @@ foreach (var (section, role) in new[] { ("Printer", PrinterRole.Line), ("ManualP
         builder.Services.AddHostedService(sp => new PrinterHostedService(role, printer, sp.GetRequiredService<SqlDb>(), sp.GetRequiredService<EdgeClock>(),
             sp.GetRequiredService<CartonMetrics>(), sp.GetRequiredService<ILoggerFactory>(), startup, sp.GetService<ClockGuard>(),
             sp.GetRequiredService<CartonPrinting.Infrastructure.Signals.ReadyJobSignal>(),
-            sp.GetRequiredService<CartonPrinting.Infrastructure.Signals.SqlOutage>()));
+            // La caída de SQL Server la levanta la vigilancia de la ingesta: sin ingesta, el sender no la declara (nadie la levantaría).
+            hasIngest ? sp.GetRequiredService<CartonPrinting.Infrastructure.Signals.SqlOutage>() : null,
+            role == PrinterRole.Line ? linePrinterReadiness : null));
     }
 }
 

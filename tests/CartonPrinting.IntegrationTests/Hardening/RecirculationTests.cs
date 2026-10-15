@@ -22,8 +22,8 @@ public sealed class RecirculationTests(SqlServerFixture sql) : IAsyncLifetime
     /// <summary>
     /// T16 · CARTON_ID_REQUIRED. La caja C-77 tiene su job CONFIRMED y vuelve a pasar: la segunda detección queda BLOCKED con
     /// RECIRCULATED_CARTON (D05), sin job, con su PrintJobResult BLOCKED. Variante: dos ciclos de C-88 esperan snapshot en
-    /// WAITING_ERP (registrados con CYCLE_ONLY, antes de activar CARTON_ID_REQUIRED: con CARTON_ID_REQUIRED desde el principio, TX-A
-    /// bloquea el segundo y la variante del catálogo no se alcanza, SI-19); al llegar el snapshot, el primero crea el job (D06) y el
+    /// WAITING_ERP, registrados con CYCLE_ONLY antes de activar CARTON_ID_REQUIRED (la variante literal del catálogo, con
+    /// CARTON_ID_REQUIRED desde el principio, está en su propia prueba; SI-19); al llegar el snapshot, el primero crea el job (D06) y el
     /// segundo queda BLOCKED con RECIRCULATED_CARTON al repetir la validación en TX-E (D08).
     /// </summary>
     [Fact]
@@ -63,6 +63,73 @@ public sealed class RecirculationTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Equal("BLOCKED", (await v.ResultsAsync(ct: Ct)).Single(r => r.GetProperty("cycleId").GetString() == "81").GetProperty("outcome").GetString());
         Assert.Equal(1, await v.CountAsync("FROM dbo.PrintJob WHERE StationId = @st AND CartonId = 'C-88'", c => c.Parameters.AddWithValue("@st", v.StationId), Ct));
         Assert.Equal(1, v.Metrics.Total(MetricNames.DetectionsBlocked, ("reason", DetectionReason.RecirculatedCarton)));
+    }
+
+    /// <summary>
+    /// SI-04 en TX-A (verificación final, BAJA-4): el interino de falla cerrada para CARTON_ID_REQUIRED sin CartonId va después de las
+    /// guardas de plazo (D04) y de estación. Un registro sin CartonId con el plazo vencido queda EXPIRED con LATE_ARRIVAL, con la
+    /// estación bloqueada queda BLOCKED con STATION_DISABLED, y solo en los demás casos BLOCKED con INCOHERENT_SNAPSHOT.
+    /// </summary>
+    [Fact]
+    public async Task Without_its_carton_id_the_deadline_and_station_guards_still_decide_first()
+    {
+        var s = await StationScenario.CreateAsync(_db, r => r with { CartonIdentityMode = "CARTON_ID_REQUIRED" }, Ct);
+        var late = await s.RegisterAsync(s.Cycle(160, detectionTimestamp: s.Clock.UtcNow.AddSeconds(-2)), ct: Ct);
+        Assert.Equal((DetectionStatus.Expired, DetectionReason.LateArrival), (late.FinalStatus, late.FinalReason));
+        var incomplete = await s.RegisterAsync(s.Cycle(161), ct: Ct);
+        Assert.Equal((DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot), (incomplete.FinalStatus, incomplete.FinalReason));
+        await s.Stations.BlockAsync(StationScenario.SiteId, s.StationId, BlockReason.Operator, "supervisor.ramos", null, s.Clock.UtcNow, Ct);
+        var disabled = await s.RegisterAsync(s.Cycle(162), ct: Ct);
+        Assert.Equal((DetectionStatus.Blocked, DetectionReason.StationDisabled), (disabled.FinalStatus, disabled.FinalReason));
+        Assert.Equal(0, await s.CountAsync("FROM dbo.PrintJob WHERE StationId = @st", c => c.Parameters.AddWithValue("@st", s.StationId), Ct));
+    }
+
+    /// <summary>
+    /// T16 · La variante del catálogo tal como está escrita: CARTON_ID_REQUIRED desde el principio y dos ciclos de la misma caja en
+    /// WAITING_ERP. Se alcanza cuando el ciclo posterior se registra primero (un reingreso con su recepción original, o dos TX-A con la
+    /// víctima del 1205 invertida): el anterior no lo cuenta como recirculación (SI-17), y las dos detecciones esperan snapshot. Al
+    /// llegar, en cualquier orden de proceso, la primera crea el job (D06) y la segunda queda BLOCKED con RECIRCULATED_CARTON (D08).
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T16")]
+    public async Task The_catalog_variant_with_carton_id_required_from_the_start_is_reachable_and_the_first_pass_gets_the_job()
+    {
+        var s = await StationScenario.CreateAsync(_db, r => r with { CartonIdentityMode = "CARTON_ID_REQUIRED" }, Ct);
+        Assert.Equal(DetectionStatus.WaitingErp, (await s.RegisterAsync(s.Cycle(141, workOrder: "WO-CV", cartonId: "C-66"), ct: Ct)).FinalStatus);
+        Assert.Equal(DetectionStatus.WaitingErp, (await s.RegisterAsync(s.Cycle(140, workOrder: "WO-CV", cartonId: "C-66"), ct: Ct)).FinalStatus);
+        await s.AddSnapshotAsync("R1", "SKU-CV", "LOT-CV", Ct, "WO-CV");
+        var snapshot = (await s.Erp.FindValidAsync("WO-CV", s.Clock.UtcNow, Ct))!;
+        var arrivals = new ErpArrivalService(s.Txe, s.Stations, s.Serials, s.Settings, s.Clock, s.Metrics);
+
+        var later = await arrivals.ProcessAsync((await s.DetectionAsync(141, Ct))!, snapshot, Ct);
+        var earlier = await arrivals.ProcessAsync((await s.DetectionAsync(140, Ct))!, snapshot, Ct);
+        Assert.Equal((DetectionStatus.Blocked, DetectionReason.RecirculatedCarton), (later!.FinalStatus, later.FinalReason));
+        Assert.Equal(DetectionStatus.JobCreated, earlier!.FinalStatus);
+        Assert.Equal(1, await s.CountAsync("FROM dbo.PrintJob WHERE StationId = @st AND CartonId = 'C-66'", c => c.Parameters.AddWithValue("@st", s.StationId), Ct));
+    }
+
+    /// <summary>
+    /// SI-17: "anterior" es por ReceivedAt, no por número de ciclo (verificación final, BAJA-5). El ciclo 151 de la caja se recibe
+    /// 10 ms antes que el 150 (los dos esperan snapshot con CYCLE_ONLY); con CARTON_ID_REQUIRED activo, al llegar el snapshot el 151 es
+    /// el primer paso y lleva el job, y el 150 es la recirculación.
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T16")]
+    public async Task ReceivedAt_decides_which_pass_of_the_carton_came_first_not_the_cycle_number()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        Assert.Equal(DetectionStatus.WaitingErp, (await s.RegisterAsync(s.Cycle(151, workOrder: "WO-RA", cartonId: "C-55"), ct: Ct)).FinalStatus);
+        s.AdvanceMs(10);
+        Assert.Equal(DetectionStatus.WaitingErp, (await s.RegisterAsync(s.Cycle(150, workOrder: "WO-RA", cartonId: "C-55"), ct: Ct)).FinalStatus);
+        await s.Stations.ActivateRevisionAsync(StationScenario.DefaultRevision(s.StationId) with { RevisionNumber = 8, CartonIdentityMode = "CARTON_ID_REQUIRED" }, Ct);
+        await s.AddSnapshotAsync("R1", "SKU-RA", "LOT-RA", Ct, "WO-RA");
+        var snapshot = (await s.Erp.FindValidAsync("WO-RA", s.Clock.UtcNow, Ct))!;
+        var arrivals = new ErpArrivalService(s.Txe, s.Stations, s.Serials, s.Settings, s.Clock, s.Metrics);
+
+        var lowerCycle = await arrivals.ProcessAsync((await s.DetectionAsync(150, Ct))!, snapshot, Ct);
+        var firstReceived = await arrivals.ProcessAsync((await s.DetectionAsync(151, Ct))!, snapshot, Ct);
+        Assert.Equal((DetectionStatus.Blocked, DetectionReason.RecirculatedCarton), (lowerCycle!.FinalStatus, lowerCycle.FinalReason));
+        Assert.Equal(DetectionStatus.JobCreated, firstReceived!.FinalStatus);
     }
 
     /// <summary>
@@ -138,7 +205,9 @@ public sealed class RecirculationTests(SqlServerFixture sql) : IAsyncLifetime
 
         s.Advance(TimeSpan.FromSeconds(5));
         await new StationSweepService(s.Settings, s.Txs, s.Stations, new ClockGuard(s.Clock), s.Clock, s.Metrics).SweepOnceAsync(Ct);
-        Assert.Equal(DetectionStatus.Expired, (await s.DetectionAsync(120, Ct))!.Status);
+        // El barrido aplica D07, cuyo único motivo es ERP_UNAVAILABLE aunque el ERP respondió: el costo del interino, registrado en SI-04.
+        var expired = (await s.DetectionAsync(120, Ct))!;
+        Assert.Equal((DetectionStatus.Expired, "ERP_UNAVAILABLE"), (expired.Status, expired.Reason));
         Assert.Equal(0, await s.CountAsync("FROM dbo.PrintJob WHERE StationId = @st", c => c.Parameters.AddWithValue("@st", s.StationId), Ct));
     }
 
@@ -198,21 +267,26 @@ public sealed class RecirculationTests(SqlServerFixture sql) : IAsyncLifetime
     {
         var s = await StationScenario.CreateAsync(_db, ct: Ct);
         var first = await s.RegisterAsync(s.Cycle(90), ct: Ct);
+        Assert.Equal(DetectionStatus.JobCreated, first.FinalStatus);
+
+        // La caja ya está etiquetada (CONFIRMED con VERIFIED) cuando genera el segundo ciclo.
+        var firstClaim = (await s.Claims.TryClaimAsync(first.PrintJobId!.Value, s.Lease, Ct))!;
+        await s.TransmitAsync(firstClaim.AttemptId, Ct);
+        await s.EvidenceAsync(s.Verified(90, (await s.JobAsync(first.PrintJobId.Value, Ct)).LabelSerial), Ct);
+        Assert.Equal(JobStatus.Confirmed, (await s.JobAsync(first.PrintJobId.Value, Ct)).Status);
+
         var second = await s.RegisterAsync(s.Cycle(91), ct: Ct);
-        Assert.Equal((DetectionStatus.JobCreated, DetectionStatus.JobCreated), (first.FinalStatus, second.FinalStatus));
+        Assert.Equal(DetectionStatus.JobCreated, second.FinalStatus);
         Assert.NotEqual(first.PrintJobId, second.PrintJobId);
 
         var detected = (await s.OutboxAsync(Ct)).Where(e => e.Type == "CartonDetected")
             .Select(e => System.Text.Json.JsonDocument.Parse(e.Payload).RootElement.GetProperty("idempotencyKey").GetString()).Distinct().ToList();
         Assert.Equal(2, detected.Count);
 
-        // La caja recibe las dos etiquetas: dos resultados CONFIRMED con idempotencyKey distinta.
-        foreach (var (job, cycle) in new[] { (first.PrintJobId!.Value, 90UL), (second.PrintJobId!.Value, 91UL) })
-        {
-            var claim = (await s.Claims.TryClaimAsync(job, s.Lease, Ct))!;
-            await s.TransmitAsync(claim.AttemptId, Ct);
-            await s.EvidenceAsync(s.Verified(cycle, (await s.JobAsync(job, Ct)).LabelSerial), Ct);
-        }
+        // La caja recibe la segunda etiqueta: dos resultados CONFIRMED con idempotencyKey distinta.
+        var secondClaim = (await s.Claims.TryClaimAsync(second.PrintJobId!.Value, s.Lease, Ct))!;
+        await s.TransmitAsync(secondClaim.AttemptId, Ct);
+        await s.EvidenceAsync(s.Verified(91, (await s.JobAsync(second.PrintJobId.Value, Ct)).LabelSerial), Ct);
 
         var confirmed = (await s.ResultsAsync(ct: Ct)).Where(r => r.GetProperty("outcome").GetString() == "CONFIRMED")
             .Select(r => r.GetProperty("idempotencyKey").GetString()).Distinct().ToList();

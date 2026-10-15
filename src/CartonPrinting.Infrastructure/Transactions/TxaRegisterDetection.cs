@@ -254,11 +254,20 @@ public sealed class TxaRegisterDetection(SqlDb db)
             return (DetectionStatus.Expired, DetectionReason.LateArrival, null);
         }
 
-        var station = await StationConfigStore.GetActiveAsync(conn, tx, d.SiteId, d.StationId, ct)
+        // Con lock compartido hasta el commit: un bloqueo de la estación en curso (CLOCK_JUMP y su purga, SI-16) espera a esta TX-A o
+        // esta TX-A lo espera y lo ve (verificación final de la Fase 7).
+        var station = await StationConfigStore.GetActiveAsync(conn, tx, d.SiteId, d.StationId, ct, holdShared: true)
             ?? throw new InvalidOperationException($"La estación {d.SiteId}/{d.StationId} no tiene StationConfig.");
         if (!station.State.LabelingEnabled)
         {
             return (DetectionStatus.Blocked, DetectionReason.StationDisabled, null);
+        }
+
+        if (plan.Revision.RequiresCartonId && d.CartonId is null)
+        {
+            // SI-04 (vacío, clase B): CARTON_ID_REQUIRED sin CartonId. Interino de falla cerrada después de las guardas de plazo (D04)
+            // y de estación, como dice el registro: sin CartonId no se valida la recirculación y no se crea el job.
+            return (DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot, null);
         }
 
         if (plan.Revision.RequiresCartonId && d.CartonId is not null

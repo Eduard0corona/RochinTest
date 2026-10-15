@@ -42,10 +42,10 @@ public sealed class TxeErpArrival(SqlDb db)
                 return new ErpArrivalResult(d?.Status, d?.Reason, null, null);
             }
 
-            // Con RCSI se lee la versión confirmada de la estación: TX-E equivale a ejecutarse antes de una activación o
-            // de un bloqueo concurrentes. Sin UPDLOCK, para no formar un ciclo con TX-A, que inserta su detección y
-            // después bloquea la estación.
-            var station = await StationConfigStore.GetActiveAsync(conn, tx, d.SiteId, d.StationId, ct)
+            // La estación se lee con lock compartido hasta el commit: un bloqueo concurrente (CLOCK_JUMP vence lo pendiente en la
+            // misma transacción, SI-16) queda en orden con TX-E, antes o después, nunca en medio. Compartido y no UPDLOCK, para no
+            // serializar TX-E con TX-A; un ciclo con la TX-A que bloquea la estación termina en un 1205 que se reintenta.
+            var station = await StationConfigStore.GetActiveAsync(conn, tx, d.SiteId, d.StationId, ct, holdShared: true)
                 ?? throw new InvalidOperationException($"La estación {d.SiteId}/{d.StationId} no tiene StationConfig.");
             if (station.Active.ConfigRevisionId != plan.ActiveConfigRevisionId)
             {

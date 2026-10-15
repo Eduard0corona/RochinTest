@@ -85,7 +85,7 @@ py build/benchmark_report.py benchmark-t12.json > docs/BENCHMARK.md
 
 ## Entorno local con Docker Compose
 
-1. Copiar `.env.example` a `.env` y cambiar las contraseñas (`.env` no se versiona).
+1. Copiar `.env.example` a `.env` y completar las contraseñas (`.env` no se versiona; vacías, `docker compose` no arranca).
 2. Levantar SQL Server 2022 y RabbitMQ:
 
 ```bash

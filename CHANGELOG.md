@@ -27,6 +27,16 @@ Cambios de la implementación. Los de la especificación están en `spec/CHANGEL
   - errores de un servidor real clasificados; pool sin periodo de bloqueo; código de salida 71 si la ingesta se detiene;
   - interino de SI-04 en TX-E; SI-20 registrado;
   - T19 con escrituras bloqueadas, con la recarga y con un SQL Server real detenido y vuelto a arrancar.
+- Verificación final por dimensiones (14 agentes, con refutación adversarial):
+  - `LabelingReady` exige la impresora de línea tomada con TX-R0 y su sender sin pausa;
+  - tres fallos seguidos del dispositivo ponen el sender en pausa, y vuelve cuando la impresora acepta conexiones;
+  - TX-R0 antes del claim siguiente a un error de TX-B;
+  - TX-A y TX-E leen la estación con lock compartido (frente a la purga de `CLOCK_JUMP`);
+  - tramos de evidencia monotónicos;
+  - alerta del Outbox medida aparte y publicación acotada a 10 s;
+  - T08 con el criterio del catálogo primero y los vencidos comparados por ventana;
+  - revisión de secretos ampliada y `.env.example` sin contraseñas;
+  - SI-19 corregido (la variante de T16 es alcanzable).
 - Pruebas: T08, T12, T16, T19 y T32 en verde contra SQL Server y RabbitMQ reales y simuladores.
 
 ## Fase 6 · Perfil extendido (2026-10-15)

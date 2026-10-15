@@ -64,7 +64,7 @@ public sealed class IngestHostedService : BackgroundService
 
     public IngestHostedService(
         IngestHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers, IErpDemand? erpDemand = null,
-        bool coordinated = false, ReadyJobSignal? readySignal = null, SqlOutage? outage = null)
+        bool coordinated = false, ReadyJobSignal? readySignal = null, SqlOutage? outage = null, LinePrinterReadiness? linePrinter = null)
     {
         outage ??= new SqlOutage(clock);
         _options = options;
@@ -88,7 +88,7 @@ public sealed class IngestHostedService : BackgroundService
         _source = new OpcUaCycleSource(options.Opc, clock, metrics, loggers.CreateLogger<OpcUaCycleSource>());
         var pressure = new ChannelPressure(_channel.Reader, options.ChannelCapacity, () => _source.DroppedNotifications);
         _heartbeat = new LabelingReadyHeartbeat(station, stations, _source, metrics, loggers.CreateLogger<LabelingReadyHeartbeat>(), pressure.Overloaded,
-            outage, TimeSpan.FromMilliseconds(options.SqlAttemptTimeoutMs));
+            outage, TimeSpan.FromMilliseconds(options.SqlAttemptTimeoutMs), linePrinter);
     }
 
     /// <summary>La ingesta (para recargar épocas o reingresar registros retenidos desde la operación).</summary>

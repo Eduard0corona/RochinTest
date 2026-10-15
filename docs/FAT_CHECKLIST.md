@@ -23,6 +23,8 @@ Sin ellos, la planta no puede aceptar las garantías de la sección 1:
 | G10 · Un solo transmisor por impresora | Ningún segundo proceso o nodo transmite a la impresora | Un EdgeHost por estación con lock de sistema operativo y lease. Con alta disponibilidad, el aislamiento físico del canal (red o proxy que valide tokens) | OT-10, OT-11 | T27 y T36 (dos procesos en una máquina; aislamiento simulado con un proxy TCP) |
 | G11 · Latencia compatible con el plazo | La desigualdad de factibilidad con los tiempos de la línea | `docs/BENCHMARK.md` repetido en el hardware de planta: intervalos OPC negociados con el PLC real, `DeviceLeadTimeMs` medido con el aplicador real (p99 de `send_start_to_applied_ms`) | OT-03 | T12 (hipótesis de una caja por segundo, simuladores) |
 | G12 · Capacidad sostenida | La tasa de llegada es menor que la capacidad de impresión y aplicación | Takt time y capacidad medidos; backlog estable a la tasa pactada | OT-02 | T12 |
+| G04 · Plazo con el reloj del PLC | Con `DeadlineReference = PLC_TIMESTAMP`, los relojes del PLC y del EdgeHost sincronizados | NTP o PTP validado entre el PLC y el EdgeHost, antes del benchmark de G11: el primer tramo de la desigualdad y el plazo solo valen con relojes sincronizados. Un PLC atrasado no se detecta (SI-15) | OT-03 | T12 y la demo con el PLC simulado y el mismo reloj |
+| G16 · Orden de aplicación | El orden de envío es el orden de aplicación | El aplicador real aplica en el orden en que recibe | OT-01 | T30 y T42 (orden de envío; la aplicación es del simulador) |
 | G09 · Historia completa durante una caída de SQL | Solo si OT lo exige | Perfil extendido (FIFO del PLC, `AckCycleId`, journal) | OT-14 | T09 y T20: NO_APLICA (perfil mínimo) |
 
 ## 2. Decisiones de OT abiertas
@@ -59,16 +61,20 @@ Vuelven a hacerse con el equipo real, porque su criterio físico se comprobó en
 - **T31:** cola interna y cancelación confirmada por la impresora real (OT-07).
 - **T36:** el aislamiento real del canal de la impresora al cambiar de dueño.
 - **T42:** orden de envío con la impresora real fuera de línea y de vuelta.
-- **T08 y T19:** caída real de RabbitMQ y de SQL Server en la red de planta, no un proxy TCP. En T19, además, lo que hace la línea mientras `LabelingReady` está en falso (OT-09).
+- **T08 y T19:** caída real de RabbitMQ y de SQL Server en la red de planta. T08 simula la caída del broker con un proxy TCP. T19 la simula con un proxy (cortes y congelamiento) y además con el contenedor de SQL Server detenido y vuelto a arrancar, en la misma máquina. En T19, además, lo que hace la línea mientras `LabelingReady` está en falso (OT-09).
+- **T05 con la impresora real:** tres fallos seguidos ponen el sender en pausa con `LabelingReady` en falso, y vuelve solo cuando la impresora acepta conexiones.
 - **SQL Server caído y reinicio del PLC a la vez:** si el ciclo siguiente a la caída llega con una época nueva, los ciclos descartados durante la caída no quedan como hueco de la época anterior. Solo los cuenta `opc_records_rejected_total{cause=SQL_UNAVAILABLE}`, con su alerta.
 
 ## 4. Configuración y seguridad que se verifican al instalar
 
 - **OPC UA.** SignAndEncrypt con validación estricta de certificados: el certificado del PLC en el almacén de confianza del EdgeHost, sin autoaceptación (valores por defecto de `OpcIngestOptions`; `OpcSecurityTests` con el PLC simulado). También se registran los intervalos de muestreo y publicación que el PLC real negocia.
 - **RabbitMQ.** `amqps://` con el certificado del broker válido para su nombre y, si la planta lo exige, certificado de cliente (`RabbitMq__Tls__*`). La comprobación de revocación del certificado está activa por defecto. Si la red de planta no llega a la lista de revocación, OT la desactiva de forma explícita (`RabbitMq__Tls__CheckCertificateRevocation=false`) y lo registra aquí. Permisos por vhost.
-- **Secretos.** Cadenas de conexión, contraseñas de los logins, claves de las personas de la Operations API (solo su SHA-256 en la configuración) y certificados: desde el almacén de secretos o las variables de entorno del servicio, nunca en el repositorio (`build/check_secrets.py` en la compuerta).
+- **Secretos.** Cadenas de conexión, contraseñas de los logins, claves de las personas de la Operations API (solo su SHA-256 en la configuración) y certificados: desde el almacén de secretos o las variables de entorno del servicio, nunca en el repositorio. `build/check_secrets.py`, en la compuerta, busca valores literales en claves que nombran una contraseña, una frase de paso o un secreto, en todos los archivos de texto salvo `spec/` y `tests/`. Es una revisión por patrones, no una herramienta de detección de secretos.
 - **SQL Server.** El login de la aplicación sin DDL ni escritura sobre `AllowedTransition`. Los triggers habilitados.
-- **Supervisión del servicio.** Reiniciar el EdgeHost cuando sale con un código distinto de 0 (70: el sender se detuvo; 71: la ingesta se detuvo).
+- **Supervisión del servicio.**
+  - Con el código 70 (el sender se detuvo, por ejemplo sin TX-C posible): reiniciar el EdgeHost automáticamente, para que el arranque ejecute TX-R0.
+  - Con el código 71 (la ingesta se detuvo por un error de SQL no clasificado como caída, es decir, un defecto): alertar y revisar antes de reiniciar, o reiniciar con un límite de intentos. Cada arranque deja como hueco los ciclos que estaban en el canal.
+  - Ninguna prueba automática ejercita los códigos de salida.
 - **SQL Server y la falla cerrada.** El EdgeHost conecta sin el periodo de bloqueo del pool (`PoolBlockingPeriod=NeverBlock`), para ver volver a SQL Server enseguida. Un login fallido (18456) cuenta como SQL no disponible: con una contraseña mal configurada, la estación queda en falla cerrada con el error en el log, en lugar de detenerse. Se verifica en planta que el servidor real vuelve después de una detención (T19 con un contenedor detenido y vuelto a arrancar es la prueba con simulador).
 
 ## 5. Defectos de la especificación que dependen de OT

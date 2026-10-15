@@ -205,9 +205,16 @@ public sealed class OwnedPrinterRunner(PrinterOwnership ownership, SenderRecover
 {
     private readonly ILogger _logger = logger ?? NullLogger<OwnedPrinterRunner>.Instance;
     private volatile bool _owned;
+    private volatile bool _inService;
     private bool _requireOwnership;
 
     public bool Owned => _owned;
+
+    /// <summary>
+    /// Tomada por este proceso y con TX-R0 hecho desde que se tomó: la impresora puede enviar (LabelingReady de la impresora de línea,
+    /// <c>LinePrinterReadiness</c>). En falso mientras se vuelve a tomar después de perder el lease, hasta repetir TX-R0.
+    /// </summary>
+    public bool InService => _inService;
 
     /// <summary>Cuántas veces se invocó el sender (para alertas y pruebas).</summary>
     public int SenderRuns { get; private set; }
@@ -256,12 +263,14 @@ public sealed class OwnedPrinterRunner(PrinterOwnership ownership, SenderRecover
         }
 
         await recovery.RecoverAsync(ownership.PrinterId, ct);
+        _inService = true;
     }
 
     /// <summary>Libera el lease al detener el proceso; un error solo se registra (el lease vencerá solo).</summary>
     public async Task ReleaseAsync()
     {
         _owned = false;
+        _inService = false;
         try
         {
             using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -292,6 +301,11 @@ public sealed class OwnedPrinterRunner(PrinterOwnership ownership, SenderRecover
                     _owned = false;
                     _logger.LogError(ex, "Impresora {Printer}: no se pudo confirmar el lease antes de enviar", ownership.PrinterId);
                 }
+
+                if (!_owned)
+                {
+                    _inService = false;
+                }
             }
 
             if (!_owned)
@@ -305,11 +319,13 @@ public sealed class OwnedPrinterRunner(PrinterOwnership ownership, SenderRecover
                     }
 
                     await recovery.RecoverAsync(ownership.PrinterId, ct);
+                    _inService = true;
                 }
                 catch (Exception ex) when (!ct.IsCancellationRequested)
                 {
                     // Por ejemplo, SQL Server no responde: sin propiedad ni TX-R0 no se envía nada, y se vuelve a intentar.
                     _owned = false;
+                    _inService = false;
                     _logger.LogError(ex, "Impresora {Printer}: no se pudo volver a tomar la impresora; se reintenta", ownership.PrinterId);
                     continue;
                 }
@@ -336,6 +352,7 @@ public sealed class OwnedPrinterRunner(PrinterOwnership ownership, SenderRecover
             {
                 // Siempre, también si el sender se detuvo: la renovación no sigue después (segunda revisión, BAJA 2).
                 _owned = false;
+                _inService = false;
                 await lost.CancelAsync();
                 try
                 {

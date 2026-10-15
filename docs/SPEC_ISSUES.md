@@ -25,7 +25,7 @@ Clasificación de `CLAUDE.md`:
 | SI-16 | B (vacío) | 3 | `DOCUMENTO_PRINCIPAL.md` secciones 10.2 y 645; `docs/ESTRATEGIA_RECUPERACION.md` (trabajo pendiente tras `CLOCK_JUMP`) | Resuelto por decisión de la persona: lo pendiente vence al confirmar el salto |
 | SI-17 | B (contradicción entre fuentes) | 7 | `spec/database/sqlserver_operations_reference.sql` (recirculación en TX-E) frente al catálogo de T16 | Resuelto por decisión de la persona: solo cuentan las detecciones anteriores, con la identidad más restrictiva |
 | SI-18 | B (vacío) | 4 | `contracts/state-machine.json` (J06: un error o un apagado entre el claim y la escritura) | Resuelto por decisión de la persona: NOT_SENT sin consumir intento |
-| SI-19 | A | 7 | `spec/tests/test-catalog.json` (T16, variante) | Abierto: parche propuesto, pendiente de la aprobación de la persona; la prueba ejercita el escenario alcanzable |
+| SI-19 | Observación (la clase A se retiró) | 7 | `spec/tests/test-catalog.json` (T16, variante) | Cerrado sin cambio en `spec/`: la variante es alcanzable tal como está escrita y una prueba la ejercita |
 | SI-20 | B (vacío) | 7 | `docs/ESTRATEGIA_RECUPERACION.md` §3 ("Al volver: arranque completo") y `DOCUMENTO_PRINCIPAL.md` §15 (SQL caído, TX-A o TX-B) | Interino recomendado aplicado con la autorización general de la persona; pendiente de su confirmación |
 
 ## SI-01 · Rango de códigos de error en el criterio de T47
@@ -55,7 +55,9 @@ Clasificación de `CLAUDE.md`:
 - **Trabajo afectado detenido.** Como corresponde a un defecto de clase B, ese camino no se implementa con una salida propia: queda en falla cerrada. Un registro que de otro modo sería candidato a job queda `BLOCKED` con `INCOHERENT_SNAPSHOT` (el registro no trae un dato que la revisión declara obligatorio y sin él no se puede validar la recirculación), no imprime y nunca se inventa un `CartonId` (I07). Elegir `INCOHERENT_SNAPSHOT` es una decisión interina de la implementación (el motivo de bloqueo más cercano a "registro incompleto"), no algo que diga la especificación. El interino no pasa por encima de otras clasificaciones: un registro sin plazo confiable sigue D04 (`EXPIRED` con `LATE_ARRIVAL`) y uno que la secuencia ya bloqueó conserva su motivo (`ReferenceCoverageTests.Review2_b5_…`).
 - **Por qué clase B.** Elegir el motivo definitivo (u otra salida, por ejemplo esperar un lector) es una decisión de comportamiento. Pendiente de la persona. El resto de las fases no depende de este caso borde.
 - **Extensión encontrada en la Fase 7 (revisión independiente, BAJA-4).** El mismo vacío aparece en TX-E. Una detección registrada con `CYCLE_ONLY` y sin `CartonId` puede esperar snapshot mientras la revisión activa pasa a `CARTON_ID_REQUIRED`. Al llegar el snapshot, el modo más restrictivo (SI-17) es `CARTON_ID_REQUIRED`, pero D08 solo admite `STATION_DISABLED` o `RECIRCULATED_CARTON`: no hay un motivo para bloquear por falta de `CartonId`, y TX-E crea el job. TX-A, en cambio, bloquea un registro así (el interino de arriba). No se rodea en el código: queda como parte de la decisión pendiente de SI-04, que debe decir también qué hace D08 en ese caso.
+- **Orden del interino en TX-A (verificación final de la Fase 7, BAJA-4).** El interino se aplicaba al armar el plan, antes de las guardas de TX-A: con un plazo calculado pero ya vencido o con la estación bloqueada, se publicaba `BLOCKED` con `INCOHERENT_SNAPSHOT` en lugar de `EXPIRED` con `LATE_ARRIVAL` o `BLOCKED` con `STATION_DISABLED`. Ahora va en TX-A, después de las guardas de plazo y de estación, como dice este registro. Prueba: `RecirculationTests.Without_its_carton_id_the_deadline_and_station_guards_still_decide_first`.
 - **Interino en TX-E (segunda revisión de la Fase 7, BAJA-8).** Se aplicó el mismo interino de falla cerrada que en TX-A, la opción recomendada, con la autorización general de la persona para seguir las recomendaciones. Con `CARTON_ID_REQUIRED` efectivo y sin `CartonId`, TX-E no crea el job: la detección sigue en `WAITING_ERP` y el barrido la vence con D07 a su plazo. Así no hace falta un motivo nuevo. Prueba: `RecirculationTests.Without_its_carton_id_a_waiting_detection_gets_no_job_once_carton_id_required_is_effective`. La decisión definitiva sigue pendiente de la persona.
+  - **Costo (verificación final, BAJA-15).** D07 publica `EXPIRED` con `ERP_UNAVAILABLE`, el único motivo que tiene, aunque el ERP respondió. Eso contradice el significado de `WAITING_ERP` ("no hay snapshot válido") y difiere de TX-A, que publica `BLOCKED` con `INCOHERENT_SNAPSHOT` en el acto. La prueba fija ese motivo, para que la decisión de la persona lo cambie a la vista.
 
 ## SI-05 · Registro `GATEWAY_RECEIPT` en vivo que abre un hueco: regla de negocio del verificador
 
@@ -175,6 +177,8 @@ Clasificación de `CLAUDE.md`:
   - TX-A y TX-E concurrentes.
 
   Además, la cobertura de D08 en TX-E (`ReferenceCoverageTests`).
+- **Orden por `ReceivedAt` (verificación final de la Fase 7, BAJA-5).** `RecirculationTests.ReceivedAt_decides_which_pass_of_the_carton_came_first_not_the_cycle_number` recibe el ciclo 151 antes que el 150, y el 151 lleva el job. Las mutaciones que comparan solo el ciclo, o que invierten la comparación de `ReceivedAt`, la hacen fallar.
+- **Hueco de prueba registrado (verificación final, BAJA-13).** El bloqueo de rango de TX-E solo decide el resultado en una intercalación: TX-E lee, luego un TX-A de un reingreso anterior de la misma caja lee y crea su job, y recién entonces TX-E inserta el suyo. Sin el bloqueo de TX-E habría dos jobs. Las pruebas concurrentes no fuerzan ese orden: retener el rango deja que cualquiera de las dos siga primero.
 - **Límite con concurrencia (segunda revisión de la Fase 7, BAJA-4).** Puede ocurrir que dos TX-A de la misma caja se superpongan y la víctima del 1205 sea la del ciclo anterior. Entonces la posterior confirma primero con job, y la anterior queda `BLOCKED` por ese job vivo: la comprobación del job vivo no mira el orden, porque un job ya creado no se le quita a nadie. El resultado sigue siendo un solo job y una detección bloqueada, pero la etiqueta queda en el segundo paso. Para la misma caja física es imposible (dos pasos en el mismo instante); puede ocurrir con un reingreso que coincide con un ciclo en vivo. La prueba concurrente afirma lo que sí se garantiza: un job y la otra detección `BLOCKED`.
 
 ## SI-18 · Un error o un apagado entre el claim y la escritura
@@ -187,13 +191,11 @@ Clasificación de `CLAUDE.md`:
   - Dejar el intento en `SENDING` hasta TX-R0: un `UNKNOWN` falso y la impresora ocupada hasta reiniciar.
 - **Clase B. Decisión de la persona (2026-10-15): sin consumir intento**, el interino. Queda como está en el código.
 
-## SI-19 · Variante de T16 inalcanzable con `CARTON_ID_REQUIRED`
+## SI-19 · Variante de T16 con `CARTON_ID_REQUIRED` desde el principio
 
-- **Evidencia.** La variante de T16 pide que, con `CartonIdentityMode = CARTON_ID_REQUIRED`, "dos ciclos de C-77 llegan sin snapshot y quedan WAITING_ERP". Con esa revisión activa, TX-A valida la recirculación del segundo ciclo y encuentra el primero en `WAITING_ERP`: lo bloquea con `RECIRCULATED_CARTON` (D05). Las dos detecciones nunca esperan snapshot a la vez. Sucede con cualquier orden y concurrencia, porque la validación toma el rango de `IX_CartonDetection_Carton`.
-- **Escenario alcanzable que la prueba ejercita.** Los dos ciclos se registran con `CYCLE_ONLY` y esperan snapshot; después se activa una revisión con `CARTON_ID_REQUIRED` y llega el snapshot. TX-E aplica el modo más restrictivo (SI-17): el primero crea el job (D06) y el segundo queda `BLOCKED` con `RECIRCULATED_CARTON` (D08). Es el resultado que espera el catálogo.
-- **Clase A.** Solo cambia el texto del escenario, no una regla.
-- **Parche mínimo propuesto** en `tests/test-catalog.json`, `injection` de T16: "Variante: dos ciclos de C-77 registrados con `CYCLE_ONLY` llegan sin snapshot y quedan WAITING_ERP; se activa `CARTON_ID_REQUIRED` y después llega el snapshot". Se regenera `tests/MATRIZ_PRUEBAS.md`.
-- **Estado.** Pendiente de la aprobación de la persona: la edición de `spec/` no se aplicó. Ningún trabajo depende de ella.
+- **Registro original (primera revisión de la Fase 7, BAJA-5).** Decía que la variante de T16 ("dos ciclos de C-77 llegan sin snapshot y quedan WAITING_ERP", con `CARTON_ID_REQUIRED`) no se alcanza, porque TX-A bloquearía el segundo ciclo como recirculación, y proponía un parche de clase A al catálogo.
+- **Corrección (verificación final de la Fase 7).** La premisa era falsa. Con la regla de SI-17, una detección solo cuenta como recirculación si es anterior. Si el paso posterior de la caja queda registrado primero, el anterior no lo ve y las dos detecciones esperan snapshot. Ocurre con un reingreso, que conserva su `ReceivedAt`, o con dos TX-A cuya víctima del 1205 es la del ciclo anterior. Al llegar el snapshot, en cualquier orden, la primera crea el job (D06) y la segunda queda `BLOCKED` con `RECIRCULATED_CARTON` (D08).
+- **Estado.** Se retira el parche de clase A: el catálogo no necesita cambios. `RecirculationTests.The_catalog_variant_with_carton_id_required_from_the_start_is_reachable_and_the_first_pass_gets_the_job` ejercita la variante tal como está escrita. La prueba anterior (registro con `CYCLE_ONLY` y activación posterior de `CARTON_ID_REQUIRED`) se mantiene como un caso más.
 
 ## SI-20 · Qué es "arranque completo" al volver SQL Server, y TX-B en la falla cerrada
 
@@ -210,7 +212,11 @@ Clasificación de `CLAUDE.md`:
 
     El latido levanta `LabelingReady` después (etapa 8). El barrido sigue con su intervalo (etapa 6). TX-R0 (etapa 3) no se repite: un intento que quedó en `SENDING` por la caída detiene el sender (código 70), y el reinicio del proceso lo ejecuta.
   - **Ciclos de la caída.** Un ciclo recibido antes de la recuperación es parte del hueco.
+  - **La impresora de línea también cuenta (verificación final de la Fase 7).** `LabelingReady` exige la impresora de línea tomada (lock y lease) con TX-R0 hecho desde que se tomó: etapas 2 y 3. Si la caída dura más que la cobertura del lease, la impresora se vuelve a tomar con TX-R0 antes de que la estación se anuncie lista. Tres fallos seguidos del dispositivo ponen el sender en pausa con `LabelingReady` en falso, como dice §3, Impresora.
+  - **Después de un error del claim** el sender ejecuta TX-R0 de su impresora antes de reclamar otra vez: un commit de TX-B cuya respuesta se perdió no deja la impresora ocupada.
+  - **La recuperación es atómica.** No se levanta si alguien informó una falla después de que empezó la prueba. Una recaída dentro de 60 s (más que el `CommandTimeout` de 30 s de SqlClient) duplica la espera.
 - **Límites declarados.**
-  - TX-B esperando un lock no se abandona: un claim confirmado después de abandonarlo dejaría un `SENDING` sin escritura. Sus jobs vencen por el barrido, y ese caso no baja `LabelingReady`.
+  - TX-B esperando un lock no se abandona: un claim confirmado después de abandonarlo dejaría un `SENDING` sin escritura. Mientras espera, sus jobs pueden vencer; al agotar el `CommandTimeout` (30 s) recibe un −2, que declara la caída, y `LabelingReady` baja.
   - La prueba del camino de TX-A no comprueba un commit (no escribe): un commit síncrono detenido se descubre en el primer TX-A después de levantar la caída. Las recaídas seguidas alargan la espera.
+  - Si la pausa del sender o la caída se declaran a mitad de una caja, esa caja ya pasó con `LabelingReady` en verdadero: la señal avisa al PLC para las siguientes.
 - **Alternativa.** Reiniciar el proceso al volver SQL, con el arranque ordenado completo. Es más simple de razonar, pero corta la sesión OPC UA y el sender en cada caída.

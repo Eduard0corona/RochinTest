@@ -49,7 +49,8 @@ var revision = await new StationConfigStore(db).ActivateRevisionAsync(new Statio
     DeadlineReference = DeadlineReference.PlcTimestamp,
     TransitBudgetMs = 5_000,
     DeviceLeadTimeMs = 400,
-    SendMarginMs = 100,
+    // Cubre p99(presend_check_to_write_ms) + ClockJumpToleranceMs (sección 17), como en T12 y T08.
+    SendMarginMs = 250,
     ClockSkewToleranceMs = 50,
     MaxUpstreamLatencyMs = null,
     ClockJumpToleranceMs = 200,

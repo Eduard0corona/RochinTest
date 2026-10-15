@@ -22,12 +22,14 @@ public interface ILabelingReadySink
 /// hasta que la vigilancia de la ingesta lo levanta, ESTRATEGIA_RECUPERACION §3) o si no se puede leer el estado de la estación en
 /// SQL dentro de <c>readTimeout</c>. En ese último caso, si la causa es SQL no disponible o la lectura no respondió, declara la
 /// caída: es una sola para el latido, la ingesta y el sender, y los ciclos que llegan durante ella no se registran. Una lectura que
-/// no respondió queda como operación abandonada: mientras no termine no se lanza otra y la caída no se levanta. Si el latido deja
-/// de llegar, el PLC aplica su propia política (OT).
+/// no respondió queda como operación abandonada: mientras no termine no se lanza otra y la caída no se levanta. Con impresora de
+/// línea (<see cref="LinePrinterReadiness"/>), también en falso mientras no está tomada con TX-R0 hecho o su sender está en pausa
+/// (ESTRATEGIA_RECUPERACION §1, etapas 2, 3 y 8; §3 Impresora). Si el latido deja de llegar, el PLC aplica su propia política (OT).
 /// </summary>
 public sealed class LabelingReadyHeartbeat(
     StationSettings station, StationConfigStore stations, ILabelingReadySink sink, CartonMetrics metrics,
-    ILogger<LabelingReadyHeartbeat>? logger = null, Func<bool>? overloaded = null, SqlOutage? outage = null, TimeSpan? readTimeout = null)
+    ILogger<LabelingReadyHeartbeat>? logger = null, Func<bool>? overloaded = null, SqlOutage? outage = null, TimeSpan? readTimeout = null,
+    LinePrinterReadiness? linePrinter = null)
 {
     private readonly ILogger _logger = logger ?? NullLogger<LabelingReadyHeartbeat>.Instance;
     private readonly TimeSpan _readTimeout = readTimeout ?? TimeSpan.FromSeconds(1);
@@ -81,7 +83,7 @@ public sealed class LabelingReadyHeartbeat(
         }
 
         // Se consulta después de la lectura: una declaración de la ingesta durante la lectura no se pierde.
-        ready = ready && outage is not { Declared: true };
+        ready = ready && outage is not { Declared: true } && linePrinter is not { Ready: false };
 
         if (sink.Connected)
         {

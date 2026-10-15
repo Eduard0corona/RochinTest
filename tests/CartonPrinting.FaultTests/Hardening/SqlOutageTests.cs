@@ -241,6 +241,55 @@ public sealed class SqlOutageTests(SqlServerFixture sql) : IAsyncLifetime
     }
 
     /// <summary>
+    /// Hasta dos reintentos cortos dentro del plazo de la caja (ESTRATEGIA_RECUPERACION §3; verificación final, BAJA-10): un corte de
+    /// unos 150 ms hace fallar los dos primeros intentos de TX-A y el tercero registra el ciclo. No hay caída declarada ni hueco.
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T19")]
+    public async Task A_short_cut_is_absorbed_by_the_retries_within_the_deadline()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct, time: TimeProvider.System);
+        await using var proxy = SqlProxy(s);
+        var db = new SqlDb(new DatabaseOptions
+        {
+            ConnectionString = new SqlConnectionStringBuilder(s.Db.AppConnectionString)
+            {
+                DataSource = $"127.0.0.1,{proxy.Port}", ConnectTimeout = 2, Pooling = false, ConnectRetryCount = 0,
+            }.ConnectionString,
+        });
+        using var metrics = new CartonMetrics();
+        var ingest = new StationIngestService(s.Settings,
+            new RegistrationService(new TxaRegisterDetection(db), new ErpCacheStore(db), new LabelSerialSource(db), s.Clock, metrics),
+            new StationConfigStore(db), new PlcEpochStore(db), new SequenceStore(db), new TxsSweep(db), new TxmManualActions(db), s.Clock, metrics);
+        await using var h = await OpcHarness.StartAsync(s.StationId, s.Clock);
+        var channel = Channel.CreateUnbounded<RawNotification>();
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        var consumer = ingest.RunAsync(channel.Reader, stop.Token);
+        try
+        {
+            await h.NextAsync(TimeSpan.FromSeconds(60));
+            await channel.Writer.WriteAsync(await ReceiveAsync(h, s, 500), Ct);
+            await WaitAsync(async () => await s.DetectionAsync(500, Ct) is not null, "detección 500");
+
+            var raw = await ReceiveAsync(h, s, 501);
+            proxy.AcceptNew = false;
+            await channel.Writer.WriteAsync(raw, Ct);
+            await Task.Delay(TimeSpan.FromMilliseconds(150), Ct);   // reintentos a los 100 ms y a los 300 ms
+            proxy.AcceptNew = true;
+            await WaitAsync(async () => await s.DetectionAsync(501, Ct) is not null, "detección 501 en el tercer intento");
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => consumer);
+        }
+
+        Assert.Equal(DetectionStatus.JobCreated, (await s.DetectionAsync(501, Ct))!.Status);
+        Assert.False(ingest.SqlUnavailable);
+        Assert.DoesNotContain(metrics.Series(MetricNames.OpcRecordsRejected), e => e.Key.Contains("cause=SQL_UNAVAILABLE", StringComparison.Ordinal));
+    }
+
+    /// <summary>
     /// Escrituras bloqueadas y lecturas que responden (segunda revisión de la Fase 7, M-1). Otra sesión retiene el rango de
     /// UQ_CartonDetection_Identity donde TX-A insertaría los ciclos siguientes al 500. TX-A no termina, la ingesta declara la caída y
     /// LabelingReady baja. Las lecturas siguen respondiendo (RCSI), pero la vigilancia no levanta la caída mientras el rango siga
@@ -454,7 +503,7 @@ public sealed class SqlOutageTests(SqlServerFixture sql) : IAsyncLifetime
             Assert.Equal(JobStatus.Ready, (await s.JobAsync(job, Ct)).Status);
             Assert.Empty(rig.Printer.Received);
 
-            outage.Recover();
+            Assert.True(outage.TryRecover(s.Clock.GetTimestamp()));
             await WaitAsync(async () => (await s.JobAsync(job, Ct)).Status != JobStatus.Ready, "el claim al levantarse la caída");
         }
         finally

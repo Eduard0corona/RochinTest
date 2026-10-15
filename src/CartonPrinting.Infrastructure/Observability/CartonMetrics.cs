@@ -17,6 +17,7 @@ public sealed class CartonMetrics : IDisposable
     private readonly ConcurrentDictionary<string, ConcurrentQueue<double>> _samples = new();
     private readonly ConcurrentDictionary<string, double> _gauges = new();
     private readonly ConcurrentDictionary<Guid, long> _received = new();
+    private readonly ConcurrentDictionary<Guid, (long Started, long? Completed)> _writes = new();
 
     /// <summary>Muestras que se conservan en memoria por serie: las más recientes (el exportador recibe todas).</summary>
     public const int MaxSamplesPerSeries = 50_000;
@@ -63,15 +64,36 @@ public sealed class CartonMetrics : IDisposable
     /// </summary>
     public void MarkReceived(Guid detectionId, long receivedTimestamp)
     {
-        if (_received.Count >= MaxReceivedMarks)
+        EvictOldest(_received, ts => ts);
+        _received[detectionId] = receivedTimestamp;
+    }
+
+    /// <summary>
+    /// Marcas monotónicas de la escritura de un job: la invocación y, si terminó sin error, la escritura completa. Los tramos de
+    /// evidencia de la sección 10.4 son monotónicos: se miden desde estas marcas hasta la recepción de cada observación en el EdgeHost,
+    /// nunca con el ObservedAt de otro dispositivo (verificación final de la Fase 7).
+    /// </summary>
+    public void MarkWrite(Guid printJobId, long startedTimestamp, long? completedTimestamp)
+    {
+        EvictOldest(_writes, w => w.Started);
+        _writes[printJobId] = (startedTimestamp, completedTimestamp);
+    }
+
+    /// <summary>Las marcas de la escritura de un job, si este proceso la hizo.</summary>
+    public (long Started, long? Completed)? WriteOf(Guid printJobId) => _writes.TryGetValue(printJobId, out var w) ? w : null;
+
+    /// <summary>Al llegar al límite, se descartan las marcas más antiguas (jobs que nunca se completaron), no las de los jobs en curso.</summary>
+    public static void EvictOldest<T>(ConcurrentDictionary<Guid, T> marks, Func<T, long> timestamp)
+    {
+        if (marks.Count < MaxReceivedMarks)
         {
-            foreach (var stale in _received.OrderBy(e => e.Value).Take(MaxReceivedMarks / 10).Select(e => e.Key).ToList())
-            {
-                _received.TryRemove(stale, out _);
-            }
+            return;
         }
 
-        _received[detectionId] = receivedTimestamp;
+        foreach (var stale in marks.OrderBy(e => timestamp(e.Value)).Take(MaxReceivedMarks / 10).Select(e => e.Key).ToList())
+        {
+            marks.TryRemove(stale, out _);
+        }
     }
 
     /// <summary>La marca de recepción de la detección, si este proceso la recibió y nadie la tomó todavía.</summary>
@@ -135,6 +157,11 @@ public static class MetricNames
     public const string ClaimRejected = "claim_rejected_total";
     public const string PrintAttempts = "print_attempts_total";
     public const string PrinterUnknown = "printer_unknown_total";
+
+    /// <summary>1 mientras el sender de la impresora está en pausa por tres fallos seguidos del dispositivo (ESTRATEGIA_RECUPERACION §3).</summary>
+    public const string PrinterSenderPaused = "printer_sender_paused";
+
+    public const string PrinterSenderPauses = "printer_sender_pauses_total";
     public const string RestartRecoveredSending = "restart_recovered_sending_total";
     public const string InboxDuplicates = "inbox_duplicates_total";
     public const string DetectionsExpired = "detections_expired_total";

@@ -10,19 +10,23 @@ namespace CartonPrinting.Infrastructure.Signals;
 /// <item>Una operación de SQL que se dejó de esperar (sin respuesta en su tiempo máximo) se sigue con
 /// <see cref="TrackAbandoned"/>: mientras alguna no termina, la caída no se levanta, porque esa conexión colgada todavía puede
 /// responder o tomar otra vez la estación.</item>
-/// <item>Una recaída poco después de levantarla (<see cref="RelapseWindow"/>) duplica la espera mínima antes de la próxima
-/// recuperación (<see cref="Relapses"/>), hasta 64 veces: una falla intermitente no hace oscilar LabelingReady.</item>
+/// <item>Una recaída poco después de levantarla (<see cref="RelapseWindow"/>, mayor que el CommandTimeout de 30 s de SqlClient, para
+/// que cuente también una operación que esperó todo ese tiempo) duplica la espera mínima antes de la próxima recuperación
+/// (<see cref="RecoveryHold"/>), hasta 64 veces: una falla intermitente no hace oscilar LabelingReady.</item>
+/// <item>La recuperación es atómica (<see cref="TryRecover"/>): no se levanta si quedó una operación abandonada pendiente o si alguien
+/// informó una falla después de que empezó la prueba.</item>
 /// </list>
 /// Las marcas son del reloj monotónico del EdgeHost, el mismo que sella la recepción de cada ciclo.
 /// </summary>
 public sealed class SqlOutage(EdgeClock clock)
 {
-    public static readonly TimeSpan RelapseWindow = TimeSpan.FromSeconds(30);
+    public static readonly TimeSpan RelapseWindow = TimeSpan.FromSeconds(60);
 
     private readonly object _gate = new();
     private volatile bool _declared;
     private long _declaredAt;
     private long _recoveredAt = long.MinValue;
+    private long _lastFailureAt = long.MinValue;
     private int _abandoned;
     private int _relapses;
 
@@ -40,17 +44,24 @@ public sealed class SqlOutage(EdgeClock clock)
     /// <summary>Cuánto lleva declarada (cero si no lo está).</summary>
     public TimeSpan DeclaredFor => _declared ? clock.GetElapsedTime(Interlocked.Read(ref _declaredAt)) : TimeSpan.Zero;
 
-    /// <summary>Declara la caída. Devuelve true solo para quien la declaró, para registrarla una vez.</summary>
+    /// <summary>La espera mínima, desde la declaración, antes de intentar levantarla: el intervalo duplicado por cada recaída.</summary>
+    public TimeSpan RecoveryHold(TimeSpan probeInterval) => probeInterval * (1 << Relapses);
+
+    /// <summary>
+    /// Declara la caída. Devuelve true solo para quien la declaró, para registrarla una vez. Con la caída ya declarada, la falla
+    /// queda anotada igual: una prueba de recuperación que empezó antes no la levanta.
+    /// </summary>
     public bool Declare()
     {
         lock (_gate)
         {
+            var now = clock.GetTimestamp();
+            Interlocked.Exchange(ref _lastFailureAt, now);
             if (_declared)
             {
                 return false;
             }
 
-            var now = clock.GetTimestamp();
             var recovered = RecoveredAt;
             _relapses = recovered != long.MinValue && clock.GetElapsedTime(recovered, now) < RelapseWindow ? Math.Min(_relapses + 1, 6) : 0;
             Interlocked.Exchange(ref _declaredAt, now);
@@ -60,15 +71,23 @@ public sealed class SqlOutage(EdgeClock clock)
     }
 
     /// <summary>
-    /// La levanta la vigilancia, después de recargar el estado y de comprobar el camino de TX-A. La marca de recuperación se escribe
-    /// antes de bajar la declaración: quien lee la declaración y después la marca nunca ve una caída levantada sin su marca.
+    /// La levanta la vigilancia, después de recargar el estado y de comprobar el camino de TX-A, si no hay operaciones abandonadas
+    /// pendientes y nadie informó una falla desde <paramref name="probeStartedAt"/> (marca monotónica tomada antes de la prueba). La
+    /// marca de recuperación se escribe antes de bajar la declaración: quien lee la declaración y después la marca nunca ve una caída
+    /// levantada sin su marca.
     /// </summary>
-    public void Recover()
+    public bool TryRecover(long probeStartedAt)
     {
         lock (_gate)
         {
+            if (!_declared || Volatile.Read(ref _abandoned) > 0 || Interlocked.Read(ref _lastFailureAt) >= probeStartedAt)
+            {
+                return false;
+            }
+
             Interlocked.Exchange(ref _recoveredAt, clock.GetTimestamp());
             _declared = false;
+            return true;
         }
     }
 
