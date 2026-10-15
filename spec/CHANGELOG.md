@@ -5,6 +5,7 @@
 Registrados en `docs/SPEC_ISSUES.md` del repositorio de implementación y aprobados por la persona responsable.
 
 - **SI-01 (clase A).** El criterio de T47 decía "51010 a 51032"; el DDL usa los códigos 51001 a 51032 y TX-X usa 52001. `tests/test-catalog.json` (T47, `expectedStates`) dice ahora "51001 a 51032, o 52001 en TX-X"; `tests/MATRIZ_PRUEBAS.md` se regeneró. Ninguna regla cambia.
+- **SI-07 (clase B, ADR 0016).** La rama `CORRECTION` de `TR_PrintJob_StateMachine` aceptaba una lectura contradictoria registrada antes del estado que corrige (antes del claim, o de la etiqueta que una reimpresión confirmada reemplazó), y el criterio de T47 sobre correcciones con respaldo anterior no se podía cumplir. Ahora exige una lectura recibida en o después del último claim del job y con `ObservationId` mayor que el de cualquier observación que haya confirmado un intento del job. Cambian la guarda de J18 (`contracts/state-machine.json`), el mecanismo de I25 (`contracts/invariants.json`), el trigger (`database/sqlserver_schema.sql`) y la sección 11 del documento principal; los artefactos derivados se regeneraron.
 
 ## 1.1.2 · 2026-10-14 · nombres de archivo (sin cambios en la especificación)
 
