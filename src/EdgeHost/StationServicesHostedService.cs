@@ -9,14 +9,14 @@ namespace CartonPrinting.EdgeHost;
 /// barrido TX-S. Corren en paralelo y fuera del camino de ingesta; un error en una pasada se registra y
 /// se reintenta en la siguiente.
 /// </summary>
-public sealed class StationServicesHostedService(StationSweepService sweep, ErpSnapshotSync? erp, TimeSpan sweepInterval) : BackgroundService
+public sealed class StationServicesHostedService(StationSweepService sweep, ErpSnapshotSync? erp, TimeSpan sweepInterval, TimeProvider time) : BackgroundService
 {
     protected override Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        var tasks = new List<Task> { sweep.RunAsync(sweepInterval, TimeProvider.System, stoppingToken) };
+        var tasks = new List<Task> { sweep.RunAsync(sweepInterval, time, stoppingToken) };
         if (erp is not null)
         {
-            tasks.Add(erp.RunAsync(TimeProvider.System, stoppingToken));
+            tasks.Add(erp.RunAsync(time, stoppingToken));
         }
 
         return Task.WhenAll(tasks);
@@ -62,6 +62,6 @@ public static class StationComposition
         }
 
         services.AddHostedService(sp => new StationServicesHostedService(sp.GetRequiredService<StationSweepService>(), sp.GetService<ErpSnapshotSync>(),
-            TimeSpan.FromMilliseconds(ingest.SweepIntervalMs)));
+            TimeSpan.FromMilliseconds(ingest.SweepIntervalMs), sp.GetRequiredService<EdgeClock>().TimeProvider));
     }
 }

@@ -9,6 +9,8 @@ Cambios de la implementación. Los de la especificación están en `spec/CHANGEL
 - `StationSweepService` (TX-S por estación) y `ClockGuard` (`CLOCK_JUMP`) en el barrido y en el claim; `CLOCK_SKEW` en la ingesta.
 - EdgeHost: sincronización ERP y barrido por estación.
 - Pruebas: T03, T04, T17, T18, T21, T33, T37 y T46 en verde.
+- Correcciones de la revisión independiente: el salto del reloj se retiene hasta confirmar el bloqueo; el barrido usa el plazo efectivo (SI-14); J13 con su propia guarda; el job se arma con la fila de la caché y TX-E comprueba su contenido; validación del snapshot truncada y con largos; la revisión activa se exige en TX-B, TX-E y el barrido; T03 comprueba que la ingesta no espera al ERP.
+- Registrados SI-14 (sentencias de referencia del barrido con el plazo congelado) y SI-15 (límites de `CLOCK_SKEW`).
 
 ## Fase 2 · Ingesta OPC simulada (2026-10-14)
 

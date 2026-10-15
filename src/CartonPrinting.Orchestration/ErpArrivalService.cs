@@ -10,7 +10,7 @@ namespace CartonPrinting.Orchestration;
 /// Llegada de un snapshot ERP válido para una detección en WAITING_ERP (D06, D08): prepara fuera de la
 /// transacción el plazo y el margen efectivos, el serial y el payload, y ejecuta TX-E, que repite la
 /// validación de TX-A. Con el plazo efectivo ya vencido no reserva serial: TX-E no crea el job y el
-/// barrido aplica D07.
+/// barrido aplica D07. Devuelve null si TX-E no hizo ninguna transición.
 /// </summary>
 public sealed class ErpArrivalService(
     TxeErpArrival txe, StationConfigStore stations, LabelSerialSource serials, StationSettings station, EdgeClock clock, CartonMetrics metrics)
@@ -38,19 +38,19 @@ public sealed class ErpArrivalService(
         var plan = new ErpArrivalPlan(detection.DetectionId,
             new JobInsert(Guid.NewGuid(), frozen.LabelType, frozen.PrinterId, snapshot.WorkOrderId, snapshot.Revision, snapshot.ProductId,
                 snapshot.LotId, serial, frozen.TemplateRevision, label.Payload, label.PayloadHash, detection.DeadlineAt),
-            frozen.RequiresCartonId, effectiveDeadline, margin, frozen.LabelType, clock.UtcNow);
+            frozen.RequiresCartonId, effectiveDeadline, margin, frozen.LabelType, now, snapshot.Gtin, active.Active.ConfigRevisionId);
         var result = await txe.ExecuteAsync(plan, ct);
 
-        switch (result.FinalStatus)
+        // Solo una transición se mide: una TX-E sin efecto devuelve el estado que ya tenía la detección.
+        if (result.PrintJobId is not null)
         {
-            case DetectionStatus.JobCreated:
-                metrics.Record(MetricNames.ErpSnapshotWaitMs, (clock.UtcNow - detection.ReceivedAt).TotalMilliseconds);
-                break;
-            case DetectionStatus.Blocked:
-                metrics.Increment(MetricNames.DetectionsBlocked, ("reason", result.FinalReason!));
-                break;
+            metrics.Record(MetricNames.ErpSnapshotWaitMs, (clock.UtcNow - detection.ReceivedAt).TotalMilliseconds);
+        }
+        else if (result.Published is not null && result.FinalStatus == DetectionStatus.Blocked)
+        {
+            metrics.Increment(MetricNames.DetectionsBlocked, ("reason", result.FinalReason!));
         }
 
-        return result;
+        return result.PrintJobId is not null || result.Published is not null ? result : null;
     }
 }

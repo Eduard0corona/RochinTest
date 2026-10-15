@@ -20,6 +20,8 @@ Clasificación de `CLAUDE.md`:
 | SI-11 | A | 2 | `spec/tests/test-catalog.json` (T11) | Resuelto: edición aprobada y aplicada en `8798b85` (spec 1.1.4) |
 | SI-12 | B (vacío) | 2 | `DOCUMENTO_PRINCIPAL.md` sección 9.2 ("marca alta reiniciada") | Abierto (OT-04): la persona decidió mantener el interino de falla cerrada |
 | SI-13 | B (vacío) | 2 | `DOCUMENTO_PRINCIPAL.md` secciones 4 y 9.2, ADR 0001 (registro incoherente frente a la secuencia) | Abierto: la persona decidió mantener el interino de falla cerrada |
+| SI-14 | B (contradicción entre fuentes) | 3 | `spec/database/sqlserver_operations_reference.sql` (J03, J14 y D07 en TX-S) frente a `contracts/state-machine.json` | Abierto: gana la máquina de estados (plazo efectivo) |
+| SI-15 | B (vacío) | 3 | `DOCUMENTO_PRINCIPAL.md` sección 10.2 (`CLOCK_SKEW`) | Abierto: interino declarado; pendiente de la persona |
 
 ## SI-01 · Rango de códigos de error en el criterio de T47
 
@@ -117,4 +119,21 @@ Clasificación de `CLAUDE.md`:
   - Por debajo de la marca no tiene efecto de secuencia ni corta la racha de descensos ambiguos.
 - **Por qué clase B.** Usar `EPOCH_UNEXPECTED` para una época que la política aceptaría, y elegir qué hora vale para la marca alta, son decisiones de comportamiento.
 - **Decisión de la persona (2026-10-14).** Mantener el interino.
+
+## SI-14 · Las sentencias de referencia del barrido usan el plazo congelado
+
+- **Contradicción.** En `contracts/state-machine.json`, las guardas de J03, J14 y J13 piden el plazo efectivo vigente con margen (el menor entre el congelado y el recalculado con la revisión activa; sección 10.1). D07 pide el plazo efectivo vencido. En cambio, las sentencias de TX-S de `database/sqlserver_operations_reference.sql` comparan `pj.DeadlineAt` y `cd.DeadlineAt`, que son los plazos congelados.
+- **Evidencia (revisión de la Fase 3, EXP2).** Con un job en `RETRY_WAIT` y una revisión nueva que acorta el presupuesto de tránsito, el barrido devolvía el job a `READY` con el plazo efectivo vencido. El claim (J02) sí usaba el plazo efectivo, así que el envío seguía protegido.
+- **Qué hace la implementación.** Gana la máquina de estados. El barrido calcula en el EdgeHost el plazo y el margen efectivos de cada job y de cada detección pendiente, con `DeadlinePolicy.Effective` y el mayor de los dos márgenes, los mismos que usan el claim y TX-E. Después los aplica por fila con las guardas en SQL: plazo congelado o efectivo vencido, y revisión activa sin cambios.
+  - Las sentencias de referencia se conservan para sus pruebas.
+  - J13 no tiene sentencia de referencia: su guarda exige vigentes ambos plazos.
+- **Por qué clase B.** Corregir la sentencia de referencia cambia el comportamiento de TX-S en la especificación. Pendiente de la persona: que la referencia recalcule el plazo efectivo en SQL, o que se declare que esas sentencias son solo el piso.
+
+## SI-15 · Límites de la detección de `CLOCK_SKEW`
+
+- **Vacío.** La sección 10.2 pide bloquear la estación si el reloj del PLC diverge más que `ClockSkewToleranceMs`, pero el gateway solo observa `DetectionTimestamp − ReceivedAt`. Esa diferencia incluye la latencia de subida, que no se conoce.
+  - Un PLC adelantado se detecta solo cuando el adelanto supera la tolerancia más esa latencia. Un adelanto entre la tolerancia y "tolerancia + latencia" no se detecta, y el plazo queda hasta esa latencia más permisivo de lo que absorbe la fórmula.
+  - Un PLC atrasado no se distingue de la latencia. Acorta los plazos (es restrictivo) y las cajas se publican como `LATE_ARRIVAL`, que no es el motivo real.
+- **Comportamiento interino.** Se bloquea con `CLOCK_SKEW` solo si `DetectionTimestamp − ReceivedAt` supera la tolerancia (adelanto demostrado). Un PLC atrasado no se detecta. Ambos límites están declarados en el registro de la Fase 3.
+- **Por qué clase B.** Detectar el atraso (por ejemplo, con una lectura de la hora del PLC por OPC UA, `ServerTimestamp` frente a `SourceTimestamp`) o publicar otro motivo cambia comportamiento y depende de OT. Pendiente de la persona.
 

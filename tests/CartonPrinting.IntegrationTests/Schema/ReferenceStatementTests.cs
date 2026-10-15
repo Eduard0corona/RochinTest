@@ -187,7 +187,8 @@ public sealed class ReferenceStatementTests(SqlServerFixture sql) : IAsyncLifeti
         // 0 filas en todas las operaciones.
         Assert.Empty(await s.Txs.ExpireDeadlinesAsync(StationScenario.SiteId, s.StationId, 100, now, Ct));
         Assert.Empty(await s.Txs.ExpireOutOfOrderAsync(StationScenario.SiteId, s.StationId, now, Ct));
-        Assert.Empty(await s.Txs.ReleaseRetriesAsync(StationScenario.SiteId, s.StationId, 100, now, Ct));
+        Assert.Null(await s.Txs.ReleaseRetryAsync(Guid.NewGuid(), now.AddSeconds(5), 100, s.Revision.ConfigRevisionId, now, Ct));
+        Assert.Empty(await s.Txs.ListPendingJobsAsync(StationScenario.SiteId, s.StationId, Ct));
         Assert.Empty(await s.Txs.ExpireWaitingErpAsync(StationScenario.SiteId, s.StationId, 100, now, Ct));
         Assert.Empty(await s.Txs.ElapsedEvidenceWindowsAsync(StationScenario.SiteId, s.StationId, now, Ct));
         Assert.Null(await s.Txs.ElapseEvidenceWindowAsync(Guid.NewGuid(), now, Ct));
@@ -199,7 +200,8 @@ public sealed class ReferenceStatementTests(SqlServerFixture sql) : IAsyncLifeti
         var (retryJob, retryAttempt) = await s.SendingJobAsync(51);
         await s.Txc.NotSentAsync(retryAttempt, s.Clock.UtcNow, "rechazada", NotSentCause.ConnectionFailed, 10, 3, s.Clock.UtcNow, Ct);
         s.AdvanceMs(20);
-        Assert.Equal(retryJob, Assert.Single(await s.Txs.ReleaseRetriesAsync(StationScenario.SiteId, s.StationId, 100, s.Clock.UtcNow, Ct)).Id); // J13
+        var retryRow = await s.JobAsync(retryJob, Ct);
+        Assert.Equal(retryJob, (await s.Txs.ReleaseRetryAsync(retryJob, retryRow.DeadlineAt, 100, s.Revision.ConfigRevisionId, s.Clock.UtcNow, Ct))!.Id); // J13
         // Otro job queda en RETRY_WAIT con un backoff largo: el barrido lo vence desde RETRY_WAIT (J14).
         var claimRetry = (await s.Claims.TryClaimAsync(retryJob, s.Lease, Ct))!;
         await s.Txc.UnknownAsync(claimRetry.AttemptId, s.Clock.UtcNow, "timeout", s.Clock.UtcNow, Ct);
@@ -364,6 +366,6 @@ public sealed class ReferenceStatementTests(SqlServerFixture sql) : IAsyncLifeti
         return new ErpArrivalPlan(detectionId, new JobInsert(Guid.NewGuid(), s.Revision.LabelType, s.Revision.PrinterId, snapshot.WorkOrderId,
             snapshot.Revision, snapshot.ProductId, snapshot.LotId, serial, s.Revision.TemplateRevision, label.Payload, label.PayloadHash,
             detection.DeadlineAt), false, DeadlinePolicy.Effective(detection.DeadlineAt, s.Revision, detection), s.Revision.SendMarginMs,
-            s.Revision.LabelType, s.Clock.UtcNow);
+            s.Revision.LabelType, s.Clock.UtcNow, snapshot.Gtin, s.Revision.ConfigRevisionId);
     }
 }

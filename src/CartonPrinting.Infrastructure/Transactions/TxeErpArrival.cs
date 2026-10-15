@@ -4,7 +4,11 @@ using Microsoft.Data.SqlClient;
 
 namespace CartonPrinting.Infrastructure.Transactions;
 
-/// <summary>Plan de TX-E preparado fuera de la transacción (serial ya obtenido, payload renderizado).</summary>
+/// <summary>
+/// Plan de TX-E preparado fuera de la transacción (serial ya obtenido, payload renderizado). El plazo y el margen
+/// efectivos se calcularon con la revisión <c>ActiveConfigRevisionId</c>; <c>SnapshotGtin</c> es el GTIN con que se
+/// armó la etiqueta.
+/// </summary>
 public sealed record ErpArrivalPlan(
     Guid DetectionId,
     JobInsert Job,
@@ -12,7 +16,9 @@ public sealed record ErpArrivalPlan(
     DateTime EffectiveDeadlineUtc,
     int EffectiveSendMarginMs,
     string LabelType,
-    DateTime EdgeNowUtc);
+    DateTime EdgeNowUtc,
+    string? SnapshotGtin,
+    long ActiveConfigRevisionId);
 
 public sealed record ErpArrivalResult(string? FinalStatus, string? FinalReason, Guid? PrintJobId, PrintJobResultEvent? Published);
 
@@ -22,6 +28,8 @@ public sealed record ErpArrivalResult(string? FinalStatus, string? FinalReason, 
 /// D06 crea el job; D08 bloquea con el motivo real (STATION_DISABLED o RECIRCULATED_CARTON). Un
 /// snapshot que llega con el plazo vencido no crea job ni cambia la detección: sigue en WAITING_ERP y
 /// el barrido (TX-S) aplica D07 con ERP_UNAVAILABLE, la transacción que le asigna la máquina de estados.
+/// Tampoco hace nada si la revisión activa ya no es la del plan (el plazo calculado no vale: se reintenta) o si
+/// la fila de la caché no tiene el contenido de la etiqueta (I10).
 /// </summary>
 public sealed class TxeErpArrival(SqlDb db)
 {
@@ -34,6 +42,15 @@ public sealed class TxeErpArrival(SqlDb db)
                 return new ErpArrivalResult(d?.Status, d?.Reason, null, null);
             }
 
+            // La fila de la estación queda bloqueada hasta el commit: ni una activación de revisión ni un bloqueo
+            // cambian lo que esta transacción decidió con ella.
+            var station = await StationConfigStore.GetActiveAsync(conn, tx, d.SiteId, d.StationId, ct, updLock: true)
+                ?? throw new InvalidOperationException($"La estación {d.SiteId}/{d.StationId} no tiene StationConfig.");
+            if (station.Active.ConfigRevisionId != plan.ActiveConfigRevisionId)
+            {
+                return new ErpArrivalResult(d.Status, d.Reason, null, null);
+            }
+
             var deadline = d.DeadlineAt < plan.EffectiveDeadlineUtc ? d.DeadlineAt : plan.EffectiveDeadlineUtc;
             if (plan.EdgeNowUtc >= deadline.AddMilliseconds(-plan.EffectiveSendMarginMs))
             {
@@ -41,8 +58,6 @@ public sealed class TxeErpArrival(SqlDb db)
                 return new ErpArrivalResult(d.Status, d.Reason, null, null);
             }
 
-            var station = await StationConfigStore.GetActiveAsync(conn, tx, d.SiteId, d.StationId, ct)
-                ?? throw new InvalidOperationException($"La estación {d.SiteId}/{d.StationId} no tiene StationConfig.");
             if (!station.State.LabelingEnabled)
             {
                 return await FinishAsync(conn, tx, d, DetectionStatus.Blocked, DetectionReason.StationDisabled, plan, ct);
@@ -54,7 +69,8 @@ public sealed class TxeErpArrival(SqlDb db)
                 return await FinishAsync(conn, tx, d, DetectionStatus.Blocked, DetectionReason.RecirculatedCarton, plan, ct);
             }
 
-            if (!await ErpCacheStore.IsRevisionValidAsync(conn, tx, plan.Job.WorkOrderId, plan.Job.ErpRevision, plan.EdgeNowUtc, ct)
+            if (!await ErpCacheStore.IsRevisionValidAsync(conn, tx, plan.Job.WorkOrderId, plan.Job.ErpRevision, plan.Job.ProductId, plan.Job.LotId,
+                    plan.SnapshotGtin, plan.EdgeNowUtc, ct)
                 || plan.Job.WorkOrderId != d.WorkOrderId)
             {
                 return new ErpArrivalResult(d.Status, d.Reason, null, null);
