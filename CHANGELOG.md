@@ -2,6 +2,14 @@
 
 Cambios de la implementación. Los de la especificación están en `spec/CHANGELOG.md`.
 
+## Fase 4 · Print Agent (2026-10-15)
+
+- Impresora simulada por TCP (rechazo de conexiones, corte a mitad de la escritura, impresión sin acuse, cola retenida, cancelación según capacidades) y simulador de evidencia (impresora, aplicador y escáner por ciclo).
+- `PrinterSenderService`: un sender por impresora, claim con `PrinterSendOrder`, segunda comprobación monotónica, `NOT_SENT` solo sin escritura invocada, TX-C en su propia transacción y reaplicación de la evidencia que llega durante `SENDING`; `EvidenceService` (TX-D y métricas de la sección 19), `DeviceCancellation` (A07 y J12) y `SenderRecovery` (TX-R0).
+- `CartonPrinting.FaultHost`: el sender real en un proceso aparte para matarlo en tres puntos (T07).
+- EdgeHost: sender de la impresora de línea con lease, recuperación de arranque y la guarda del reloj de la estación.
+- Pruebas: T05, T06, T07, T15, T22, T29, T31, T38, T39, T42 y T44 en verde contra SQL Server real y la impresora simulada.
+
 ## Fase 3 · ERP y plazo (2026-10-14)
 
 - ERP simulado por HTTP (retraso, 503, sin respuesta); `HttpErpClient` con validación del snapshot; `ErpSnapshotSync` con señal de la ingesta, timeout y circuit breaker (Polly) y caché.

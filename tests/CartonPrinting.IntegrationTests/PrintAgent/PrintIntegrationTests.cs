@@ -53,14 +53,22 @@ public sealed class PrintIntegrationTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Single(s.Metrics.Samples(MetricNames.SendToVerifiedMs));
         Assert.Equal(1, rig.Printer.TransmissionsOf(row.LabelSerial));
 
-        // Otro job transmitido: confirmarlo a mano con la observación del ciclo 10 lo rechaza el trigger.
+        // Otro job transmitido, confirmado a mano: con la observación que ya confirmó al del ciclo 10 lo rechaza el
+        // índice (una observación confirma un solo intento); con una lectura nueva del ciclo 10, el trigger (la
+        // evidencia no es del job ni de su ciclo).
         var other = await s.ReadyJobAsync(11, Ct);
         rig.EvidenceSim.Sources = new EvidenceSources(PrinterCompletion: false);
         await rig.SendAsync(other, Ct);
         var otherAttempt = Assert.Single(await s.AttemptsAsync(other, Ct));
-        var ex = await s.FailsAsync("UPDATE dbo.PrintAttempt SET Outcome = 'CONFIRMED', ConfirmingObservationId = @o WHERE AttemptId = @a",
+        var reused = await s.FailsAsync("UPDATE dbo.PrintAttempt SET Outcome = 'CONFIRMED', ConfirmingObservationId = @o WHERE AttemptId = @a",
             c => { c.Parameters.AddWithValue("@o", attempt.ConfirmingObservationId!.Value); c.Parameters.AddWithValue("@a", otherAttempt.AttemptId); }, ct: Ct);
-        Assert.InRange(ex.Number, 2601, 51032);
+        Assert.Equal(2601, reused.Number);   // UX_PrintAttempt_ConfirmingObservation
+        Assert.Contains("UX_PrintAttempt_ConfirmingObservation", reused.Message, StringComparison.Ordinal);
+        var foreign = await s.ObserveAsync(s.Verified(10, row.LabelSerial) with { SourceReference = "SCN-OTRA-LECTURA-10" }, Ct);
+        var ex = await s.FailsAsync("UPDATE dbo.PrintAttempt SET Outcome = 'CONFIRMED', ConfirmingObservationId = @o WHERE AttemptId = @a",
+            c => { c.Parameters.AddWithValue("@o", foreign); c.Parameters.AddWithValue("@a", otherAttempt.AttemptId); }, ct: Ct);
+        Assert.Equal(51022, ex.Number);   // TR_PrintAttempt_Guard: confirmación sin evidencia del job o de su ciclo
+        Assert.Equal(AttemptOutcome.Transmitted, Assert.Single(await s.AttemptsAsync(other, Ct)).Outcome);
     }
 
     /// <summary>
@@ -91,11 +99,13 @@ public sealed class PrintIntegrationTests(SqlServerFixture sql) : IAsyncLifetime
             result.GetProperty("evidence").GetProperty("verified").GetBoolean(), result.GetProperty("evidence").GetProperty("readSerial").GetString()));
         Assert.Equal(1, s.Metrics.Total(MetricNames.SerialMismatch));
 
+        Assert.Equal(1, await s.CountAsync("FROM dbo.EvidenceObservation WHERE StationId = @st AND ReadSerial = @serial AND EvidenceLevel = 'VERIFIED'",
+            c => { c.Parameters.AddWithValue("@st", s.StationId); c.Parameters.AddWithValue("@serial", bSerial); }, Ct));
         var observation = await s.ScalarAsync<long>("SELECT MAX(ObservationId) FROM dbo.EvidenceObservation WHERE StationId = @st AND ReadSerial = @serial",
             c => { c.Parameters.AddWithValue("@st", s.StationId); c.Parameters.AddWithValue("@serial", bSerial); }, Ct);
         var ex = await s.FailsAsync("UPDATE dbo.PrintAttempt SET Outcome = 'CONFIRMED', ConfirmingObservationId = @o WHERE AttemptId = @a",
             c => { c.Parameters.AddWithValue("@o", observation); c.Parameters.AddWithValue("@a", attempt.AttemptId); }, ct: Ct);
-        Assert.InRange(ex.Number, 51001, 51032);
+        Assert.Equal(51022, ex.Number);   // TR_PrintAttempt_Guard: serial distinto
         Assert.NotEqual(JobStatus.Confirmed, (await s.JobAsync(a, Ct)).Status);
     }
 
@@ -119,7 +129,8 @@ public sealed class PrintIntegrationTests(SqlServerFixture sql) : IAsyncLifetime
             Assert.Single(report.EvidenceElapsed);
             var row = await printed.JobAsync(job, Ct);
             Assert.Equal((JobStatus.Unknown, JobReason.EvidenceWindowElapsed), (row.Status, row.Reason));
-            Assert.Equal("UNKNOWN", LastResult(await printed.ResultsAsync(job, Ct)).GetProperty("outcome").GetString());
+            var unknown = LastResult(await printed.ResultsAsync(job, Ct));
+            Assert.Equal(("UNKNOWN", false), (unknown.GetProperty("outcome").GetString(), unknown.GetProperty("final").GetBoolean()));
             Assert.Equal(1, printed.Metrics.Total(MetricNames.EvidenceWindowElapsed));
         }
 
@@ -151,6 +162,7 @@ public sealed class PrintIntegrationTests(SqlServerFixture sql) : IAsyncLifetime
         var ready = await s.ReadyJobAsync(40, Ct);
         var sent = await s.ReadyJobAsync(41, Ct);
         await rig.SendAsync(sent, Ct);
+        Assert.True(Assert.Single(await s.AttemptsAsync(sent, Ct)).MayHaveSent);
 
         var cancel = await s.Txm.CancelJobAsync(ready, StationScenario.SiteId, s.StationId, "supervisor.ramos", "Caja retirada de la línea", s.Clock.UtcNow, Ct);
         var row = await s.JobAsync(ready, Ct);
@@ -176,7 +188,7 @@ public sealed class PrintIntegrationTests(SqlServerFixture sql) : IAsyncLifetime
             c.Parameters.AddWithValue("@st", s.StationId);
             c.Parameters.AddWithValue("@id", sent);
         }, "MANUAL", Ct);
-        Assert.InRange(backed.Number, 51001, 51032);
+        Assert.Equal(51012, backed.Number);   // TR_PrintJob_StateMachine: TRANSMITTED → CANCELLED no es una transición (J17 solo desde READY)
 
         var other = await s.ReadyJobAsync(42, Ct);
         var unbacked = await s.FailsAsync("UPDATE dbo.PrintJob SET Status = 'CANCELLED', Reason = 'CANCELLED_BY_OPERATOR', ResultVersion = ResultVersion + 1 WHERE PrintJobId = @id",
@@ -213,6 +225,9 @@ public sealed class PrintIntegrationTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Equal(("UNKNOWN", false, bSerial, corrected.ResultVersion), (result.GetProperty("outcome").GetString(), result.GetProperty("final").GetBoolean(),
             result.GetProperty("evidence").GetProperty("readSerial").GetString(), result.GetProperty("resultVersion").GetInt32()));
         Assert.Equal(1, s.Metrics.Total(MetricNames.ConfirmedCorrected));
+        Assert.Equal(1, s.Metrics.Total(MetricNames.SerialMismatch));
+        Assert.Equal(1, await s.CountAsync("FROM dbo.EvidenceObservation WHERE StationId = @st AND ReadSerial = @serial AND EvidenceLevel = 'VERIFIED'",
+            c => { c.Parameters.AddWithValue("@st", s.StationId); c.Parameters.AddWithValue("@serial", bSerial); }, Ct));
 
         foreach (var (sql, kind) in new[]
         {

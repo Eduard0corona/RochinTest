@@ -638,24 +638,53 @@ En la primera compuerta falló `Tx_e_d08_with_recirculated_carton`. La prueba ac
 5. **Cancelación (T31).** "No impreso" sin confirmación de cancelación no cambia el job; solo una cancelación confirmada por el dispositivo para ese job aplica A07 y J12.
 6. **T07 con un proceso real.** El sender corre en `CartonPrinting.FaultHost`; la prueba lo mata con `Process.Kill` (TerminateProcess en Windows, equivalente a kill -9) en cada punto, comprueba con el login administrador que la sesión del host no tiene transacciones abiertas durante el I/O (I20) y ejecuta la recuperación de arranque. El UNKNOWN del primer punto (no se escribió nada) es falso: es el costo aceptado de no poder distinguirlo desde SQL.
 7. **El sender del EdgeHost** toma el lease y ejecuta TX-R0 antes de enviar; el lock de sistema operativo, la renovación del lease y la parada ante su pérdida son de la Fase 5.
+8. **Guarda del reloj en el claim.** Desde la corrección de la Fase 3 el `ClockGuard` es obligatorio: el sender del EdgeHost usa el de la estación (el mismo que el barrido), y el FaultHost y las pruebas, uno propio. Un claim rechazado (también `RevisionChanged`) deja el job `READY` y el sender lo reintenta en la vuelta siguiente.
+9. **Métricas de evidencia en cualquier orden.** `printed_to_applied_ms` se registra cuando se conocen los dos instantes observados, lleguen PRINTED (por job) y APPLIED (por ciclo) en el orden que lleguen; lo que quedó pendiente durante `SENDING` se mide antes que la observación nueva.
 
 ### Comandos y resultados
 
-La compuerta de la fase se registra al cerrarla (después de cerrar las Fases 2 y 3, que se revisan en paralelo).
+Compuerta completa, 2026-10-15 00:59 (`powershell -File build/ci.ps1 --fase 4`, rama con la Fase 3 corregida y `main` integrados):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   164, Omitido:     0, Total:   164, Duración: 18 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    88, Omitido:     0, Total:    88, Duración: 2 m 56 s - CartonPrinting.IntegrationTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    58, Omitido:     0, Total:    58, Duración: 4 m 13 s - CartonPrinting.FaultTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 62 ejecutadas
+  Fase 2: T11=1 destino(s), 1 ejecutadas, T13=5 destino(s), 5 ejecutadas, T24=1 destino(s), 1 ejecutadas, T25=8 destino(s), 10 ejecutadas, T26=2 destino(s), 3 ejecutadas, T30=2 destino(s), 3 ejecutadas, T35=2 destino(s), 2 ejecutadas, T45=4 destino(s), 12 ejecutadas
+  Fase 4: T05=1 destino(s), 1 ejecutadas, T06=1 destino(s), 1 ejecutadas, T07=1 destino(s), 1 ejecutadas, T15=1 destino(s), 1 ejecutadas, T22=1 destino(s), 1 ejecutadas, T29=1 destino(s), 1 ejecutadas, T31=1 destino(s), 1 ejecutadas, T38=1 destino(s), 1 ejecutadas, T39=1 destino(s), 1 ejecutadas, T42=1 destino(s), 1 ejecutadas, T44=1 destino(s), 1 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
 
 Durante el desarrollo:
 
 - T44 falló al principio: la evidencia del aplicador llegaba mientras el intento seguía en `SENDING` y quedaba registrada sin efecto (decisión 4).
 - T42 falló porque la impresora "fuera de línea" no cortaba la conexión TCP ya abierta; el simulador ahora la corta y la prueba reconecta.
 - T31 falló de forma intermitente por la medición de la evidencia que llega durante `SENDING`; la medición quedó pendiente hasta TX-C.
+- Al integrar la Fase 3 corregida, T31 volvió a fallar (2 de 3 corridas sueltas): APPLIED llegaba después de TX-C y se medía en el acto, mientras PRINTED seguía pendiente. Corregido con la decisión 9; después, 5 de 5.
+- Una corrida de la compuerta con la revisión de la Fase 3 ejecutando su propia suite a la vez dio cuatro errores de conexión a SQL Server (tiempo de espera del protocolo previo al inicio de sesión) en pruebas de esquema; repetida sin esa carga, en verde.
+- Antes de la revisión se reforzaron aserciones:
+  - T15 y T22: número exacto del trigger. En T15, la aserción anterior (rango 2601 a 51032) aceptaba la violación del índice `UX_PrintAttempt_ConfirmingObservation`, que no es el trigger; ahora se prueban los dos casos por separado.
+  - T39: 51012 y `MayHaveSent`.
+  - T06, T31 y T42: el `PrintJobResult` publicado.
+  - T31: la variante 1 también con el job ya `UNKNOWN`.
+  - T38: el UNKNOWN no es final.
+  - T44: `serial_mismatch_total` y la observación registrada.
 
 ### Pruebas de la fase
 
-- **T05, T06, T07, T15, T22, T29, T31, T38, T39, T42 y T44**: se ejecutan y pasan; su estado se registra con la compuerta de cierre.
+- **T05, T06, T07, T15, T22, T29, T31, T38, T39, T42 y T44: PASA** (detalle en `docs/TEST_STATUS.md`; la revisión independiente está pendiente).
 
 ### Lo que no se verificó
 
 - Ninguna impresora, aplicador ni escáner reales; el protocolo y las capacidades son del simulador.
 - La compuerta física (`PLC_WINDOW_TAG`) no tiene implementación ni prueba del catálogo.
 - `Process.Kill` no es un corte de energía: no prueba el estado del disco ni del dispositivo tras un apagón.
+- T29 simula la suspensión avanzando el reloj manual en el punto posterior al claim; no suspende el proceso.
+- La alerta inmediata de T22 y T44 y el incidente físico no se prueban.
 
