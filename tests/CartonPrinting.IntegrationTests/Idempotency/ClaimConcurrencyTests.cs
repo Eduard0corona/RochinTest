@@ -2,6 +2,7 @@ using CartonPrinting.Contracts;
 using CartonPrinting.Infrastructure.Observability;
 using CartonPrinting.Infrastructure.Transactions;
 using CartonPrinting.Testing;
+using Microsoft.Data.SqlClient;
 
 namespace CartonPrinting.IntegrationTests.Idempotency;
 
@@ -57,5 +58,39 @@ public sealed class ClaimConcurrencyTests(SqlServerFixture sql) : IAsyncLifetime
         var order = await s.SendOrder.GetAsync(s.PrinterId, ct);
         Assert.Equal(job, order!.LastPrintJobId);
         Assert.Equal((ulong)(1000 + round), order.LastCycleId);
+    }
+
+    /// <summary>
+    /// Contención real: otra transacción retiene un UPDLOCK sobre la fila del job mientras se lanzan los
+    /// 10 claims. Ninguno termina mientras el bloqueo sigue retenido (no hay lecturas sucias ni atajos por
+    /// versión de fila); al liberarlo, exactamente uno reclama y los otros nueve terminan sin excepción.
+    /// </summary>
+    [Fact]
+    public async Task Claims_blocked_by_a_held_update_lock_still_have_exactly_one_winner()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var s = await StationScenario.CreateAsync(_db, ct: ct);
+        var job = await s.ReadyJobAsync(2000, ct);
+
+        await using var holder = new SqlConnection(s.Db.AppConnectionString);
+        await holder.OpenAsync(ct);
+        await using var tx = (SqlTransaction)await holder.BeginTransactionAsync(ct);
+        await using (var hold = new SqlCommand("SELECT Status FROM dbo.PrintJob WITH (UPDLOCK, ROWLOCK) WHERE PrintJobId = @id", holder, tx))
+        {
+            hold.Parameters.AddWithValue("@id", job);
+            Assert.Equal(JobStatus.Ready, (string?)await hold.ExecuteScalarAsync(ct));
+        }
+
+        var claims = Enumerable.Range(0, 10).Select(_ => Task.Run(() => s.Claims.TryClaimAsync(job, s.Lease, ct), ct)).ToArray();
+        await Task.Delay(TimeSpan.FromMilliseconds(1500), ct);
+        Assert.All(claims, c => Assert.False(c.IsCompleted, "Un claim terminó mientras otra transacción retenía la fila del job."));
+
+        await tx.CommitAsync(ct);
+        var outcomes = await Task.WhenAll(claims);
+
+        Assert.Equal(1, outcomes.Count(o => o!.Claimed));
+        Assert.All(outcomes.Where(o => !o!.Claimed), o => Assert.Equal(ClaimRejection.NotReady, o!.Rejection));
+        Assert.Equal(9, s.Metrics.Total(MetricNames.ClaimConflicts));
+        Assert.Equal(AttemptOutcome.Sending, Assert.Single(await s.AttemptsAsync(job, ct)).Outcome);
     }
 }

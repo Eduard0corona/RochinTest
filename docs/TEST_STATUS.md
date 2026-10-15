@@ -8,8 +8,8 @@ Estado real de cada prueba del catálogo (`spec/tests/test-catalog.json`). `spec
 
 | Txx | Fase | Estado | Pruebas xUnit | Entorno | Comando y fecha | Notas |
 | --- | --- | --- | --- | --- | --- | --- |
-| T01 | 1 | PASA | `IntegrationTests/Idempotency/DuplicateTagTests` | SQL Server real | `build/ci.ps1` · 2026-10-14 19:30 | 100 entregas (SUBSCRIPTION, REPUBLISH, READ) desde 10 consumidores: 1 detección JOB_CREATED, 1 job, 1 intento, 1 CartonDetected, 1 PrintJobResult; duplicate_detection_total = 99 por transporte. La transmisión se mide en una impresora en memoria con un arnés de sender (Fase 1); el sender real y el simulador TCP se agregan en la Fase 4. |
-| T02 | 1 | PASA | `IntegrationTests/Idempotency/ClaimConcurrencyTests` (5 rondas) | SQL Server real | `build/ci.ps1` · 2026-10-14 19:30 | 10 claims concurrentes: 1 ganador, 9 con @claimed vacío y sin excepción, claim_conflicts_total = 9, 1 intento SENDING, ningún evento adicional. |
+| T01 | 1 | PASA | `IntegrationTests/Idempotency/DuplicateTagTests` | SQL Server real | `build/ci.ps1` · 2026-10-14 20:20 | 100 entregas (SUBSCRIPTION, REPUBLISH, READ) desde 10 consumidores: 1 detección JOB_CREATED, 1 job, 1 intento, 1 CartonDetected, 1 PrintJobResult; duplicate_detection_total = 99 por transporte. **Cobertura parcial:** la transmisión se mide en una impresora en memoria con un arnés de sender; T01 se repite en la Fase 4 con el sender real y el simulador TCP. |
+| T02 | 1 | PASA | `IntegrationTests/Idempotency/ClaimConcurrencyTests` (5 rondas y una con bloqueo retenido) | SQL Server real | `build/ci.ps1` · 2026-10-14 20:20 | 10 claims concurrentes: 1 ganador, 9 con @claimed vacío y sin excepción, claim_conflicts_total = 9, 1 intento SENDING, ningún evento adicional. Con un `UPDLOCK` retenido por otra transacción sobre la fila del job, ningún claim termina hasta liberarlo y después gana uno solo. |
 | T03 | 3 | NO_EJECUTADA | — | — | — |  |
 | T04 | 3 | NO_EJECUTADA | — | — | — |  |
 | T05 | 4 | NO_EJECUTADA | — | — | — |  |
@@ -17,11 +17,11 @@ Estado real de cada prueba del catálogo (`spec/tests/test-catalog.json`). `spec
 | T07 | 4 | NO_EJECUTADA | — | — | — |  |
 | T08 | 7 | NO_EJECUTADA | — | — | — |  |
 | T09 | 6 | NO_EJECUTADA | — | — | — | Perfil extendido (Fase 6). |
-| T10 | 1 | PASA | `IntegrationTests/Idempotency/LotChangeRaceTests` | SQL Server real | `build/ci.ps1` · 2026-10-14 19:30 | R2 llega con el job READY; UPDATE de Payload, ErpRevision, LotId y PayloadHash fallan con 51005; el resultado publicado y la etiqueta transmitida (impresora en memoria) llevan el lote de R1. |
+| T10 | 1 | PASA | `IntegrationTests/Idempotency/LotChangeRaceTests` | SQL Server real | `build/ci.ps1` · 2026-10-14 20:20 | R2 llega con el job READY; UPDATE de Payload, ErpRevision, LotId y PayloadHash fallan con 51005; el resultado publicado y la etiqueta transmitida (impresora en memoria) llevan el lote de R1. |
 | T11 | 2 | NO_EJECUTADA | — | — | — |  |
 | T12 | 7 | NO_EJECUTADA | — | — | — |  |
 | T13 | 2 | NO_EJECUTADA | — | — | — |  |
-| T14 | 1 | PASA | `IntegrationTests/Idempotency/RepublishedResultTests` | SQL Server real y RabbitMQ real | `build/ci.ps1` · 2026-10-14 19:30 | El relay publica 3 veces el mismo EventId (confirm "perdido"); el consumidor con InboxMessage aplica 1 efecto; inbox_duplicates_total = 2; con versiones desordenadas conserva la mayor por (idempotencyKey, labelType). |
+| T14 | 1 | PASA | `IntegrationTests/Idempotency/RepublishedResultTests` | SQL Server real y RabbitMQ real | `build/ci.ps1` · 2026-10-14 20:20 | El relay publica 3 veces el mismo EventId (confirm "perdido"); el consumidor con InboxMessage aplica 1 efecto; inbox_duplicates_total = 2; con versiones desordenadas conserva la mayor por (idempotencyKey, labelType). El Inbox y la deduplicación son de `InboxConsumer` (src); el efecto "conserva la versión mayor" es del consumidor de prueba, porque los consumidores reales están fuera del MVP. |
 | T15 | 4 | NO_EJECUTADA | — | — | — |  |
 | T16 | 7 | NO_EJECUTADA | — | — | — |  |
 | T17 | 3 | NO_EJECUTADA | — | — | — |  |
@@ -54,4 +54,4 @@ Estado real de cada prueba del catálogo (`spec/tests/test-catalog.json`). `spec
 | T44 | 4 | NO_EJECUTADA | — | — | — |  |
 | T45 | 2 | NO_EJECUTADA | — | — | — |  |
 | T46 | 3 | NO_EJECUTADA | — | — | — |  |
-| T47 | 1 | PASA | `IntegrationTests/Schema/TriggerGuardTests`, `ReferenceStatementTests`, `MigrationTests` | SQL Server real | `build/ci.ps1` · 2026-10-14 19:30 | DDL y semilla sin error; cada transacción de referencia con 0 y N filas sin excepción ni Msg 334; los 33 THROW (51001 a 51032 y 52001, SI-01) fallan con su código exacto; transiciones prohibidas, respaldos ausentes o anteriores, cambio de solo Reason, PrinterSendOrder hacia atrás, PlcEpochHistory editada y desbloqueo sin OperatorAction rechazados; reglas CHECK y UNIQUE de la sección 6. |
+| T47 | 1 | PASA | `IntegrationTests/Schema/TriggerGuardTests`, `ReferenceStatementTests`, `ReferenceCoverageTests`, `MigrationTests` | SQL Server real | `build/ci.ps1` · 2026-10-14 20:20 | DDL y semilla sin error; cada transacción de referencia con 0 y N filas sin excepción ni Msg 334, incluidas las ramas excepcionales (X03 en TX-C, TX-D, TX-S y TX-R0) y la recirculación (TX-A y D08 en TX-E); los 33 THROW (51001 a 51032 y 52001, SI-01) fallan con su código exacto; transiciones prohibidas, respaldos ausentes o anteriores (también un intento excepcional que no es el más reciente), cambio de solo Reason, PrinterSendOrder hacia atrás, PlcEpochHistory editada y desbloqueo sin OperatorAction rechazados; cada regla CHECK y UNIQUE de la sección 6 con una prueba que nombra la restricción. Vacíos de guarda: SI-07 y SI-08. |

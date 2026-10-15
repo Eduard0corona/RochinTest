@@ -57,6 +57,10 @@ public sealed class OutboxRelay(
         var published = 0;
         foreach (var message in pending)
         {
+            using var activity = CartonTelemetry.ActivitySource.StartActivity("outbox.publish");
+            activity?.SetTag(CartonTelemetry.Tags.EventId, message.EventId);
+            activity?.SetTag(CartonTelemetry.Tags.IdempotencyKey, message.OrderingKey);
+            activity?.SetTag("eventType", message.EventType);
             try
             {
                 await publisher.PublishAsync(message, ct);

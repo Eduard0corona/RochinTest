@@ -207,13 +207,10 @@ public sealed class StationScenario
         return (job, attempt);
     }
 
-    public Task<WriteOutcome> TransmitAsync(Guid attemptId, CancellationToken ct = default, int? evidenceWindowMs = null)
+    public Task<WriteOutcome> TransmitAsync(Guid attemptId, CancellationToken ct = default)
     {
         var now = Clock.UtcNow;
-        var none = Revision.MinConfirmationLevel == EvidenceLevel.None;
-        var window = evidenceWindowMs ?? Revision.EvidenceWindowMs;
-        return Txc.TransmittedAsync(attemptId, now, now.AddMilliseconds(1), now, null, none ? null : now.AddMilliseconds(1 + window!.Value),
-            none, now.AddMilliseconds(1), ct);
+        return Txc.TransmittedAsync(attemptId, now, now.AddMilliseconds(1), now, null, now.AddMilliseconds(1), ct);
     }
 
     /// <summary>Job UNKNOWN con WRITE_INTERRUPTED (A04, J09).</summary>

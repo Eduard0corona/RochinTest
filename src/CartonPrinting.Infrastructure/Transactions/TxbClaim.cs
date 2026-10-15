@@ -27,6 +27,7 @@ public enum ClaimRejection
     PrinterNotActive,
     LeaseInvalid,
     MissingSendOrder,
+    PrinterBusy,
 }
 
 /// <summary>
@@ -70,7 +71,12 @@ public sealed class TxbClaim(SqlDb db)
                   AND EXISTS (
                       SELECT 1 FROM dbo.PrinterLease AS pl
                       WHERE pl.PrinterId = pj.PrinterId AND pl.OwnerInstanceId = @OwnerInstanceId
-                        AND pl.FencingToken = @LeaseToken AND pl.LeaseUntil > @EdgeNowUtc);
+                        AND pl.FencingToken = @LeaseToken AND pl.LeaseUntil > @EdgeNowUtc)
+                  -- J02: ningún otro intento SENDING en la impresora (UX_PrintAttempt_PrinterInFlight lo
+                  -- garantiza; la guarda evita que el claim termine en 2601 en lugar de 0 filas).
+                  AND NOT EXISTS (
+                      SELECT 1 FROM dbo.PrintAttempt AS inflight WITH (UPDLOCK, HOLDLOCK)
+                      WHERE inflight.PrinterId = pj.PrinterId AND inflight.Outcome = 'SENDING');
 
                 DECLARE @attemptNumber INT = NULL;
                 IF EXISTS (SELECT 1 FROM @claimed)
@@ -117,7 +123,9 @@ public sealed class TxbClaim(SqlDb db)
                                  OR (pj.PlcEpoch <> so.LastPlcEpoch AND eh.AcceptedAt > so.LastEpochAcceptedAt)
                                  OR (pj.PlcEpoch = so.LastPlcEpoch AND pj.CycleId > so.LastCycleId) THEN 1 ELSE 0 END,
                        CASE WHEN EXISTS (SELECT 1 FROM dbo.PrinterLease AS pl WHERE pl.PrinterId = pj.PrinterId
-                                 AND pl.OwnerInstanceId = @owner AND pl.FencingToken = @token AND pl.LeaseUntil > @now) THEN 1 ELSE 0 END
+                                 AND pl.OwnerInstanceId = @owner AND pl.FencingToken = @token AND pl.LeaseUntil > @now) THEN 1 ELSE 0 END,
+                       CASE WHEN EXISTS (SELECT 1 FROM dbo.PrintAttempt AS pa WHERE pa.PrinterId = pj.PrinterId AND pa.Outcome = 'SENDING')
+                            THEN 1 ELSE 0 END
                 FROM dbo.PrintJob AS pj
                 INNER JOIN dbo.StationConfig AS sc ON sc.SiteId = pj.SiteId AND sc.StationId = pj.StationId
                 INNER JOIN dbo.StationConfigRevision AS ar ON ar.ConfigRevisionId = sc.ActiveConfigRevisionId
@@ -163,7 +171,12 @@ public sealed class TxbClaim(SqlDb db)
                 return ClaimRejection.PrinterNotActive;
             }
 
-            return r.GetInt32(6) == 0 ? ClaimRejection.LeaseInvalid : ClaimRejection.None;
+            if (r.GetInt32(6) == 0)
+            {
+                return ClaimRejection.LeaseInvalid;
+            }
+
+            return r.GetInt32(7) == 1 ? ClaimRejection.PrinterBusy : ClaimRejection.None;
         }, ct);
 
     /// <summary>J03 cuando el claim se rechazó por plazo u orden (también lo hace TX-S).</summary>

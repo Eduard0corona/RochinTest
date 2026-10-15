@@ -38,9 +38,23 @@ public sealed class RegistrationService(
     public async Task<RegistrationResult> RegisterAsync(
         CycleRecord record, StationSettings station, StationRevision revision, SequenceDecision sequence, CancellationToken ct)
     {
+        var identity = record.Identity;
+        using var activity = CartonTelemetry.ActivitySource.StartActivity("carton.register");
+        activity?.SetTag(CartonTelemetry.Tags.IdempotencyKey, identity.IdempotencyKey);
+        activity?.SetTag(CartonTelemetry.Tags.CorrelationId, identity.DetectionId);
+        activity?.SetTag(CartonTelemetry.Tags.StationId, record.StationId);
+
         var plan = await PlanAsync(record, station, revision, sequence, ct);
         var result = await txa.ExecuteAsync(plan, ct);
         Record(result, record, plan);
+        activity?.SetTag("outcome", result.Outcome.ToString());
+        activity?.SetTag("detectionStatus", result.FinalStatus);
+        if (result.PrintJobId is { } jobId)
+        {
+            activity?.SetTag(CartonTelemetry.Tags.PrintJobId, jobId);
+            activity?.SetTag(CartonTelemetry.Tags.LabelSerial, plan.Job?.LabelSerial);
+        }
+
         return result;
     }
 
@@ -52,21 +66,23 @@ public sealed class RegistrationService(
         var deadline = DeadlinePolicy.Compute(revision, record.DetectionTimestamp, record.ReceivedAt, record.Transport, record.QueueOverflow,
             opensGap: sequence.Gap is not null);
 
-        if (terminalStatus is null)
+        if (record.WorkOrderId is null || (revision.RequiresCartonId && record.CartonId is null))
         {
-            if (deadline is null)
+            // Registro incompleto: la orden es obligatoria en el contrato con el PLC y, con
+            // CARTON_ID_REQUIRED, la identidad física también (SI-04). Va antes que cualquier otra
+            // clasificación terminal: una detección sin orden solo puede quedar BLOCKED
+            // (CK_CartonDetection_WorkOrder), salvo que la secuencia ya la bloqueara por otra causa.
+            if (terminalStatus != DetectionStatus.Blocked)
             {
-                // Sin referencia confiable no se fabrica un plazo (I26): DeadlineAt = ReceivedAt.
-                (terminalStatus, terminalReason) = revision.DeadlineReference == DeadlineReference.PlcTimestamp
-                    ? (DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot)
-                    : (DetectionStatus.Expired, DetectionReason.LateArrival);
-            }
-            else if (record.WorkOrderId is null || (revision.RequiresCartonId && record.CartonId is null))
-            {
-                // Registro incompleto: la orden es obligatoria en el contrato con el PLC; con
-                // CARTON_ID_REQUIRED la identidad física también (SI-04).
                 (terminalStatus, terminalReason) = (DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot);
             }
+        }
+        else if (terminalStatus is null && deadline is null)
+        {
+            // Sin referencia confiable no se fabrica un plazo (I26): DeadlineAt = ReceivedAt.
+            (terminalStatus, terminalReason) = revision.DeadlineReference == DeadlineReference.PlcTimestamp
+                ? (DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot)
+                : (DetectionStatus.Expired, DetectionReason.LateArrival);
         }
 
         var detection = new DetectionInsert

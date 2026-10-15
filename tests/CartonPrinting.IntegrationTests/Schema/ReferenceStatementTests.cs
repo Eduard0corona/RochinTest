@@ -127,8 +127,11 @@ public sealed class ReferenceStatementTests(SqlServerFixture sql) : IAsyncLifeti
         // J18 desde CONFIRMED.
         Assert.Equal(EvidenceAction.Corrected, (await s.EvidenceAsync(s.Verified(30, "P01LXX-000000000002"))).Action);
         Assert.Equal(JobReason.SerialMismatch, (await s.JobAsync(j1)).Reason);
-        // J18 desde UNKNOWN por SERIAL_MISMATCH: cambia la versión, el estado y el motivo no.
-        Assert.Equal(EvidenceAction.Corrected, (await s.EvidenceAsync(s.Verified(30, "P01LXX-000000000003"))).Action);
+        // J18 solo aplica a un job confirmado o en UNKNOWN "por otra causa": una segunda contradicción
+        // sobre UNKNOWN SERIAL_MISMATCH se registra sin transición ni nueva versión.
+        var corrected = (await s.JobAsync(j1)).ResultVersion;
+        Assert.Equal(EvidenceAction.Recorded, (await s.EvidenceAsync(s.Verified(30, "P01LXX-000000000003"))).Action);
+        Assert.Equal(corrected, (await s.JobAsync(j1)).ResultVersion);
 
         // J11 por serial distinto.
         var (j2, _) = await s.TransmittedJobAsync(31);
@@ -139,6 +142,12 @@ public sealed class ReferenceStatementTests(SqlServerFixture sql) : IAsyncLifeti
         // Tras SERIAL_MISMATCH no hay reconciliación automática: la lectura correcta se registra sin transición.
         Assert.Equal(EvidenceAction.Recorded, (await s.EvidenceAsync(s.Verified(31, (await s.JobAsync(j2)).LabelSerial))).Action);
         Assert.Equal(JobStatus.Unknown, (await s.JobAsync(j2)).Status);
+        // J18 desde UNKNOWN por otra causa (WRITE_INTERRUPTED): cambian el motivo y la versión, no el estado.
+        var (j4, _) = await s.UnknownJobAsync(33);
+        var before = (await s.JobAsync(j4)).ResultVersion;
+        Assert.Equal(EvidenceAction.Corrected, (await s.EvidenceAsync(s.Verified(33, "P01LXX-000000000005"))).Action);
+        var after = await s.JobAsync(j4);
+        Assert.Equal((JobStatus.Unknown, JobReason.SerialMismatch, before + 1), (after.Status, after.Reason, after.ResultVersion));
     }
 
     [Fact]
@@ -252,7 +261,7 @@ public sealed class ReferenceStatementTests(SqlServerFixture sql) : IAsyncLifeti
         // TX-X: ejecución, intento excepcional transmitido y confirmado (X01).
         var auth = await s.ApproveReprintAsync(u2, JobStatus.ClosedUnresolved, "CLOSED_CARTON_RECOVERED", "ACCEPTED");
         var run = await s.ExecuteReprintAsync(auth);
-        await s.TransmitAsync(run.AttemptId, Ct, evidenceWindowMs: 60_000);
+        await s.TransmitAsync(run.AttemptId, Ct);
         var serial = (await s.JobAsync(u2)).LabelSerial;
         var x01 = await s.EvidenceAsync(s.Verified(72, serial, run.AttemptId, EvidenceType.ManualInspection, "inspector.diaz"));
         Assert.Equal(EvidenceAction.ExceptionalConfirmed, x01.Action);
@@ -292,7 +301,7 @@ public sealed class ReferenceStatementTests(SqlServerFixture sql) : IAsyncLifeti
 
         // CK_CartonDetection_GatewayLive y CK_CartonDetection_PlcTimestamp: plazo fabricado en un registro sin cota.
         var gateway = await InsertDetectionAsync(s, 81, "RECOVERED", "REPUBLISH", detectionTimestamp: false, deadlineAfterReceipt: true);
-        Assert.Contains("CK_CartonDetection_", gateway.Message, StringComparison.Ordinal);
+        Assert.Matches(@"\bCK_CartonDetection_(GatewayLive|PlcTimestamp)\b", gateway.Message);
         var plc = await InsertDetectionAsync(s, 82, "OBSERVED", "SUBSCRIPTION", detectionTimestamp: false, deadlineAfterReceipt: true);
         Assert.Contains("CK_CartonDetection_PlcTimestamp", plc.Message, StringComparison.Ordinal);
 
@@ -304,8 +313,10 @@ public sealed class ReferenceStatementTests(SqlServerFixture sql) : IAsyncLifeti
             SELECT NEWID(), PrintJobId, 9, 'ORDINARY', PrinterId, N'x', 1, 'SENDING', 1, PayloadHash, SYSUTCDATETIME()
             FROM dbo.PrintJob WHERE PrintJobId = @id
             """, c => c.Parameters.AddWithValue("@id", sending), ct: Ct);
+        // El insert viola a la vez JobOpen, OrdinarySent y PrinterInFlight; SQL Server informa uno de los tres.
+        // Cada índice se prueba por separado en ReferenceCoverageTests.
         Assert.Equal(2601, open.Number);
-        Assert.Contains("UX_PrintAttempt_", open.Message, StringComparison.Ordinal);
+        Assert.Matches(@"\bUX_PrintAttempt_(JobOpen|OrdinarySent|PrinterInFlight)\b", open.Message);
         _ = row;
     }
 

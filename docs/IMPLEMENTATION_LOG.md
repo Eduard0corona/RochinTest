@@ -184,7 +184,12 @@ El revisor notó archivos sin seguimiento que aparecían en el árbol durante su
 3. **`mandatory` en la publicación.** Un evento sin cola enlazada vuelve como error (`PublishReturnException`) y el relay se detiene sin marcarlo publicado, en lugar de perderlo. Configurable (`RabbitMq:Mandatory`).
 4. **Validación de contratos antes del Outbox.** Un evento que no cumple su schema o sus reglas de negocio revierte la transacción: emitir un contrato inválido es un defecto. Única tolerancia: SI-05.
 5. **SI-04 y SI-05** (ver `docs/SPEC_ISSUES.md`): `CARTON_ID_REQUIRED` sin `CartonId` queda `BLOCKED` con `INCOHERENT_SNAPSHOT` (falla cerrada, pendiente de la persona); un registro `GATEWAY_RECEIPT` en vivo que abre un hueco se registra sin plazo según la máquina de estados, aunque la regla del verificador no vea el hueco.
-6. **Plazo efectivo sin referencia activa.** Si la revisión activa no puede dar un plazo confiable para un registro (por ejemplo, cambió a `PLC_TIMESTAMP` y el registro no trae `DetectionTimestamp`), el plazo efectivo es su recepción: el job ya no se envía. Es la lectura más restrictiva de "nunca más permisivo que el congelado".
+6. **Plazo efectivo sin referencia activa.** Si la revisión activa no puede dar un plazo confiable para un registro (por ejemplo, cambió a `PLC_TIMESTAMP` y el registro no trae `DetectionTimestamp`), el plazo efectivo es su recepción: el job ya no se envía. Es la lectura más restrictiva de "nunca más permisivo que el congelado". Registrado como SI-09.
+7. **J18 solo con una lectura posterior al primer claim.** El trigger no lo exige para `CORRECTION` (SI-07); TX-D sí, igual que I06 lo exige para confirmar.
+8. **El claim no termina en 2601.** La guarda de TX-B excluye una impresora con otro intento en `SENDING` (`UX_PrintAttempt_PrinterInFlight` sigue siendo la barrera); el rechazo se diagnostica como `PrinterBusy`.
+9. **TX-C lee el nivel mínimo y la ventana de evidencia congelados dentro de la transacción** (del job para un intento ordinario, de la autorización para uno excepcional); el sender no los pasa.
+10. **Payload de la reimpresión.** Es el del job (mismo `LabelSerial`) y, con `ReprintMarker`, una marca visible antes del cierre de la etiqueta; el intento registra el SHA-256 de ese payload en `AttemptPayloadHash` (I09).
+11. **D07 en TX-E y G02 en el barrido** (SI-06): un snapshot tardío vence la detección sin crear el job; el barrido cierra como `RECOVERED` un hueco que dos TX-A concurrentes dejaron abierto por RCSI.
 
 ### Comandos y resultados
 
@@ -209,3 +214,55 @@ Durante el desarrollo, dos pruebas fallaron por errores de la prueba que el sist
 
 - **T01, T02, T10, T14 y T47: PASA** (detalle en `docs/TEST_STATUS.md`).
 - T47 ejecuta, además del criterio del catálogo, una prueba que lee el DDL y la referencia, extrae los 33 códigos `THROW` y exige que cada uno tenga su prueba negativa.
+
+### Revisión independiente
+
+Subagente `revisor-adversarial` sobre `feat/sql-idempotency` (2026-10-14). 1 ALTA, 4 MEDIA y 9 BAJA. Todos se corrigieron o se registraron:
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| 1: una lectura contradictoria después de X01 (job confirmado por reimpresión) no aplicaba J18 | Alta | TX-D evalúa la contradicción antes de elegir el intento: X03 si referencia la reimpresión en curso, J11 si el job está en `TRANSMITTED`, J18 si está `CONFIRMED` (por cualquier vía) o `UNKNOWN` por otra causa; J18 limpia `ConfirmedByExceptionalReprint`. Prueba con y sin `AttemptId` |
+| 2: una lectura `VERIFIED` de un ciclo con el `PrintJobId` de otro job podía confirmar a ese otro | Media | La evidencia correlacionada al ciclo resuelve el job por el ciclo; un `PrintJobId` que no coincide deja la observación registrada sin efecto |
+| 3: un registro `GATEWAY_RECEIPT` no en vivo sin `WorkOrderId` terminaba en 547 (`CK_CartonDetection_WorkOrder`) | Media | El registro incompleto se clasifica antes que el plazo: `BLOCKED` con `INCOHERENT_SNAPSHOT` (salvo que la secuencia ya lo bloqueara) |
+| 4: `ReprintMarker` se ignoraba y el intento excepcional repetía el hash del job | Media | `ReprintPayload.Render` y `AttemptPayloadHash` propio (decisión 10) |
+| 5: sentencias de referencia y reglas de fila sin prueba en T47 | Media | `ReferenceCoverageTests`: recirculación en TX-A (job vivo y `WAITING_ERP`), D08 por recirculación en TX-E, A04+X03 en TX-C, X03 en TX-R0, TX-S y TX-D, respaldo excepcional anterior (51012), lease con 0 filas, y una prueba por cada `UNIQUE` y `CHECK` (`UQ_PrintJob_LabelSerial`, `UX_PrintAttempt_JobOpen`, `_OrdinarySent`, `_Authorization`, `_ConfirmingObservation`, `UX_ReprintAuthorization_OpenPerJob`, `CK_EvidenceObservation_Type`, `_Level`, `_Manual`). Las aserciones nombran la restricción exacta. Vacíos de guarda registrados: SI-07 y SI-08 |
+| 6: J18 se repetía sobre un `UNKNOWN` que ya era `SERIAL_MISMATCH` | Baja | La segunda contradicción se registra sin transición ni versión nueva (el disparador de J18 dice "por otra causa") |
+| 7: T02 no forzaba contención real | Baja | Prueba adicional: otra transacción retiene `UPDLOCK` sobre la fila del job; ningún claim termina mientras tanto; al liberarla, un ganador |
+| 8: un claim con otro intento `SENDING` en la impresora lanzaba 2601 | Baja | Decisión 8 y prueba |
+| 9: TX-C confiaba en el nivel y la ventana que pasaba el llamador | Baja | Decisión 9 |
+| 10: la tolerancia de SI-05 no tenía pruebas | Baja | `OutboxWriter.ToleratedRule` y cuatro pruebas unitarias: tolerada solo con hueco, `GATEWAY_RECEIPT` y `DeadlineAt = ReceivedAt`; nunca encubre otra regla |
+| 11: T14 no decía dónde vive el efecto "conserva la versión mayor" | Baja | Nota en `docs/TEST_STATUS.md`: es el efecto del consumidor de prueba |
+| 12: faltaban CHANGELOG, lista de lo no verificado y trazas con `correlationId` | Baja | Entrada en `CHANGELOG.md`; secciones siguientes; actividades `carton.register`, `carton.claim` y `outbox.publish` con `idempotencyKey`, `correlationId`, `printJobId` y `attemptId` (`TracingTests`) |
+| 13: D07 en TX-E y G02 en el barrido sin documentar | Baja | Comentarios en el código y SI-06 |
+| 14: la decisión 6 no estaba registrada; SI-04 no decía que el camino quedó detenido | Baja | SI-09; SI-04 reformulado (camino en falla cerrada hasta la decisión); riesgo de la Fase 4 abajo |
+
+Al corregir el hallazgo 6 se encontró que una prueba anterior de TX-D esperaba J18 sobre un `UNKNOWN` que ya era `SERIAL_MISMATCH`; la prueba contradecía el disparador de J18 y se corrigió (ahora también cubre J18 desde `UNKNOWN` por `WRITE_INTERRUPTED`).
+
+Compuerta completa después de las correcciones, 2026-10-14 20:20 (`powershell -File build/ci.ps1`):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   128, Omitido:     0, Total:   128, Duración: 20 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    74, Omitido:     0, Total:    74, Duración: 1 m 47 s - CartonPrinting.IntegrationTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 56 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
+### Lo que no se verificó
+
+- T01 mide la transmisión con un arnés de sender y una impresora en memoria; el sender real, el lock de sistema operativo y el simulador TCP llegan en la Fase 4, donde T01 se repite.
+- Los servicios que usan TX-D, TX-E, TX-S, TX-M, TX-X y TX-R0 (escáner, ERP, barrido, Operations API, recuperación) no existen todavía: aquí solo se ejecutaron las transacciones, desde las pruebas.
+- El consumidor de T14 es de prueba; los consumidores reales de `PrintJobResult` están fuera del MVP.
+- Las trazas se comprobaron con un `ActivityListener` en proceso, no contra un colector OTLP.
+- La compuerta corrió en Windows con Docker Desktop; no en Linux ni en GitHub Actions.
+
+### Riesgos
+
+- **Evidencia registrada y no aplicada.** TX-D registra la observación en su propia transacción y la aplica en otra. Si el proceso muere entre las dos, la observación queda sin aplicar. La Fase 4 tiene que reaplicar al arrancar las observaciones sin efecto posteriores al claim (J18 ya ignora las anteriores, SI-07).
+- Las pruebas de concurrencia dependen del planificador de SQL Server; T02 se repite en cinco rondas y con un bloqueo retenido explícito.
+- SI-04, SI-07, SI-08 y SI-09 esperan una decisión de la persona; mientras tanto, cada camino queda en su variante más restrictiva.

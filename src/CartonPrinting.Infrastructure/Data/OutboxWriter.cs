@@ -22,16 +22,20 @@ public static class OutboxWriter
     /// pero la regla de negocio del verificador no ve el hueco y exigiría un plazo posterior (SI-05).
     /// Solo en ese caso se tolera esa regla; todas las demás se exigen.
     /// </summary>
-    public static Task InsertCartonDetectedAsync(SqlConnection conn, SqlTransaction tx, CartonDetectedEvent evt, bool opensGapWithoutDeadline, CancellationToken ct)
-    {
-        var tolerated = opensGapWithoutDeadline
-            && evt.DeadlineReference == DeadlineReference.GatewayReceipt
-            && evt.DeadlineAt == evt.ReceivedAt
-                ? ContractBusinessRules.DeadlineNotAfterReference
-                : null;
-        return InsertAsync(conn, tx, evt.EventId, CartonDetectedType, evt.IdempotencyKey, DetectionAggregate, evt.EventId, 1,
-            ContractJson.Serialize(evt), ct, tolerated);
-    }
+    public static Task InsertCartonDetectedAsync(SqlConnection conn, SqlTransaction tx, CartonDetectedEvent evt, bool opensGapWithoutDeadline, CancellationToken ct) =>
+        InsertAsync(conn, tx, evt.EventId, CartonDetectedType, evt.IdempotencyKey, DetectionAggregate, evt.EventId, 1,
+            ContractJson.Serialize(evt), ct, ToleratedRule(evt, opensGapWithoutDeadline));
+
+    /// <summary>
+    /// SI-05: la única regla de negocio que se tolera, y solo para un registro GATEWAY_RECEIPT que abre un
+    /// hueco y quedó sin plazo (DeadlineAt = ReceivedAt). En cualquier otro caso devuelve null.
+    /// </summary>
+    public static string? ToleratedRule(CartonDetectedEvent evt, bool opensGapWithoutDeadline) =>
+        opensGapWithoutDeadline
+        && evt.DeadlineReference == DeadlineReference.GatewayReceipt
+        && evt.DeadlineAt == evt.ReceivedAt
+            ? ContractBusinessRules.DeadlineNotAfterReference
+            : null;
 
     /// <summary>Resultado de una detección sin job (BLOCKED, EXPIRED por LATE_ARRIVAL o ERP_UNAVAILABLE).</summary>
     public static Task InsertDetectionResultAsync(SqlConnection conn, SqlTransaction tx, PrintJobResultEvent evt, CancellationToken ct) =>

@@ -83,15 +83,20 @@ public sealed class TxdEvidence(SqlDb db)
             var o = await JobQueries.GetObservationAsync(conn, tx, observationId, ct)
                 ?? throw new InvalidOperationException($"EvidenceObservation {observationId} no existe.");
 
+            // APPLIED y VERIFIED correlacionan por ciclo: el job es el de ese ciclo. Un PrintJobId que no
+            // coincide con el job del ciclo hace la observación incoherente: queda registrada, sin efecto.
             JobRecord? job = null;
-            if (o.PrintJobId is { } jid)
-            {
-                job = await JobQueries.GetJobAsync(conn, tx, jid, ct, updLock: true);
-            }
-            else if (o.CorrelatedTo == CorrelatedTo.Cycle && o.PlcEpoch is { } epoch && o.CycleId is { } cycle)
+            if (o.CorrelatedTo == CorrelatedTo.Cycle && o.PlcEpoch is { } epoch && o.CycleId is { } cycle)
             {
                 var found = await JobQueries.GetJobByCycleAsync(conn, tx, new CycleIdentity(o.SiteId, o.StationId, epoch, cycle), ct);
-                job = found is null ? null : await JobQueries.GetJobAsync(conn, tx, found.PrintJobId, ct, updLock: true);
+                if (found is not null && (o.PrintJobId is null || o.PrintJobId == found.PrintJobId))
+                {
+                    job = await JobQueries.GetJobAsync(conn, tx, found.PrintJobId, ct, updLock: true);
+                }
+            }
+            else if (o.PrintJobId is { } jid)
+            {
+                job = await JobQueries.GetJobAsync(conn, tx, jid, ct, updLock: true);
             }
 
             if (job is null)
@@ -100,19 +105,21 @@ public sealed class TxdEvidence(SqlDb db)
             }
 
             var attempts = await JobQueries.GetAttemptsAsync(conn, tx, job.PrintJobId, ct);
+
+            // Una lectura VERIFIED del ciclo con otro serial contradice al job, haya o no intento ordinario.
+            var contradicts = o.EvidenceLevel == EvidenceLevel.Verified
+                && !string.Equals(o.ReadSerial, job.LabelSerial, StringComparison.Ordinal);
+            if (contradicts)
+            {
+                return await ApplyContradictionAsync(conn, tx, o, job, attempts, edgeNowUtc, ct);
+            }
+
             var attempt = o.AttemptId is { } aid
                 ? attempts.SingleOrDefault(a => a.AttemptId == aid)
                 : attempts.SingleOrDefault(a => a.Kind == AttemptKind.Ordinary && a.MayHaveSent);
             if (attempt is null)
             {
                 return new EvidenceOutcome(EvidenceAction.Recorded, job.PrintJobId, null, job.Status, null);
-            }
-
-            var contradicts = o.EvidenceLevel == EvidenceLevel.Verified
-                && !string.Equals(o.ReadSerial, job.LabelSerial, StringComparison.Ordinal);
-            if (contradicts)
-            {
-                return await ApplyContradictionAsync(conn, tx, o, job, attempt, edgeNowUtc, ct);
             }
 
             var minimum = await FrozenMinimumLevelAsync(conn, tx, job.ConfigRevisionId, ct);
@@ -194,33 +201,35 @@ public sealed class TxdEvidence(SqlDb db)
         }, ct);
 
     private static async Task<EvidenceOutcome> ApplyContradictionAsync(
-        SqlConnection conn, SqlTransaction tx, ObservationRecord o, JobRecord job, AttemptRecord attempt, DateTime edgeNowUtc, CancellationToken ct)
+        SqlConnection conn, SqlTransaction tx, ObservationRecord o, JobRecord job, IReadOnlyList<AttemptRecord> attempts, DateTime edgeNowUtc,
+        CancellationToken ct)
     {
-        // Lectura contradictoria de una reimpresión en curso: A06 y X03 juntos.
-        if (attempt.Kind == AttemptKind.ExceptionalReprint)
+        // Lectura contradictoria que referencia la reimpresión en curso (la más reciente): A06 y X03 juntos.
+        var exceptional = o.AttemptId is { } aid
+            ? attempts.SingleOrDefault(a => a.AttemptId == aid && a.Kind == AttemptKind.ExceptionalReprint)
+            : null;
+        var latestExceptional = attempts.Where(a => a.Kind == AttemptKind.ExceptionalReprint).MaxBy(a => a.AttemptNumber);
+        if (exceptional is not null && exceptional.Outcome == AttemptOutcome.Transmitted
+            && latestExceptional?.AttemptId == exceptional.AttemptId && o.ReceivedAt >= exceptional.ClaimedAt)
         {
-            if (attempt.Outcome != AttemptOutcome.Transmitted)
-            {
-                return new EvidenceOutcome(EvidenceAction.Recorded, job.PrintJobId, attempt.AttemptId, job.Status, null);
-            }
-
             await RequireAttemptAsync(conn, tx, """
                 UPDATE dbo.PrintAttempt SET Outcome = 'UNKNOWN', FailureDetail = N'Evidencia contradictoria'
                 OUTPUT inserted.PrintJobId, inserted.Kind INTO @a (PrintJobId, Kind)
                 WHERE AttemptId = @AttemptId AND Outcome = 'TRANSMITTED';
-                """, c => c.Guid("@AttemptId", attempt.AttemptId), ct);
-            var x03 = await TxcWriteResult.ExceptionalUnresolvedAsync(conn, tx, job.PrintJobId, attempt.AttemptId, edgeNowUtc, ct);
-            return new EvidenceOutcome(EvidenceAction.ExceptionalUnresolved, job.PrintJobId, attempt.AttemptId, job.Status, x03);
+                """, c => c.Guid("@AttemptId", exceptional.AttemptId), ct);
+            var x03 = await TxcWriteResult.ExceptionalUnresolvedAsync(conn, tx, job.PrintJobId, exceptional.AttemptId, edgeNowUtc, ct);
+            return new EvidenceOutcome(EvidenceAction.ExceptionalUnresolved, job.PrintJobId, exceptional.AttemptId, job.Status, x03);
         }
 
-        // 2b. Serial distinto con el job en TRANSMITTED: A06 y J11.
-        if (job.Status == JobStatus.Transmitted && attempt.Outcome == AttemptOutcome.Transmitted)
+        // 2b. Serial distinto con el job en TRANSMITTED: A06 y J11 con SERIAL_MISMATCH.
+        var ordinary = attempts.SingleOrDefault(a => a.Kind == AttemptKind.Ordinary && a.MayHaveSent);
+        if (job.Status == JobStatus.Transmitted && ordinary is { Outcome: AttemptOutcome.Transmitted } && o.ReceivedAt >= ordinary.ClaimedAt)
         {
             await RequireAttemptAsync(conn, tx, """
                 UPDATE dbo.PrintAttempt SET Outcome = 'UNKNOWN', FailureDetail = N'Evidencia contradictoria'
                 OUTPUT inserted.PrintJobId, inserted.Kind INTO @a (PrintJobId, Kind)
                 WHERE AttemptId = @AttemptId AND Outcome = 'TRANSMITTED';
-                """, c => c.Guid("@AttemptId", attempt.AttemptId), ct);
+                """, c => c.Guid("@AttemptId", ordinary.AttemptId), ct);
             await TxcWriteResult.RequireJobAsync(conn, tx, """
                 UPDATE dbo.PrintJob
                 SET Status = 'UNKNOWN', Reason = 'SERIAL_MISMATCH', ResultVersion = ResultVersion + 1, UpdatedAt = @EdgeNowUtc
@@ -228,14 +237,18 @@ public sealed class TxdEvidence(SqlDb db)
                 WHERE PrintJobId = @PrintJobId AND Status = 'TRANSMITTED';
                 """, c => c.DateTime2("@EdgeNowUtc", edgeNowUtc).Guid("@PrintJobId", job.PrintJobId), ct);
             var mismatch = await ResultPublisher.PublishJobAsync(conn, tx, job.PrintJobId, edgeNowUtc,
-                new ResultExtras { AttemptId = attempt.AttemptId, ObservationId = o.ObservationId }, ct);
-            return new EvidenceOutcome(EvidenceAction.SerialMismatch, job.PrintJobId, attempt.AttemptId, job.Status, mismatch);
+                new ResultExtras { AttemptId = ordinary.AttemptId, ObservationId = o.ObservationId }, ct);
+            return new EvidenceOutcome(EvidenceAction.SerialMismatch, job.PrintJobId, ordinary.AttemptId, job.Status, mismatch);
         }
 
-        // 2c. Serial distinto con el job CONFIRMED o UNKNOWN: corrección J18.
-        if (job.Status is JobStatus.Confirmed or JobStatus.Unknown)
+        // 2c. J18: el job ya confirmado (por un intento ordinario o por una reimpresión, X01) o en UNKNOWN
+        // por otra causa. Un UNKNOWN que ya es SERIAL_MISMATCH no se vuelve a corregir. La lectura tiene
+        // que ser posterior al primer claim del job: antes no había etiqueta suya que leer. El trigger no
+        // lo exige para CORRECTION (SI-07); la regla vive aquí.
+        var firstClaim = attempts.Count == 0 ? (DateTime?)null : attempts.Min(a => a.ClaimedAt);
+        if (firstClaim is { } claimedAt && o.ReceivedAt >= claimedAt
+            && (job.Status == JobStatus.Confirmed || (job.Status == JobStatus.Unknown && job.Reason != JobReason.SerialMismatch)))
         {
-            var corrected = false;
             await TxcWriteResult.RunWithTransitionKindAsync(conn, tx, "CORRECTION", """
                 DECLARE @j TABLE (PrintJobId UNIQUEIDENTIFIER NOT NULL);
                 UPDATE dbo.PrintJob
@@ -245,13 +258,12 @@ public sealed class TxdEvidence(SqlDb db)
                 WHERE PrintJobId = @PrintJobId AND Status IN ('CONFIRMED', 'UNKNOWN');
                 IF NOT EXISTS (SELECT 1 FROM @j) THROW 50202, N'J18 sin job en CONFIRMED o UNKNOWN.', 1;
                 """, c => c.DateTime2("@EdgeNowUtc", edgeNowUtc).Guid("@PrintJobId", job.PrintJobId), ct);
-            corrected = true;
             var published = await ResultPublisher.PublishJobAsync(conn, tx, job.PrintJobId, edgeNowUtc,
-                new ResultExtras { AttemptId = attempt.AttemptId, ObservationId = o.ObservationId }, ct);
-            return new EvidenceOutcome(corrected ? EvidenceAction.Corrected : EvidenceAction.Recorded, job.PrintJobId, attempt.AttemptId, job.Status, published);
+                new ResultExtras { ObservationId = o.ObservationId }, ct);
+            return new EvidenceOutcome(EvidenceAction.Corrected, job.PrintJobId, published.AttemptId, job.Status, published);
         }
 
-        return new EvidenceOutcome(EvidenceAction.Recorded, job.PrintJobId, attempt.AttemptId, job.Status, null);
+        return new EvidenceOutcome(EvidenceAction.Recorded, job.PrintJobId, null, job.Status, null);
     }
 
     /// <summary>Intento excepcional confirmado (A05 o A08) y X01 o X02 en una transacción.</summary>
