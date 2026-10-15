@@ -16,12 +16,13 @@ public interface ILabelingReadySink
 
 /// <summary>
 /// Latido LabelingReady (contrato con el PLC, sección 4): el servicio escribe true mientras la estación
-/// está habilitada y la ingesta conectada; false si la estación está bloqueada, si se pierde OPC o si no
-/// se puede leer su estado en SQL. Si el latido deja de llegar, el PLC aplica su propia política (OT).
+/// está habilitada, la ingesta conectada y su canal sin saturar; false si la estación está bloqueada, si se
+/// pierde OPC, si el canal está lleno (ARQUITECTURA_TECNICA §2) o si no se puede leer su estado en SQL. Si el
+/// latido deja de llegar, el PLC aplica su propia política (OT).
 /// </summary>
 public sealed class LabelingReadyHeartbeat(
     StationSettings station, StationConfigStore stations, ILabelingReadySink sink, CartonMetrics metrics,
-    ILogger<LabelingReadyHeartbeat>? logger = null)
+    ILogger<LabelingReadyHeartbeat>? logger = null, Func<bool>? overloaded = null)
 {
     private readonly ILogger _logger = logger ?? NullLogger<LabelingReadyHeartbeat>.Instance;
 
@@ -32,7 +33,7 @@ public sealed class LabelingReadyHeartbeat(
         try
         {
             var active = await stations.GetActiveAsync(station.SiteId, station.StationId, ct);
-            ready = active is { State.LabelingEnabled: true } && sink.Connected;
+            ready = active is { State.LabelingEnabled: true } && sink.Connected && !(overloaded?.Invoke() ?? false);
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {

@@ -1,6 +1,7 @@
 using CartonPrinting.Contracts;
 using CartonPrinting.Infrastructure.Data;
 using CartonPrinting.Infrastructure.Observability;
+using CartonPrinting.Infrastructure.Transactions;
 using CartonPrinting.OpcIngest;
 using CartonPrinting.Orchestration;
 using CartonPrinting.Testing;
@@ -108,9 +109,14 @@ public sealed class EpochChangeTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Equal(OperatorActionType.ConfirmEpoch, await s.ScalarAsync<string>("SELECT ActionType FROM dbo.OperatorAction WHERE OperatorActionId = @id",
             c => c.Parameters.AddWithValue("@id", confirm.OperatorActionId), ct));
 
-        // Reingresar otra vez es un duplicado auténtico, no otra detección.
+        // Reingresar otra vez (por ejemplo, un proceso que cayó entre el registro y la resolución) es un duplicado
+        // auténtico, no otra detección; con la anomalía ya resuelta, el reingreso se rechaza.
+        var again = await ingest.ProcessRecordAsync(RetainedRecords.Reingest(await s.ScalarAsync<string>(
+            "SELECT IncomingRecord FROM dbo.SequenceAnomaly WHERE AnomalyId = @id", c => c.Parameters.AddWithValue("@id", retained[0].AnomalyId!.Value), ct)), ct);
+        Assert.Equal(RegistrationOutcome.Duplicate, again.Result!.Outcome);
         Assert.Equal(1, await s.CountAsync("FROM dbo.CartonDetection WHERE StationId = @st AND PlcEpoch = 43 AND CycleId = 1",
             c => c.Parameters.AddWithValue("@st", s.StationId), ct));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => ingest.ReingestAsync(retained[0].AnomalyId!.Value, "supervisor.ramos", "Otra vez", ct));
     }
 
     [Fact]

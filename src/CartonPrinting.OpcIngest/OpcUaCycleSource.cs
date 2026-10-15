@@ -107,8 +107,9 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
     private SessionReconnectHandler? _reconnect;
     private bool _firstPending = true;
     private uint _highestSequence;
+    private uint _subscriptionId;
     private bool _recovering;
-    private uint? _recoveryWatermark;
+    private DateTime? _republishedBefore;
 
     public OpcUaCycleSource(OpcIngestOptions options, EdgeClock clock, CartonMetrics metrics, ILogger<OpcUaCycleSource>? logger = null)
     {
@@ -136,7 +137,17 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
         _logger.LogInformation("OPC UA: {Event}", text);
     }
 
+    /// <summary>
+    /// Sesión conectada y recuperación terminada. La recuperación termina cuando terminan sus lecturas
+    /// (registro actual, Republish y FIFO), no cuando llega una caja: con LabelingReady bajo, la línea
+    /// puede estar detenida y no pasar ninguna.
+    /// </summary>
     public bool Connected => _session is { Connected: true } && !_recovering;
+
+    /// <summary>Notificaciones descartadas porque el canal acotado estaba lleno.</summary>
+    public long DroppedNotifications => Interlocked.Read(ref _dropped);
+
+    private long _dropped;
 
     public async Task StartAsync(ChannelWriter<RawNotification> writer, CancellationToken ct)
     {
@@ -227,10 +238,10 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
             _highestSequence = 0;
         }
 
-        session.AddSubscription(subscription);
-        await subscription.CreateAsync(ct);
         _subscription = subscription;
         _item = item;
+        session.AddSubscription(subscription);
+        await subscription.CreateAsync(ct);
         RevisedPublishingIntervalMs = subscription.CurrentPublishingInterval;
         RevisedSamplingIntervalMs = item.Status.SamplingInterval;
         RevisedQueueSize = item.Status.QueueSize;
@@ -247,28 +258,22 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
         // El transporte se decide por mensaje (todas sus notificaciones comparten número de secuencia);
         // solo la primera notificación del monitored item tras crearlo o transferirlo es READ.
         string messageTransport;
+        bool recovering;
+        DateTime? watermark;
         lock (_gate)
         {
-            if (_recovering)
+            // Una suscripción recreada (reinicio del servidor, sesión nueva o suscripción vencida) vuelve a
+            // numerar sus mensajes desde 1 y su primera notificación es el valor actual: READ.
+            if (subscription.Id != _subscriptionId)
             {
-                _recoveryWatermark ??= subscription.AvailableSequenceNumbers is { } available && available.Any()
-                    ? available.Max()
-                    : seq;
-                if (seq <= _recoveryWatermark)
-                {
-                    messageTransport = Transport.Republish;
-                }
-                else
-                {
-                    _recovering = false;
-                    _recoveryWatermark = null;
-                    messageTransport = Transport.Subscription;
-                }
+                _subscriptionId = subscription.Id;
+                _highestSequence = 0;
+                _firstPending = true;
             }
-            else
-            {
-                messageTransport = seq != 0 && seq <= _highestSequence ? Transport.Republish : Transport.Subscription;
-            }
+
+            recovering = _recovering;
+            watermark = _republishedBefore;
+            messageTransport = seq != 0 && seq <= _highestSequence ? Transport.Republish : Transport.Subscription;
 
             _highestSequence = Math.Max(_highestSequence, seq);
         }
@@ -281,6 +286,17 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
             }
 
             var transport = messageTransport;
+            if (recovering)
+            {
+                // Durante la recuperación, un cambio que el servidor registró antes de la reconexión llegó tarde
+                // (REPUBLISH), aunque viaje en un mensaje nuevo; solo uno posterior es en vivo. Sin la hora del
+                // servidor o sin ServerTimestamp, se trata como recuperado (ante la duda, nunca en vivo).
+                transport = watermark is { } w && change.Value.ServerTimestamp != DateTime.MinValue
+                    && DateTime.SpecifyKind(change.Value.ServerTimestamp, DateTimeKind.Utc) > w
+                        ? Transport.Subscription
+                        : Transport.Republish;
+            }
+
             lock (_gate)
             {
                 if (_firstPending)
@@ -330,6 +346,7 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
             _options.RecordNodeId);
         if (!_writer!.TryWrite(raw))
         {
+            Interlocked.Increment(ref _dropped);
             // Canal acotado lleno: señal de sobrecarga, no un buffer infinito. El registro se pierde
             // como notificación y aparecerá como hueco de secuencia.
             _metrics.Increment("opc_ingest_channel_full_total");
@@ -346,7 +363,7 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
         lock (_gate)
         {
             _recovering = true;
-            _recoveryWatermark = null;
+            _republishedBefore = null;
         }
 
         Note($"keep-alive perdido ({e.Status}); estado del reconector {_reconnect.State}");
@@ -389,64 +406,109 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
     }
 
     /// <summary>
-    /// Tras reconectar: lectura del registro actual (READ) y de la FIFO (PLC_FIFO). El valor actual
-    /// nunca se toma como historial: la clasificación de secuencia abre huecos contra la marca alta.
+    /// Tras reconectar, en pasos independientes (el fallo de uno no salta los demás): hora del servidor como marca
+    /// de lo recuperado; lectura del registro actual (READ), que va primero para no demorarla; Republish de los
+    /// mensajes que se perdieron en tránsito; lectura de la FIFO (PLC_FIFO). Al terminar, la recuperación termina,
+    /// llegue o no una caja. El valor actual nunca se toma como historial: la clasificación abre huecos.
     /// </summary>
     public async Task RecoverAfterReconnectAsync(CancellationToken ct)
     {
-        if (_session is not { Connected: true } session)
-        {
-            Note("recuperación omitida: sesión no conectada");
-            return;
-        }
-
         try
         {
-            // Republish: los mensajes que el servidor envió y no llegaron (perdidos en tránsito durante
-            // la interrupción) siguen disponibles en su cola de retransmisión hasta el acuse.
-            if (_subscription is { } subscription)
+            if (_session is not { Connected: true } session)
             {
-                // La lista de disponibles llega con la primera respuesta de publicación tras reconectar.
-                var waited = 0;
-                while (!(subscription.AvailableSequenceNumbers?.Any() ?? false) && waited < 3000)
-                {
-                    await Task.Delay(100, ct);
-                    waited += 100;
-                }
-
-                uint highest;
-                lock (_gate)
-                {
-                    highest = _highestSequence;
-                }
-
-                var available = subscription.AvailableSequenceNumbers?.Where(s => s > highest).Order().ToArray() ?? [];
-                Note($"Republish: disponibles sin procesar [{string.Join(",", available)}] (último procesado {highest})");
-                foreach (var seq in available)
-                {
-                    var response = await ((SessionClient)session).RepublishAsync(null, subscription.Id, seq, ct);
-                    ProcessRepublished(response.NotificationMessage);
-                }
+                Note("recuperación omitida: sesión no conectada");
+                return;
             }
 
-            var current = await session.ReadValueAsync(NodeId.Parse(_options.RecordNodeId), ct);
-            Note($"lectura tras reconectar: {current.StatusCode}");
-            Enqueue(current, Transport.Read, 0);
-            if (_options.FifoNodeId is not null)
+            try
             {
-                var fifo = await session.ReadValueAsync(NodeId.Parse(_options.FifoNodeId), ct);
-                if (StatusCode.IsGood(fifo.StatusCode) && fifo.Value is string[] pending)
+                var serverNow = await session.ReadValueAsync(VariableIds.Server_ServerStatus_CurrentTime, ct);
+                if (StatusCode.IsGood(serverNow.StatusCode) && serverNow.Value is DateTime t)
                 {
-                    foreach (var record in pending)
+                    lock (_gate)
                     {
-                        Enqueue(new DataValue(new Variant(record), fifo.StatusCode, fifo.SourceTimestamp, fifo.ServerTimestamp), Transport.PlcFifo, 0);
+                        _republishedBefore = DateTime.SpecifyKind(t, DateTimeKind.Utc);
                     }
                 }
             }
+            catch (ServiceResultException ex)
+            {
+                Note($"hora del servidor no disponible ({ex.StatusCode}): lo que llegue durante la recuperación se trata como recuperado");
+            }
+
+            try
+            {
+                var current = await session.ReadValueAsync(NodeId.Parse(_options.RecordNodeId), ct);
+                Note($"lectura tras reconectar: {current.StatusCode}");
+                Enqueue(current, Transport.Read, 0);
+            }
+            catch (ServiceResultException ex)
+            {
+                Note($"lectura del registro tras reconectar fallida: {ex.StatusCode}");
+            }
+
+            try
+            {
+                // Republish: los mensajes que el servidor envió y no llegaron siguen en su cola de retransmisión
+                // hasta el acuse. La lista llega con la primera respuesta de publicación tras reconectar.
+                if (_subscription is { } subscription)
+                {
+                    var waited = 0;
+                    while (!(subscription.AvailableSequenceNumbers?.Any() ?? false) && waited < 1000)
+                    {
+                        await Task.Delay(50, ct);
+                        waited += 50;
+                    }
+
+                    uint highest;
+                    lock (_gate)
+                    {
+                        highest = _highestSequence;
+                    }
+
+                    var available = subscription.AvailableSequenceNumbers?.Where(seq => seq > highest).Order().ToArray() ?? [];
+                    Note($"Republish: disponibles sin procesar [{string.Join(",", available)}] (último procesado {highest})");
+                    foreach (var seq in available)
+                    {
+                        var response = await ((SessionClient)session).RepublishAsync(null, subscription.Id, seq, ct);
+                        ProcessRepublished(response.NotificationMessage);
+                    }
+                }
+            }
+            catch (ServiceResultException ex)
+            {
+                Note($"Republish fallido: {ex.StatusCode}");
+            }
+
+            if (_options.FifoNodeId is not null)
+            {
+                try
+                {
+                    var fifo = await session.ReadValueAsync(NodeId.Parse(_options.FifoNodeId), ct);
+                    if (StatusCode.IsGood(fifo.StatusCode) && fifo.Value is string[] pending)
+                    {
+                        foreach (var record in pending)
+                        {
+                            Enqueue(new DataValue(new Variant(record), fifo.StatusCode, fifo.SourceTimestamp, fifo.ServerTimestamp), Transport.PlcFifo, 0);
+                        }
+                    }
+                }
+                catch (ServiceResultException ex)
+                {
+                    Note($"lectura de la FIFO fallida: {ex.StatusCode}");
+                }
+            }
         }
-        catch (ServiceResultException ex)
+        finally
         {
-            Note($"lectura tras reconectar fallida: {ex.StatusCode}");
+            lock (_gate)
+            {
+                _recovering = false;
+                _republishedBefore = null;
+            }
+
+            Note("recuperación terminada");
         }
     }
 

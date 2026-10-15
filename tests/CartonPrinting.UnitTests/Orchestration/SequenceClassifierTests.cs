@@ -28,7 +28,7 @@ public sealed class SequenceClassifierTests
         var accept = Assert.IsType<SequenceVerdict.AcceptEpoch>(c.Classify(record, TestRevisions.Revision(), T0));
         Assert.Equal((42L, PlcEpochStore.Initial), (accept.Epoch, accept.AcceptanceMode));
 
-        c.AcceptEpoch(42, T0);
+        c.AcceptEpoch(42, T0, PlcEpochStore.Initial);
         var first = Register(c.Classify(record, TestRevisions.Revision(), T0));
         Assert.Equal(SequenceCase.FirstOfEpoch, first.Case);
         Assert.Null(first.Decision.Gap);
@@ -60,7 +60,6 @@ public sealed class SequenceClassifierTests
     }
 
     [Fact]
-    [Trait("Spec", "T24")]
     public void Lower_cycle_with_a_later_timestamp_is_reset_suspected_and_blocks_the_station()
     {
         var c = WithMark(42, 5000, T0);
@@ -138,7 +137,6 @@ public sealed class SequenceClassifierTests
     }
 
     [Fact]
-    [Trait("Spec", "T01")]
     public void Known_key_with_the_same_fingerprint_is_a_duplicate_without_sql_and_collisions_do_not_move_the_mark()
     {
         var c = WithMark(42, 100, T0);
@@ -151,5 +149,43 @@ public sealed class SequenceClassifierTests
         Assert.IsType<SequenceVerdict.Register>(c.Classify(record with { WorkOrderId = "WO-OTRA" }, TestRevisions.Revision(), T0));
         c.Observe(TestRevisions.Cycle(42, 900, T0, T0), SequenceCase.Gap, RegistrationOutcome.Collision);
         Assert.Equal(101UL, c.Current!.HighWater);
+    }
+
+    [Fact]
+    [Trait("Spec", "T25")]
+    public void First_key_of_a_new_epoch_counts_the_cycles_before_it_as_a_gap_but_not_in_the_initial_epoch()
+    {
+        // Revisión de la Fase 2, M3 (SI-12, interino de falla cerrada).
+        var c = new SequenceClassifier([new EpochMark(42, T0.AddHours(-2), 5000, T0.AddMinutes(-1)), new EpochMark(43, T0, null, null, PlcEpochStore.AutoIncrementByOne)]);
+        var seventh = Register(c.Classify(TestRevisions.Cycle(43, 7, T0, T0), TestRevisions.Revision(), T0));
+        Assert.Equal((SequenceCase.Gap, 1UL, 6UL), (seventh.Case, seventh.Decision.Gap!.FromCycleId, seventh.Decision.Gap.ToCycleId));
+        Assert.Equal(SequenceCase.FirstOfEpoch, Register(c.Classify(TestRevisions.Cycle(43, 1, T0, T0), TestRevisions.Revision(), T0)).Case);
+        Assert.Equal(SequenceCase.FirstOfEpoch, Register(c.Classify(TestRevisions.Cycle(43, 0, T0, T0), TestRevisions.Revision(), T0)).Case);
+
+        var initial = new SequenceClassifier([new EpochMark(42, T0, null, null)]);
+        Assert.Equal(SequenceCase.FirstOfEpoch, Register(initial.Classify(TestRevisions.Cycle(42, 918273, T0, T0), TestRevisions.Revision(), T0)).Case);
+    }
+
+    [Fact]
+    public void A_duplicate_registered_by_another_instance_moves_the_high_water_mark()
+    {
+        // Revisión de la Fase 2, M2: con dos instancias, la otra ya registró el 702.
+        var c = WithMark(42, 701, T0);
+        var record = TestRevisions.Cycle(42, 702, T0.AddMilliseconds(300), T0);
+        c.Observe(record, SequenceCase.InOrder, RegistrationOutcome.Duplicate);
+        Assert.Equal((702UL, record.DetectionTimestamp), (c.Current!.HighWater, c.Current.HighWaterTimestamp));
+        Assert.Equal(SequenceCase.InOrder, Register(c.Classify(TestRevisions.Cycle(42, 703, T0.AddMilliseconds(600), T0), TestRevisions.Revision(), T0)).Case);
+    }
+
+    [Fact]
+    public void Cycle_ids_at_the_top_of_the_range_do_not_overflow()
+    {
+        // Revisión de la Fase 2, B2.
+        var c = WithMark(42, ulong.MaxValue, T0);
+        var five = Register(c.Classify(TestRevisions.Cycle(42, 5, null, T0), TestRevisions.Revision(), T0));
+        Assert.Equal(SequenceCase.AmbiguousDecrease, five.Case);
+        Assert.Null(five.Decision.Gap);
+        var top = WithMark(42, ulong.MaxValue - 1, T0);
+        Assert.Equal(SequenceCase.InOrder, Register(top.Classify(TestRevisions.Cycle(42, ulong.MaxValue, T0.AddSeconds(1), T0), TestRevisions.Revision(), T0)).Case);
     }
 }

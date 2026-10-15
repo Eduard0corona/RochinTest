@@ -37,6 +37,9 @@ public sealed class IngestHostOptions
 public sealed class IngestHostedService(
     IngestHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers, IErpDemand? erpDemand = null) : BackgroundService
 {
+    /// <summary>La ingesta en ejecución (para recargar épocas o reingresar registros retenidos desde la operación).</summary>
+    public StationIngestService? Service { get; private set; }
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var logger = loggers.CreateLogger<IngestHostedService>();
@@ -51,9 +54,38 @@ public sealed class IngestHostedService(
             FullMode = BoundedChannelFullMode.Wait,
         });
 
+        Service = ingest;
         await using var source = new OpcUaCycleSource(options.Opc, clock, metrics, loggers.CreateLogger<OpcUaCycleSource>());
-        var heartbeat = new LabelingReadyHeartbeat(station, stations, source, metrics, loggers.CreateLogger<LabelingReadyHeartbeat>());
-        await source.StartAsync(channel.Writer, stoppingToken);
+        long droppedSeen = 0;
+        bool Overloaded()
+        {
+            // Canal casi lleno, o notificaciones descartadas desde el latido anterior.
+            var dropped = source.DroppedNotifications;
+            var lost = dropped > droppedSeen;
+            droppedSeen = dropped;
+            return lost || channel.Reader.Count >= options.ChannelCapacity * 9 / 10;
+        }
+
+        var heartbeat = new LabelingReadyHeartbeat(station, stations, source, metrics, loggers.CreateLogger<LabelingReadyHeartbeat>(), Overloaded);
+
+        // Con el PLC inalcanzable al arrancar, se reintenta: el resto del EdgeHost (Outbox, barrido) sigue.
+        var backoff = TimeSpan.FromSeconds(1);
+        while (true)
+        {
+            try
+            {
+                await source.StartAsync(channel.Writer, stoppingToken);
+                break;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !stoppingToken.IsCancellationRequested)
+            {
+                logger.LogWarning(ex, "Ingesta de {Station}: no se pudo conectar a {Endpoint}; reintento en {Backoff}", options.StationId,
+                    options.Opc.EndpointUrl, backoff);
+                await Task.Delay(backoff, clock.TimeProvider, stoppingToken);
+                backoff = TimeSpan.FromTicks(Math.Min(backoff.Ticks * 2, TimeSpan.FromSeconds(30).Ticks));
+            }
+        }
+
         logger.LogInformation("Ingesta de {Site}/{Station} conectada a {Endpoint}", options.SiteId, options.StationId, options.Opc.EndpointUrl);
 
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);

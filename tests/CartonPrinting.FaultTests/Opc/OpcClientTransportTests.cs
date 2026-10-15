@@ -112,4 +112,75 @@ public sealed class OpcClientTransportTests
         Assert.Equal([731UL, 732UL], after.Where(n => n.Transport == Transport.PlcFifo).Select(n => LatchedRecord.Parse(n.Value!).CycleId));
         Assert.DoesNotContain(after, n => n.Transport == Transport.Subscription);
     }
+
+    /// <summary>
+    /// Revisión de la Fase 2, A1 y A2: después de reiniciar el PLC, la suscripción recreada vuelve a numerar sus
+    /// mensajes; los ciclos en vivo posteriores son SUBSCRIPTION (no REPUBLISH) y la recuperación termina sin
+    /// que pase ninguna caja (Connected vuelve a true, y con él LabelingReady).
+    /// </summary>
+    [Fact]
+    public async Task After_a_server_restart_recovery_ends_without_cycles_and_later_live_cycles_are_subscription()
+    {
+        await using var h = await OpcHarness.StartAsync("OPC-E", new EdgeClock(TimeProvider.System));
+        await h.NextAsync();   // READ inicial
+        for (ulong c = 740; c < 745; c++)
+        {
+            h.Server.Nodes.Publish(Record(c));
+            await h.CollectUntilAsync(l => l.Any(n => n.Value is { Length: > 0 } v && LatchedRecord.Parse(v).CycleId == c));
+        }
+
+        await h.RestartServerAsync();
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (!h.Client.Connected && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+
+        Assert.True(h.Client.Connected, string.Join(" | ", h.Client.ConnectionEvents));
+        await Task.Delay(500);
+        while (h.Notifications.Reader.TryRead(out _))
+        {
+            // Descarta el valor actual leído al reconectar.
+        }
+
+        var live = new List<RawNotificationDump>();
+        for (ulong c = 750; c < 755; c++)
+        {
+            h.Server.Nodes.Publish(Record(c));
+            live.AddRange((await h.CollectUntilAsync(l => l.Any(n => n.Value is { Length: > 0 } v && LatchedRecord.Parse(v).CycleId == c))).Select(Dump));
+        }
+
+        Assert.All(live.Where(n => n.Cycle >= 750), n => Assert.Equal(Transport.Subscription, n.Transport));
+    }
+
+    /// <summary>
+    /// Revisión de la Fase 2, A2: con el enlace congelado y la misma sesión reactivada, la recuperación termina
+    /// sin cajas, y el primer ciclo publicado después es SUBSCRIPTION.
+    /// </summary>
+    [Fact]
+    public async Task After_a_frozen_link_the_first_cycle_published_after_recovery_is_subscription()
+    {
+        await using var h = await OpcHarness.StartAsync("OPC-F", new EdgeClock(TimeProvider.System));
+        await h.NextAsync();
+        h.Proxy.Freeze();
+        await Task.Delay(2500);
+        h.Proxy.SeverAll();
+        h.Proxy.Resume();
+
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while ((h.Client.ReconnectCount == 0 || !h.Client.Connected) && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+
+        Assert.True(h.Client.Connected, string.Join(" | ", h.Client.ConnectionEvents));
+        await Task.Delay(300);
+        while (h.Notifications.Reader.TryRead(out _))
+        {
+        }
+
+        h.Server.Nodes.Publish(Record(760));
+        var first = (await h.CollectUntilAsync(l => l.Any(n => n.Value is { Length: > 0 } v && LatchedRecord.Parse(v).CycleId == 760))).Select(Dump).Last();
+        Assert.Equal(Transport.Subscription, first.Transport);
+    }
 }

@@ -3,8 +3,11 @@ using Microsoft.Data.SqlClient;
 
 namespace CartonPrinting.Infrastructure.Data;
 
-/// <summary>Marca alta de una época aceptada: el mayor CycleId registrado y su DetectionTimestamp latched.</summary>
-public sealed record EpochMark(long Epoch, DateTime AcceptedAt, ulong? HighWater, DateTime? HighWaterTimestamp);
+/// <summary>
+/// Marca alta de una época aceptada: el mayor CycleId registrado y su DetectionTimestamp latched, y cómo se
+/// aceptó la época (INITIAL, AUTO_INCREMENT_BY_ONE u OPERATOR_CONFIRMED).
+/// </summary>
+public sealed record EpochMark(long Epoch, DateTime AcceptedAt, ulong? HighWater, DateTime? HighWaterTimestamp, string AcceptanceMode = PlcEpochStore.Initial);
 
 /// <summary>Anomalía con su registro completo retenido para un reingreso posterior.</summary>
 public sealed record RetainedAnomaly(long AnomalyId, string AnomalyType, long PlcEpoch, ulong? CycleId, string IncomingRecord, DateTime DetectedAt);
@@ -20,7 +23,7 @@ public sealed class SequenceStore(SqlDb db)
         db.ReadAsync<IReadOnlyList<EpochMark>>(async conn =>
         {
             await using var cmd = conn.Command(null, """
-                SELECT e.PlcEpoch, e.AcceptedAt, hw.CycleId, hw.DetectionTimestamp
+                SELECT e.PlcEpoch, e.AcceptedAt, hw.CycleId, hw.DetectionTimestamp, e.AcceptanceMode
                 FROM dbo.PlcEpochHistory AS e
                 OUTER APPLY (
                     SELECT TOP (1) cd.CycleId, cd.DetectionTimestamp
@@ -35,7 +38,7 @@ public sealed class SequenceStore(SqlDb db)
             await using var r = await cmd.ExecuteReaderAsync(ct);
             while (await r.ReadAsync(ct))
             {
-                list.Add(new EpochMark(r.GetInt64(0), r.GetUtc(1), r.IsDBNull(2) ? null : r.GetCycleId(2), r.IsDBNull(3) ? null : r.GetUtc(3)));
+                list.Add(new EpochMark(r.GetInt64(0), r.GetUtc(1), r.IsDBNull(2) ? null : r.GetCycleId(2), r.IsDBNull(3) ? null : r.GetUtc(3), r.GetString(4)));
             }
 
             return list;
@@ -87,5 +90,6 @@ public sealed class SequenceStore(SqlDb db)
 
     /// <summary>true si la violación es de PK_PlcEpochHistory (la época ya la aceptó otro proceso o un reintento).</summary>
     public static bool IsEpochAlreadyAccepted(SqlException ex) =>
-        ex.Number is 2627 or 2601 && ex.Message.Contains("PK_PlcEpochHistory", StringComparison.Ordinal);
+        ex.Number is 2627 or 2601
+        && (ex.Message.Contains("PK_PlcEpochHistory", StringComparison.Ordinal) || ex.Message.Contains("UQ_PlcEpochHistory_Order", StringComparison.Ordinal));
 }

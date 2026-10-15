@@ -348,17 +348,21 @@ Las correcciones posteriores a la segunda revisión fueron el cambio de especifi
 ### Decisiones
 
 1. **TX-A sigue siendo la autoridad.** La marca alta y la caché de huellas son de la ingesta (barrera 2): evitan ir a SQL con repeticiones, pero la unicidad la decide la inserción primero. La caché solo guarda claves que este proceso registró o confirmó como duplicado; una clave con otra huella siempre va a TX-A.
-2. **Épocas.** La primera época de una estación se acepta como `INITIAL`; la actual + 1 con `AUTO_INCREMENT_BY_ONE`; lo demás es `EPOCH_UNEXPECTED`. La aceptación es una transacción propia antes de TX-A (la detección tiene FK a la época), con `FirstCycleId` = primer ciclo recibido. El primer registro de una época no abre hueco: no se sabe en qué valor arrancó el contador.
+2. **Épocas.** La primera época de una estación se acepta como `INITIAL`; la actual + 1 con `AUTO_INCREMENT_BY_ONE`; lo demás es `EPOCH_UNEXPECTED`. La aceptación es una transacción propia antes de TX-A (la detección tiene FK a la época), con `FirstCycleId` = primer ciclo recibido y un `AcceptedAt` nunca anterior al de la época actual (el orden entre épocas no retrocede con el reloj de pared). En la primera época de la estación el primer registro no abre hueco; en una época nueva, mientras OT no fije el valor de arranque del contador, los ciclos anteriores al primer registro (desde 1) son un hueco (SI-12, interino de falla cerrada). Antes de retener un registro de una época desconocida, la ingesta relee las épocas una vez: una época confirmada por una persona llega sin reiniciar.
 3. **`EPOCH_UNEXPECTED`.** Cada registro de una época no aceptada queda como su propia anomalía con el registro completo, y la estación se bloquea una vez. El reingreso exige la época ya aceptada (`CONFIRM_EPOCH`), registra el mismo registro latched con `ANOMALY_REINGEST` y conserva `ReceivedAt`, y después resuelve la anomalía con `RESOLVE_ANOMALY`. Repetirlo da un duplicado auténtico.
 4. **Tardío o reinicio.** Con `DetectionTimestamp` en el registro y en la marca alta, anterior es tardío y posterior o igual es `RESET_SUSPECTED` (la igualdad se trata como reinicio: falla cerrada). Sin alguno de los dos timestamps es `AMBIGUOUS_DECREASE`: `WARNING` y, si la clave nueva anterior también fue ambigua, `BLOCKING` con la estación bloqueada.
 5. **Rebote.** El avance mínimo plausible desde la marca alta es `(CycleId − M) × MinCycleIntervalMs`; sin `DetectionTimestamp` (o sin `MinCycleIntervalMs`) la regla no se aplica, como pide T26. Un registro con rebote que además salta ciclos abre igual su hueco (diagrama 08).
-6. **Registro incoherente.** El formato real del registro latched es una decisión de OT (OT-04). El simulador cierra el registro con un eco del `CycleId`; si el eco no coincide, el registro es incoherente y queda `BLOCKED` con `INCOHERENT_SNAPSHOT` antes que cualquier otra clasificación (D05), igual que un registro sin orden. Sin eco, la coherencia no se puede comprobar (SI-10).
+6. **Registro incoherente.** El formato real del registro latched es una decisión de OT (OT-04). El simulador cierra el registro con un eco del `CycleId`; si el eco no coincide, el registro es incoherente: no alimenta el estado de secuencia (no acepta épocas, no mueve la marca alta, no abre huecos) y queda `BLOCKED` con `INCOHERENT_SNAPSHOT` si su época ya está aceptada, o retenido con la estación bloqueada si no (falla cerrada). Sin eco, la coherencia no se puede comprobar (SI-10).
 7. **Decodificación.** Solo StatusCode Good produce un registro; vacío, mal formado o sin identidad se descarta con `opc_records_rejected_total{cause,transport}` y nunca llega a TX-A.
-8. **`LabelingReady`** = estación habilitada y OPC conectado; baja si no se puede leer SQL y al detener el servicio.
+8. **`LabelingReady`** = estación habilitada, OPC conectado con la recuperación terminada y el canal de la ingesta sin saturar (o sin notificaciones descartadas desde el latido anterior); baja si no se puede leer SQL y al detener el servicio. La recuperación tras reconectar termina cuando terminan sus lecturas, no cuando pasa una caja.
 9. **G03 en la ingesta.** Mientras no existe el barrido completo de la Fase 3, el servicio alojado cierra los huecos vencidos cada `GapSweepIntervalMs` y mide `cycles_unobserved_total` y `sequence_gaps_open`.
 10. **El consumidor no salta registros.** Si TX-A falla con un error que no es de identidad ni 1205, el servicio se detiene: la disponibilidad cede ante la consistencia.
 11. **Pruebas de T45 por transporte.** La clasificación del transporte la prueba `OpcClientTransportTests` contra el servidor simulado (primera notificación, Republish tras congelar el enlace, Overflow, reinicio con lectura y FIFO); la regla de plazo por transporte se prueba con registros de cada transporte en la ingesta, más un recorrido completo por OPC (primera notificación tras reiniciar el servidor).
 12. **Precondición de T24 en bloque.** Los 5000 ciclos registrados se cargan con `SqlBulkCopy` (con `FireTriggers` y `CheckConstraints`) y pasan a `EXPIRED` por D04; la inyección (5200 entregas) pasa completa por la ingesta y TX-A.
+
+13. **Transporte tras reconectar.** Una suscripción recreada (reinicio del PLC, sesión nueva o suscripción vencida) vuelve a numerar sus mensajes: el cliente lleva el número de secuencia por suscripción y la primera notificación de la nueva es `READ`. Durante la recuperación, un cambio que el servidor registró antes de la reconexión (por su `ServerTimestamp` frente a la hora del servidor al reconectar) es `REPUBLISH` aunque viaje en un mensaje nuevo; uno posterior es `SUBSCRIPTION`. La recuperación hace, en pasos independientes: hora del servidor, lectura del registro actual, Republish de lo perdido en tránsito y FIFO.
+14. **Dos instancias.** Un duplicado auténtico también mueve la marca alta (la detección existe), como al reconstruir el estado desde SQL.
+15. **Arranque sin PLC.** El servicio alojado reintenta la conexión con espera exponencial en lugar de detener el EdgeHost.
 
 ### Comandos y resultados
 
@@ -389,9 +393,51 @@ Durante el desarrollo:
 
 - **T11, T13, T24, T25, T26, T30, T35 y T45: PASA** (detalle en `docs/TEST_STATUS.md`).
 
+### Revisión independiente
+
+Subagente `revisor-adversarial` sobre una copia limpia de `3ab9802` (2026-10-14). Ejecutó la compuerta (155, 80 y 20 pruebas en verde) y diez experimentos propios con el cliente OPC UA real contra el PLC simulado y SQL Server real. 2 ALTA, 4 MEDIA y 9 BAJA:
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| A1: tras reiniciar el PLC, los ciclos en vivo quedaban `REPUBLISH` hasta que la secuencia nueva superaba a la vieja | Alta | Número de secuencia por suscripción y primera notificación `READ` al recrearla (decisión 13). Prueba: ciclos en vivo después de `RestartServerAsync` son `SUBSCRIPTION` |
+| A2: tras una reconexión, `Connected` (y `LabelingReady`) seguía en false hasta que pasara una caja | Alta | La recuperación termina al terminar sus pasos; marca por `ServerTimestamp` (decisión 13). Pruebas: recuperación sin cajas tras reiniciar el PLC y tras congelar el enlace; el primer ciclo posterior es `SUBSCRIPTION` |
+| M1: una época confirmada no llegaba a la ingesta en ejecución; `ReloadAsync` fuera de la serialización | Media | Recarga bajo el semáforo del consumidor y relectura antes de retener (decisión 2); el servicio alojado expone la ingesta. Prueba `A_confirmed_epoch_reaches_the_running_ingest` |
+| M2: con dos EdgeHost, huecos espurios y cajas en vivo vencidas | Media | Decisión 14. Prueba `Two_instances_on_one_station_do_not_open_spurious_gaps` |
+| M3: el primer registro de una época nueva nunca abría hueco (interpretación no registrada) | Media | SI-12 (clase B) con interino de falla cerrada; prueba unitaria |
+| M4: el canal lleno no bajaba `LabelingReady` | Media | Decisión 8. Prueba `A_saturated_channel_lowers_labeling_ready` |
+| B1: un registro incoherente alimentaba el estado de secuencia | Baja | Decisión 6. Prueba `An_incoherent_record_does_not_feed_the_sequence_state` |
+| B2: desborde de `ulong` en la marca alta | Baja | Comparaciones sin desborde; prueba unitaria |
+| B3: un fallo del Republish saltaba la lectura y la FIFO; la lectura se demoraba 3 s | Baja | Pasos independientes; la lectura va primero |
+| B4: `AcceptedAt` del reloj de pared y `UQ_PlcEpochHistory_Order` sin reconocer | Baja | Decisión 2; la violación de `UQ_PlcEpochHistory_Order` recarga las épocas |
+| B5: sin PLC al arrancar, el servicio alojado detenía el EdgeHost | Baja | Decisión 15 |
+| B6: `plc_epoch_changes_total` contaba `INITIAL` y no `OPERATOR_CONFIRMED` | Baja | Corregido (la confirmada se cuenta al recargar) |
+| B7: el monitored item se asignaba después de crearlo | Baja | Se asigna antes |
+| B8: pruebas más débiles que su texto (reingreso duplicado no ejercitado, precondición de T24 escrita a mano y sin jobs, Traits de T24 y T01 en pruebas que no lo son, T11 reiniciando el PLC, RESET_SUSPECTED y AMBIGUOUS_DECREASE BLOCKING sin prueba contra SQL) | Baja | T25 reingresa de verdad (duplicado) y prueba el rechazo posterior; T24 registra su precondición por TX-A, con 5000 jobs que no se reutilizan, y comprueba que la estación la bloqueó la primera colisión; Traits corregidos; T11 desconecta el gateway (enlace congelado más que la sesión); prueba de RESET_SUSPECTED y AMBIGUOUS_DECREASE BLOCKING contra SQL. En T45, el `READ` del recorrido por OPC puede salir de la primera notificación o de la lectura de recuperación: las dos son `READ` por diseño |
+| B9: clasificación de SI-10 y SI-11; afirmaciones de T24 y T11 sin verificar; lista de lo no verificado incompleta | Baja | SI-10 es clase B (regla 6 de `AI_CONTEXT`); SI-11 es clase A y su edición queda pendiente de aprobación; las afirmaciones ahora se verifican; lista ampliada |
+
+Compuerta completa después de las correcciones, 2026-10-14 22:48 (`powershell -File build/ci.ps1`):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   158, Omitido:     0, Total:   158, Duración: 19 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    80, Omitido:     0, Total:    80, Duración: 1 m 57 s - CartonPrinting.IntegrationTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    27, Omitido:     0, Total:    27, Duración: 3 m 20 s - CartonPrinting.FaultTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 62 ejecutadas
+  Fase 2: T11=1 destino(s), 1 ejecutadas, T13=3 destino(s), 3 ejecutadas, T24=1 destino(s), 1 ejecutadas, T25=6 destino(s), 8 ejecutadas, T26=2 destino(s), 3 ejecutadas, T30=2 destino(s), 3 ejecutadas, T35=2 destino(s), 2 ejecutadas, T45=4 destino(s), 11 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
 ### Lo que no se verificó
 
 - Ningún PLC real: el servidor OPC UA es el simulador. El formato del registro latched, el eco de cierre y la FIFO son del simulador (OT-04, OT-14).
+- La clasificación del transporte tras reconectar se probó con el servidor de OPC Foundation (reinicio, enlace congelado, sesión vencida); otros servidores pueden numerar o sellar distinto.
+- Dos instancias se probaron con dos consumidores en un proceso, no con dos EdgeHost reales (la Fase 5 agrega la propiedad de la impresora).
+- El flujo `REQUIRE_CONFIRMATION` de punta a punta en el EdgeHost necesita la Operations API (Fase 5); aquí se probó con la ingesta y las acciones manuales de TX-M.
 - Seguridad OPC UA: las pruebas usan `SecurityMode = None` contra el simulador; `SignAndEncrypt` con certificados de planta no se probó.
 - Un solo `IngestHostedService` por proceso (una estación); varias estaciones por EdgeHost no se probaron.
 - Los intervalos revisados por el servidor y el bit Overflow se observaron solo con el servidor de OPC Foundation.
