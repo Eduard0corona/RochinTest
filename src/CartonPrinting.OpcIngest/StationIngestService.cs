@@ -55,13 +55,16 @@ public sealed class StationIngestService
     private readonly CartonMetrics _metrics;
     private readonly ILogger _logger;
     private readonly CycleDecoder _decoder;
+    private readonly IErpDemand? _erpDemand;
     private readonly SemaphoreSlim _serial = new(1, 1);
     private SequenceClassifier _classifier = new([]);
 
     public StationIngestService(
         StationSettings station, RegistrationService registration, StationConfigStore stations, PlcEpochStore epochs, SequenceStore sequence,
-        TxsSweep sweep, TxmManualActions manual, EdgeClock clock, CartonMetrics metrics, ILogger<StationIngestService>? logger = null)
+        TxsSweep sweep, TxmManualActions manual, EdgeClock clock, CartonMetrics metrics, ILogger<StationIngestService>? logger = null,
+        IErpDemand? erpDemand = null)
     {
+        _erpDemand = erpDemand;
         _station = station;
         _registration = registration;
         _stations = stations;
@@ -154,6 +157,7 @@ public sealed class StationIngestService
 
         var (state, revision) = await _stations.GetActiveAsync(_station.SiteId, _station.StationId, ct)
             ?? throw new InvalidOperationException($"La estación {_station.SiteId}/{_station.StationId} no tiene StationConfig.");
+        await CheckClockSkewAsync(record, state, revision, ct);
 
         // Un registro incoherente (campos de ciclos distintos) pasa por la misma clasificación con dos límites: no
         // acepta épocas (SI-13) y su hora no decide nada. Queda BLOCKED con INCOHERENT_SNAPSHOT y su CycleId mueve
@@ -194,6 +198,11 @@ public sealed class StationIngestService
                 case SequenceVerdict.Register register:
                     var result = await _registration.RegisterAsync(record, _station, revision, register.Decision, ct);
                     _classifier.Observe(record, register.Case, result);
+                    if (result.FinalStatus == DetectionStatus.WaitingErp && record.WorkOrderId is { } workOrder)
+                    {
+                        _erpDemand?.WorkOrderNeeded(workOrder);
+                    }
+
                     if (register.Case == SequenceCase.Late && result.Outcome == RegistrationOutcome.Registered)
                     {
                         _metrics.Increment(MetricNames.OutOfOrderDetections, ("transport", record.Transport));
@@ -205,6 +214,30 @@ public sealed class StationIngestService
                 default:
                     throw new UnreachableException(verdict.GetType().Name);
             }
+        }
+    }
+
+    /// <summary>
+    /// CLOCK_SKEW (sección 10.1): con PLC_TIMESTAMP, un DetectionTimestamp posterior a la recepción en el
+    /// EdgeHost es un límite inferior del adelanto del reloj del PLC (la latencia solo lo achica). Si supera
+    /// ClockSkewToleranceMs, la estación se bloquea antes de registrar el ciclo, de modo que ningún job se
+    /// crea con un plazo calculado con ese reloj; el ciclo queda BLOCKED con STATION_DISABLED. Un reloj del
+    /// PLC atrasado acorta los plazos (es restrictivo) y no se puede separar de la latencia: no se detecta.
+    /// </summary>
+    private async Task CheckClockSkewAsync(CycleRecord record, StationState state, StationRevision revision, CancellationToken ct)
+    {
+        if (revision.DeadlineReference != DeadlineReference.PlcTimestamp || record.DetectionTimestamp is not { } ts)
+        {
+            return;
+        }
+
+        var aheadMs = (CanonicalTimestamp.Truncate(ts) - CanonicalTimestamp.Truncate(record.ReceivedAt)).TotalMilliseconds;
+        _metrics.Record(MetricNames.ClockSkewMs, aheadMs, ("station", record.StationId));
+        if (revision.ClockSkewToleranceMs is { } tolerance && aheadMs > tolerance && state.LabelingEnabled)
+        {
+            await _stations.BlockAsync(record.SiteId, record.StationId, BlockReason.ClockSkew, "SYSTEM", null, _clock.UtcNow, ct);
+            _logger.LogError("Reloj del PLC adelantado al menos {Ahead} ms en {Station} (tolerancia {Tolerance} ms): estación bloqueada con CLOCK_SKEW",
+                aheadMs, record.StationId, tolerance);
         }
     }
 

@@ -2,6 +2,17 @@
 
 Cambios de la implementación. Los de la especificación están en `spec/CHANGELOG.md`.
 
+## Fase 3 · ERP y plazo (2026-10-14)
+
+- ERP simulado por HTTP (retraso, 503, sin respuesta); `HttpErpClient` con validación del snapshot; `ErpSnapshotSync` con señal de la ingesta, timeout y circuit breaker (Polly) y caché.
+- `ErpArrivalService` (D06 y D08 por TX-E con plazo y margen efectivos); D07 en el barrido.
+- `StationSweepService` (TX-S por estación) y `ClockGuard` (`CLOCK_JUMP`) en el barrido y en el claim; `CLOCK_SKEW` en la ingesta.
+- EdgeHost: sincronización ERP y barrido por estación.
+- Pruebas: T03, T04, T17, T18, T21, T33, T37 y T46 en verde.
+- Correcciones de la revisión independiente: el salto del reloj se retiene hasta confirmar el bloqueo; el barrido usa el plazo efectivo (SI-14); J13 con su propia guarda; el job se arma con la fila de la caché y TX-E comprueba su contenido; validación del snapshot truncada y con largos; la revisión activa se exige en TX-B, TX-E y el barrido; T03 comprueba que la ingesta no espera al ERP.
+- Registrados SI-14 (sentencias de referencia del barrido con el plazo congelado) y SI-15 (límites de `CLOCK_SKEW`).
+- Segunda revisión: SI-16, decidido por la persona (al confirmar un `CLOCK_JUMP` vence lo pendiente, y el salto solo se confirma con ese bloqueo vigente); revisión obligatoria en el claim; TX-E sin `UPDLOCK`.
+
 ## Fase 2 · Ingesta OPC simulada (2026-10-14)
 
 - PLC simulado como servidor OPC UA en proceso (registro latched con eco de cierre, FIFO, `LabelingReady`, `PrintWindowCycleId`) y proxy TCP para inyectar fallas.

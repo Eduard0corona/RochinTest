@@ -24,6 +24,7 @@
     <ProjectReference Include="..\..\src\CartonPrinting.Outbox\CartonPrinting.Outbox.csproj" />
     <ProjectReference Include="..\..\src\CartonPrinting.Simulators\CartonPrinting.Simulators.csproj" />
     <ProjectReference Include="..\..\src\CartonPrinting.OpcIngest\CartonPrinting.OpcIngest.csproj" />
+    <ProjectReference Include="..\..\src\CartonPrinting.ErpSync\CartonPrinting.ErpSync.csproj" />
   </ItemGroup>
 
   <ItemGroup>

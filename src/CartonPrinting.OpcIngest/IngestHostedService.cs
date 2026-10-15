@@ -25,16 +25,17 @@ public sealed class IngestHostOptions
 
     public int LabelingReadyIntervalMs { get; set; } = 500;
 
-    public int GapSweepIntervalMs { get; set; } = 1_000;
+    /// <summary>Intervalo del barrido TX-S de la estación (cierre de vencidos, huecos y ventanas de evidencia).</summary>
+    public int SweepIntervalMs { get; set; } = 200;
 }
 
 /// <summary>
 /// Ingesta de una estación como servicio alojado: cliente OPC UA, consumidor del canal (clasificación y
-/// TX-A), latido LabelingReady y cierre de huecos vencidos (G03). Si el consumidor falla, el servicio se
-/// detiene en lugar de saltarse registros.
+/// TX-A) y latido LabelingReady. Los huecos vencidos (G03) los cierra el barrido de la estación. Si el
+/// consumidor falla, el servicio se detiene en lugar de saltarse registros.
 /// </summary>
 public sealed class IngestHostedService(
-    IngestHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers) : BackgroundService
+    IngestHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers, IErpDemand? erpDemand = null) : BackgroundService
 {
     /// <summary>La ingesta en ejecución (para recargar épocas o reingresar registros retenidos desde la operación).</summary>
     public StationIngestService? Service { get; private set; }
@@ -46,7 +47,7 @@ public sealed class IngestHostedService(
         var stations = new StationConfigStore(db);
         var registration = new RegistrationService(new TxaRegisterDetection(db), new ErpCacheStore(db), new LabelSerialSource(db), clock, metrics);
         var ingest = new StationIngestService(station, registration, stations, new PlcEpochStore(db), new SequenceStore(db), new TxsSweep(db),
-            new TxmManualActions(db), clock, metrics, loggers.CreateLogger<StationIngestService>());
+            new TxmManualActions(db), clock, metrics, loggers.CreateLogger<StationIngestService>(), erpDemand);
         var channel = Channel.CreateBounded<RawNotification>(new BoundedChannelOptions(options.ChannelCapacity)
         {
             SingleReader = true,
@@ -84,7 +85,6 @@ public sealed class IngestHostedService(
         {
             ingest.RunAsync(channel.Reader, linked.Token),
             heartbeat.RunAsync(TimeSpan.FromMilliseconds(options.LabelingReadyIntervalMs), clock.TimeProvider, linked.Token),
-            SweepGapsAsync(ingest, logger, linked.Token),
         };
         await Task.WhenAny(tasks);
         await linked.CancelAsync();
@@ -102,22 +102,5 @@ public sealed class IngestHostedService(
             throw;
         }
 
-    }
-
-    private async Task SweepGapsAsync(StationIngestService ingest, ILogger logger, CancellationToken ct)
-    {
-        while (!ct.IsCancellationRequested)
-        {
-            try
-            {
-                await ingest.SweepGapsAsync(ct);
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                logger.LogWarning(ex, "Cierre de huecos de {Station} fallido; se reintenta", options.StationId);
-            }
-
-            await Task.Delay(TimeSpan.FromMilliseconds(options.GapSweepIntervalMs), clock.TimeProvider, ct);
-        }
     }
 }

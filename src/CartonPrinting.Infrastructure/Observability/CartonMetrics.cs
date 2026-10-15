@@ -105,6 +105,7 @@ public static class MetricNames
     public const string CyclesUnobserved = "cycles_unobserved_total";
     public const string OpcReconnect = "opc_reconnect_total";
     public const string OpcRecordsRejected = "opc_records_rejected_total";
+    public const string ErpRequests = "erp_requests_total";
     public const string OutOfOrderDetections = "out_of_order_detections_total";
     public const string PresendCheckRejected = "presend_check_rejected_total";
     public const string EvidenceWindowElapsed = "evidence_window_elapsed_total";
@@ -118,6 +119,7 @@ public static class MetricNames
 
     public const string OpcCallbackDurationMs = "opc_callback_duration_ms";
     public const string ErpSnapshotWaitMs = "erp_snapshot_wait_ms";
+    public const string ErpRequestMs = "erp_request_ms";
     public const string SendToVerifiedMs = "send_to_verified_ms";
     public const string PresendCheckToWriteMs = "presend_check_to_write_ms";
     public const string SendToPrintedMs = "send_to_printed_ms";

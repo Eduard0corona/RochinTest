@@ -20,6 +20,9 @@ Clasificación de `CLAUDE.md`:
 | SI-11 | A | 2 | `spec/tests/test-catalog.json` (T11) | Resuelto: edición aprobada y aplicada en `8798b85` (spec 1.1.4) |
 | SI-12 | B (vacío) | 2 | `DOCUMENTO_PRINCIPAL.md` sección 9.2 ("marca alta reiniciada") | Abierto (OT-04): la persona decidió mantener el interino de falla cerrada |
 | SI-13 | B (vacío) | 2 | `DOCUMENTO_PRINCIPAL.md` secciones 4 y 9.2, ADR 0001 (registro incoherente frente a la secuencia) | Abierto: la persona decidió mantener el interino de falla cerrada |
+| SI-14 | B (contradicción entre fuentes) | 3 | `spec/database/sqlserver_operations_reference.sql` (J03, J14 y D07 en TX-S) frente a `contracts/state-machine.json` | Abierto: la persona decidió mantener el plazo efectivo (gana la máquina de estados) |
+| SI-15 | B (vacío) | 3 | `DOCUMENTO_PRINCIPAL.md` sección 10.2 (`CLOCK_SKEW`) | Abierto (OT): la persona decidió mantener el interino y declararlo |
+| SI-16 | B (vacío) | 3 | `DOCUMENTO_PRINCIPAL.md` secciones 10.2 y 645; `docs/ESTRATEGIA_RECUPERACION.md` (trabajo pendiente tras `CLOCK_JUMP`) | Resuelto por decisión de la persona: lo pendiente vence al confirmar el salto |
 
 ## SI-01 · Rango de códigos de error en el criterio de T47
 
@@ -117,4 +120,40 @@ Clasificación de `CLAUDE.md`:
   - Por debajo de la marca no tiene efecto de secuencia ni corta la racha de descensos ambiguos.
 - **Por qué clase B.** Usar `EPOCH_UNEXPECTED` para una época que la política aceptaría, y elegir qué hora vale para la marca alta, son decisiones de comportamiento.
 - **Decisión de la persona (2026-10-14).** Mantener el interino.
+
+## SI-14 · Las sentencias de referencia del barrido usan el plazo congelado
+
+- **Contradicción.** En `contracts/state-machine.json`, las guardas de J03, J14 y J13 piden el plazo efectivo vigente con margen (el menor entre el congelado y el recalculado con la revisión activa; sección 10.1). D07 pide el plazo efectivo vencido. En cambio, las sentencias de TX-S de `database/sqlserver_operations_reference.sql` comparan `pj.DeadlineAt` y `cd.DeadlineAt`, que son los plazos congelados.
+- **Evidencia (revisión de la Fase 3, EXP2).** Con un job en `RETRY_WAIT` y una revisión nueva que acorta el presupuesto de tránsito, el barrido devolvía el job a `READY` con el plazo efectivo vencido. El claim (J02) sí usaba el plazo efectivo, así que el envío seguía protegido.
+- **Qué hace la implementación.** Gana la máquina de estados. El barrido calcula en el EdgeHost el plazo y el margen efectivos de cada job y de cada detección pendiente, con `DeadlinePolicy.Effective` y el mayor de los dos márgenes, los mismos que usan el claim y TX-E. Después los aplica por fila con las guardas en SQL: plazo congelado o efectivo vencido, y revisión activa sin cambios.
+  - Las sentencias de referencia se conservan para sus pruebas.
+  - J13 no tiene sentencia de referencia: su guarda exige vigentes ambos plazos.
+- **Por qué clase B.** Corregir la sentencia de referencia cambia el comportamiento de TX-S en la especificación. Pendiente de la persona: que la referencia recalcule el plazo efectivo en SQL, o que se declare que esas sentencias son solo el piso.
+- **Decisión de la persona (2026-10-15).** Mantener el plazo efectivo en el barrido. SI-14 sigue abierto para corregir la referencia en una versión futura de la especificación.
+
+## SI-15 · Límites de la detección de `CLOCK_SKEW`
+
+- **Vacío.** La sección 10.2 pide bloquear la estación si el reloj del PLC diverge más que `ClockSkewToleranceMs`, pero el gateway solo observa `DetectionTimestamp − ReceivedAt`. Esa diferencia incluye la latencia de subida, que no se conoce.
+  - Un PLC adelantado se detecta solo cuando el adelanto supera la tolerancia más esa latencia. Un adelanto entre la tolerancia y "tolerancia + latencia" no se detecta, y el plazo queda hasta esa latencia más permisivo de lo que absorbe la fórmula.
+  - Un PLC atrasado no se distingue de la latencia. Acorta los plazos (es restrictivo) y las cajas se publican como `LATE_ARRIVAL`, que no es el motivo real.
+- **Comportamiento interino.** Se bloquea con `CLOCK_SKEW` solo si `DetectionTimestamp − ReceivedAt` supera la tolerancia (adelanto demostrado). Un PLC atrasado no se detecta. Ambos límites están declarados en el registro de la Fase 3.
+- **Por qué clase B.** Detectar el atraso (por ejemplo, con una lectura de la hora del PLC por OPC UA, `ServerTimestamp` frente a `SourceTimestamp`) o publicar otro motivo cambia comportamiento y depende de OT. Pendiente de la persona.
+- **Decisión de la persona (2026-10-15).** Mantener el interino y declararlo; queda abierto para OT.
+
+## SI-16 · Trabajo pendiente a través de un `CLOCK_JUMP`
+
+- **Vacío.** La sección 10.2 y la fila "Salto del reloj del EdgeHost" (línea 645) piden no evaluar plazos con el reloj saltado. `ESTRATEGIA_RECUPERACION.md` dice que lo pendiente queda "sin enviar hasta el desbloqueo". Ninguna de las dos fuentes dice qué pasa con ese trabajo después, aunque sus plazos se calcularon con un reloj que ya no es confiable.
+- **Evidencia (segunda revisión de la Fase 3, EXP1).**
+  1. El reloj de pared retrocede 1 h y la estación se bloquea con `CLOCK_JUMP`.
+  2. Pasan 5 min reales y una persona desbloquea.
+  3. Un claim acepta un job 5 min después de su plazo real (I04).
+- **EXP2.** Con la estación ya bloqueada por otro motivo, el salto no quedaba registrado en SQL y se daba por confirmado.
+- **Decisión de la persona (2026-10-15): lo pendiente vence al confirmar el salto.** La transacción que registra el salto (`TxsSweep.ClockJumpAsync`) hace, en una sola transacción:
+  - bloquea la estación con `CLOCK_JUMP`;
+  - vence los jobs `READY` y `RETRY_WAIT` con `DEADLINE_PASSED` (J03, J14);
+  - pasa las detecciones `WAITING_ERP` a `BLOCKED` con `STATION_DISABLED` (D08);
+  - publica sus resultados.
+
+  Nada anterior al salto se imprime. El salto solo se da por confirmado cuando el bloqueo vigente es `CLOCK_JUMP`. Con otro bloqueo vigente se vence lo pendiente y el salto se retiene; al levantarse ese bloqueo, la estación queda bloqueada con `CLOCK_JUMP`.
+- **Costo aceptado.** Un job vence con `DEADLINE_PASSED` aunque su plazo real no haya pasado: falla cerrada, como el `UNKNOWN` del reinicio.
 

@@ -97,6 +97,23 @@ public sealed class ErpCacheStore(SqlDb db)
             return (int)(await cmd.ExecuteScalarAsync(ct))! == 1;
         }, ct);
 
+    /// <summary>La fila guardada de una revisión concreta (válida o no).</summary>
+    public Task<ErpSnapshot?> GetRevisionAsync(string workOrderId, string revision, CancellationToken ct) =>
+        db.ReadAsync(async conn =>
+        {
+            await using var cmd = conn.Command(null, """
+                SELECT WorkOrderId, Revision, ProductId, LotId, Gtin, ValidFrom, ValidUntil, ReceivedAt, SourceHash
+                FROM dbo.ErpWorkOrderCache
+                WHERE WorkOrderId = @wo AND Revision = @rev
+                """);
+            cmd.NVarChar("@wo", workOrderId, 128).NVarChar("@rev", revision, 64);
+            await using var r = await cmd.ExecuteReaderAsync(ct);
+            return await r.ReadAsync(ct)
+                ? new ErpSnapshot(r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3), r.GetNullableString(4),
+                    r.GetUtc(5), r.GetUtc(6), r.GetUtc(7), r.GetBytes32(8))
+                : null;
+        }, ct);
+
     /// <summary>El snapshot válido más reciente para la orden en el instante del EdgeHost.</summary>
     public Task<ErpSnapshot?> FindValidAsync(string workOrderId, DateTime edgeNowUtc, CancellationToken ct) =>
         db.ReadAsync(conn => FindValidAsync(conn, null, workOrderId, edgeNowUtc, ct), ct);
@@ -117,7 +134,10 @@ public sealed class ErpCacheStore(SqlDb db)
             : null;
     }
 
-    /// <summary>Comprueba dentro de una transacción que una revisión concreta sigue siendo válida.</summary>
+    /// <summary>
+    /// Comprueba dentro de una transacción que una revisión concreta sigue siendo válida. Para TX-A, que arma el job
+    /// con la fila que acaba de leer de la caché (las filas solo se insertan, nunca cambian).
+    /// </summary>
     public static async Task<bool> IsRevisionValidAsync(SqlConnection conn, SqlTransaction tx, string workOrderId, string revision, DateTime edgeNowUtc, CancellationToken ct)
     {
         await using var cmd = conn.Command(tx, """
@@ -125,6 +145,26 @@ public sealed class ErpCacheStore(SqlDb db)
             WHERE WorkOrderId = @wo AND Revision = @rev AND ValidFrom <= @now AND ValidUntil > @now
             """);
         cmd.NVarChar("@wo", workOrderId, 128).NVarChar("@rev", revision, 64).DateTime2("@now", edgeNowUtc);
+        return (int)(await cmd.ExecuteScalarAsync(ct))! == 1;
+    }
+
+    /// <summary>
+    /// Comprueba dentro de una transacción que una revisión concreta sigue siendo válida y que su fila tiene el
+    /// contenido con que se armó la etiqueta (producto, lote y GTIN): el job referencia esa fila (FK_PrintJob_Erp) y
+    /// no puede llevar otro contenido (I10).
+    /// </summary>
+    public static async Task<bool> IsRevisionValidAsync(
+        SqlConnection conn, SqlTransaction tx, string workOrderId, string revision, string productId, string lotId, string? gtin, DateTime edgeNowUtc,
+        CancellationToken ct)
+    {
+        await using var cmd = conn.Command(tx, """
+            SELECT COUNT(*) FROM dbo.ErpWorkOrderCache
+            WHERE WorkOrderId = @wo AND Revision = @rev AND ValidFrom <= @now AND ValidUntil > @now
+              AND ProductId = @product AND LotId = @lot AND ISNULL(Gtin, '') = ISNULL(@gtin, '')
+            """);
+        cmd.NVarChar("@wo", workOrderId, 128).NVarChar("@rev", revision, 64).DateTime2("@now", edgeNowUtc)
+            .NVarChar("@product", productId, 128).NVarChar("@lot", lotId, 128);
+        cmd.Parameters.Add(new SqlParameter("@gtin", System.Data.SqlDbType.Char, 14) { Value = (object?)gtin ?? DBNull.Value });
         return (int)(await cmd.ExecuteScalarAsync(ct))! == 1;
     }
 }

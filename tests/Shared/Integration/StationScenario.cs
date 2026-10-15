@@ -25,11 +25,11 @@ public sealed class StationScenario
     public const string WorkOrder = "WO-2026-4815";
     public static readonly DateTime Start = new(2026, 10, 12, 18, 4, 11, 200, DateTimeKind.Utc);
 
-    private StationScenario(TestDatabase db, string stationId, FakeTimeProvider time)
+    private StationScenario(TestDatabase db, string stationId, TimeProvider time)
     {
         Db = db;
         StationId = stationId;
-        Time = time;
+        Provider = time;
         Clock = new EdgeClock(time);
         Sql = new SqlDb(new DatabaseOptions { ConnectionString = db.AppConnectionString });
         Metrics = new CartonMetrics();
@@ -49,7 +49,7 @@ public sealed class StationScenario
         Leases = new PrinterLeaseStore(Sql);
         Serials = new LabelSerialSource(Sql);
         Registration = new RegistrationService(Txa, Erp, Serials, Clock, Metrics);
-        Claims = new ClaimService(Sql, Txb, Metrics, Clock);
+        Claims = new ClaimService(Sql, Txb, Metrics, Clock, new ClockGuard(Clock));
     }
 
     public TestDatabase Db { get; }
@@ -57,7 +57,10 @@ public sealed class StationScenario
     public string PrinterId => $"PRN-{StationId}";
     public string ManualPrinterId => $"PRN-MAN-{StationId}";
     public string OwnerInstanceId { get; } = "edge-test-" + Guid.NewGuid().ToString("N")[..8];
-    public FakeTimeProvider Time { get; }
+    /// <summary>Reloj manual del escenario; las pruebas con reloj real (ERP con latencia real) no lo tienen.</summary>
+    public FakeTimeProvider Time => Provider as FakeTimeProvider ?? throw new InvalidOperationException("El escenario usa el reloj real.");
+
+    public TimeProvider Provider { get; }
     public EdgeClock Clock { get; }
     public SqlDb Sql { get; }
     public CartonMetrics Metrics { get; }
@@ -118,11 +121,12 @@ public sealed class StationScenario
     };
 
     /// <summary>Crea una estación nueva con su revisión (por defecto PLC_TIMESTAMP y nivel PRINTED).</summary>
-    public static async Task<StationScenario> CreateAsync(TestDatabase db, Func<StationRevision, StationRevision>? configure = null, CancellationToken ct = default)
+    public static async Task<StationScenario> CreateAsync(TestDatabase db, Func<StationRevision, StationRevision>? configure = null, CancellationToken ct = default,
+        TimeProvider? time = null)
     {
         var n = Interlocked.Increment(ref _counter);
         var stationId = $"L{n:D3}-{Guid.NewGuid().ToString("N")[..4]}";
-        var s = new StationScenario(db, stationId, new FakeTimeProvider(Start.AddMinutes(n)));
+        var s = new StationScenario(db, stationId, time ?? new FakeTimeProvider(Start.AddMinutes(n)));
         s.SerialPrefix = $"P01L{n:D3}";
         var revision = DefaultRevision(stationId);
         s.Revision = await s.Stations.ActivateRevisionAsync(configure is null ? revision : configure(revision), ct);

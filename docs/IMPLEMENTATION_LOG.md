@@ -495,3 +495,163 @@ Sin hallazgos ALTA en la segunda revisión: no se pide una tercera.
 - T24 a escala completa tarda unos 2,5 minutos (5200 entregas reales contra SQL).
 - La caché de huellas es de 4096 claves: una repetición más vieja va a TX-A, que la resuelve igual.
 
+## Fase 3 · ERP y plazo (T03, T04, T17, T18, T21, T33, T37, T46)
+
+### Plan
+
+- **Entregables:** sincronización ERP asíncrona con timeout y circuit breaker y un ERP simulado con latencia y caídas; `WAITING_ERP` y TX-E (D06, D08); plazo y margen efectivos (congelado frente a revisión activa) con `DeviceLeadTimeMs`; detector de saltos del reloj (`CLOCK_JUMP`) y desfase del PLC (`CLOCK_SKEW`); barrido TX-S por estación; configuración versionada activada por dos personas.
+- **Pruebas que la cierran:** T03, T04, T17, T18, T21, T33, T37 y T46.
+- **Riesgos previstos:** pruebas sensibles a la latencia real (ERP lento); simular un ajuste de NTP sin un reloj controlable.
+
+### Lo hecho
+
+- **Simulador** (`CartonPrinting.Simulators/Erp`): ERP HTTP en proceso (solo 127.0.0.1) con retraso, 503 y conexión sin respuesta.
+- **ERP** (`CartonPrinting.ErpSync`): `HttpErpClient` (valida el snapshot: campos, vigencia, GTIN de 14 dígitos, orden pedida; nunca usa uno no validado, I10), `ErpSnapshotSync` (sondeo con señal de la ingesta por `System.Threading.Channels`, Polly con timeout y circuit breaker, caché, `erp_cache_age_seconds`).
+- **Orquestación**: `ErpArrivalService` (plazo y margen efectivos, serial y payload antes de TX-E; sin serial si el plazo ya venció), `StationSweepService` (TX-S por estación con la comprobación del reloj antes de evaluar, `config_revision_active`), `IErpDemand`.
+- **Reloj**: `ClockGuard` (divergencia entre `UtcNow` y el monotónico), compartido por el barrido y el claim de la estación; `CLOCK_SKEW` en la ingesta con `PLC_TIMESTAMP`.
+- **EdgeHost**: servicios por estación (ERP y barrido) y señal de la ingesta al ERP.
+
+### Decisiones
+
+1. **Contrato con el ERP.** El del simulador (GET JSON por orden); el real es una decisión de integración y queda detrás de `IErpClient`. Un 404 es "sin snapshot"; un error, un timeout o un snapshot inválido son "ERP no disponible".
+2. **Polly**: circuit breaker por fuera y timeout por dentro (un timeout cuenta como falla). Los tiempos de E/S usan el reloj real; los instantes del dominio, el del EdgeHost.
+3. **Snapshot tardío.** `ErpArrivalService` no reserva serial si el plazo efectivo ya venció; TX-E no crea el job y deja la detección en `WAITING_ERP`; el barrido aplica D07 (decisión 11 de la Fase 1).
+4. **`erp_cache_age_seconds`** = segundos desde la última respuesta del ERP (o desde el arranque si nunca respondió).
+5. **Orden del barrido**: reloj primero (con un salto no evalúa nada); después J03 y J14 (plazo y orden) antes de J13; D07; ventanas de evidencia; autorizaciones; G03. Los plazos son los efectivos, calculados en el EdgeHost con la revisión activa, y cada transacción exige que esa revisión siga activa (SI-14). J13 exige en SQL vigentes el plazo efectivo y el congelado. Texto anterior, que la revisión encontró incorrecto: "J13, que además exige plazo vigente en SQL" (era el congelado).
+6. **`CLOCK_JUMP`**: un `ClockGuard` por estación, compartido por el barrido y el claim; la tolerancia es la de la revisión activa; al detectar un salto se bloquea la estación y el claim se rechaza (`ClockJump`) sin evaluar el plazo. El salto queda retenido hasta que el bloqueo se confirma en SQL. Si `BlockAsync` falla, toda comprobación posterior lo vuelve a informar y reintenta el bloqueo; un claim concurrente tampoco evalúa su plazo mientras el bloqueo no es visible. El claim y el barrido usan como `@EdgeNowUtc` el instante que la guarda verificó. La guarda es obligatoria en `ClaimService`. Un salto menor que la tolerancia no se detecta (límite declarado en la sección 10.2). Segunda revisión y SI-16 (decisión de la persona): la transacción que registra el salto (`TxsSweep.ClockJumpAsync`) bloquea la estación y vence lo pendiente (J03 y J14 con `DEADLINE_PASSED`, D08 con `STATION_DISABLED`). El salto se da por confirmado solo si el bloqueo vigente es `CLOCK_JUMP`; con otro bloqueo vigente se retiene y el barrido no evalúa plazos hasta poder registrarlo.
+7. **`CLOCK_SKEW`**: con `PLC_TIMESTAMP`, un `DetectionTimestamp` posterior a la recepción es un límite inferior del adelanto del reloj del PLC; si supera `ClockSkewToleranceMs`, la estación se bloquea antes de registrar el ciclo y el ciclo queda `BLOCKED` con `STATION_DISABLED`. Su `DeadlineAt` se calcula igual (el contrato exige `deadlineAt` posterior a `detectionTimestamp`) pero no decide nada: no se crea job. Un reloj del PLC atrasado acorta los plazos (es restrictivo) y no se distingue de la latencia: no se detecta, y las cajas se publican como `LATE_ARRIVAL`. Ambos límites son SI-15 (clase B).
+8. **El escenario de pruebas admite el reloj real** (`TimeProvider.System`) para las pruebas con latencia real (T03); `ManualTimeProvider` separa el reloj de pared del monotónico para simular un ajuste de NTP (T37).
+9. **Snapshot ERP: la fila de la caché, no la respuesta (I10).** Después del upsert se relee la fila de `(WorkOrderId, Revision)`. Si su contenido (producto, lote, GTIN, vigencia) no coincide con la respuesta, el ERP reutilizó la revisión: el snapshot no está disponible y se mide `erp_requests_total{outcome=revision_conflict}`. Si coincide, el job se arma con la fila. TX-E además exige en SQL que la fila tenga el producto, el lote y el GTIN de la etiqueta. Se compara el contenido y no `SourceHash`, que depende de los bytes del cuerpo HTTP.
+10. **Validación del snapshot.** La vigencia se trunca a milisegundos antes de validarla. El GTIN debe tener 14 dígitos ASCII, y revisión, producto y lote no pueden pasar el largo de su columna (un parámetro `NVarChar(n)` truncaría en silencio). Cada orden va en su propio `try`, y las órdenes se procesan por plazo.
+11. **Revisión activa en la transacción.** El claim (TX-B) exige `sc.ActiveConfigRevisionId` igual a la revisión con que calculó el plazo (parámetro obligatorio); si no, el rechazo es `RevisionChanged` y el job sigue `READY`; el sender de la Fase 4 lo vuelve a reclamar en su vuelta siguiente. TX-E no actúa si cambió la revisión; lee la estación sin `UPDLOCK` (con RCSI equivale a ejecutarse antes de la activación concurrente, y el `UPDLOCK` formaba un ciclo de bloqueos con TX-A). El barrido exige la revisión en cada transacción.
+12. **Métricas de TX-E.** Solo se mide una transición (job creado o resultado publicado). Una TX-E sin efecto devuelve null y no cuenta en `SyncOnceAsync`.
+
+### Comandos y resultados
+
+Compuerta completa, 2026-10-14 23:10 (`powershell -File build/ci.ps1 --fase 3`):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   159, Omitido:     0, Total:   159, Duración: 22 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    83, Omitido:     0, Total:    83, Duración: 2 m 22 s - CartonPrinting.IntegrationTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    33, Omitido:     0, Total:    33, Duración: 3 m 19 s - CartonPrinting.FaultTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 62 ejecutadas
+  Fase 3: T03=1 destino(s), 1 ejecutadas, T04=1 destino(s), 1 ejecutadas, T17=1 destino(s), 1 ejecutadas, T18=1 destino(s), 1 ejecutadas, T21=1 destino(s), 1 ejecutadas, T33=1 destino(s), 1 ejecutadas, T37=3 destino(s), 3 ejecutadas, T46=1 destino(s), 1 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
+Durante el desarrollo:
+
+- Al integrar las correcciones de la Fase 2, T03 empezó a fallar a veces: con el presupuesto de tránsito por defecto (950 ms útiles), la latencia de arranque en frío de la primera consulta HTTP (Kestrel, `HttpClient`, JIT) se comía el plazo. Una pasada directa sí creaba el job. La prueba ahora calienta el cliente y usa `TransitBudgetMs` = 3000 (la precondición del catálogo solo exige que sea mayor que el retraso del ERP).
+- T26 (Fase 2) falló en esta rama porque un dato de prueba tenía un `DetectionTimestamp` en el futuro, que con `CLOCK_SKEW` bloquea la estación como debe. Se corrigió el dato.
+
+### Pruebas de la fase
+
+- **T03, T04, T17, T18, T21, T33, T37 y T46: PASA** (detalle en `docs/TEST_STATUS.md`).
+
+### Revisión independiente
+
+Subagente `revisor-adversarial` sobre una copia limpia de `a0eaebb` (2026-10-14). Ejecutó la compuerta (159, 83 y 33 pruebas en verde) y seis experimentos contra SQL Server real (EXP1, EXP2 y EXP4 a EXP7). También hizo dos mutaciones: J13 sin guarda de plazo, y una llamada síncrona al ERP desde la ingesta. Con ambas la suite seguía en verde. Resultado: 1 ALTA, 4 MEDIA y 7 BAJA.
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| 1: `ClockGuard` olvidaba el salto antes de que el bloqueo quedara guardado; si `BlockAsync` fallaba, los claims siguientes se evaluaban con el reloj saltado | Alta | El salto queda retenido hasta que el bloqueo se confirma, y el claim usa el instante verificado (decisión 6). Prueba `A_clock_jump_whose_block_failed_is_not_forgotten` (fila de la estación retenida y claim cancelado): falla si la confirmación va antes del bloqueo. Más una prueba unitaria |
+| 2: el barrido usaba el `DeadlineAt` congelado, y J13 devolvía a `READY` un job con el plazo efectivo vencido | Media | Plazo efectivo por fila en J03, J14, J13 y D07; conflicto con la referencia registrado como SI-14 (decisión 5). Prueba `The_sweep_expires_by_the_effective_deadline_after_a_revision_change` |
+| 3: T18 pasaba sin la guarda de J13 | Media | Prueba `Release_from_retry_wait_has_its_own_deadline_guard`, que llama a J13 sin pasar por la expiración: falla con las guardas de plazo reemplazadas por `1 = 1` |
+| 4: T03 no comprobaba que la ingesta no espere al ERP | Media | El ERP retiene las peticiones mientras se procesa el ciclo: la ingesta debe devolver sin respuesta del ERP. Falla con la llamada síncrona de la revisión. Cobertura parcial declarada en `TEST_STATUS` |
+| 5: el job copiaba la respuesta HTTP y no la fila validada de la caché (I10) | Media | Decisión 9. Pruebas `A_reused_erp_revision_with_other_content_is_not_used_and_the_job_matches_the_cache_row` y `Tx_e_does_not_create_a_job_whose_content_differs_from_the_cache_row` |
+| 6: validación antes de truncar, GTIN sin dígitos aceptado, una orden con error detenía la pasada, órdenes sin orden | Baja | Decisión 10. Pruebas `ErpClientValidationTests` (cinco casos inválidos y uno válido) y `An_order_that_fails_does_not_stop_the_others` |
+| 7: una TX-E sin efecto se contaba como transición | Baja | Decisión 12. Prueba `A_tx_e_without_effect_is_not_counted` |
+| 8: plazo efectivo calculado con una revisión leída fuera de la transacción | Baja | Decisión 11. Prueba `Tx_e_and_tx_b_require_the_revision_they_were_computed_with` |
+| 9: límites de `CLOCK_SKEW` sin declarar | Baja | SI-15 (clase B) y decisión 7 |
+| 10: el claim con `ClockGuard` solo existía en las pruebas; `TimeProvider.System` en el servicio de la estación | Baja | Guarda obligatoria en `ClaimService`; el servicio usa el `TimeProvider` inyectado. La composición del EdgeHost no tiene prueba (lo no verificado). El sender del EdgeHost, que compone el claim, es de la Fase 4 |
+| 11: T33 no distinguía el margen efectivo | Baja | El claim se prueba a 120 ms del plazo efectivo |
+| 12: afirmaciones excesivas ("cero bytes", decisión 5) | Baja | `TEST_STATUS` de T04, T17 y T18 dice de dónde se deduce; decisión 5 corregida |
+
+Compuerta completa después de las correcciones, 2026-10-15 00:29 (`powershell -File build/ci.ps1 --fase 3`, rama con `main` integrado: Fase 2 cerrada y especificación 1.1.4):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   164, Omitido:     0, Total:   164, Duración: 20 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    83, Omitido:     0, Total:    83, Duración: 2 m 17 s - CartonPrinting.IntegrationTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    50, Omitido:     0, Total:    50, Duración: 3 m 34 s - CartonPrinting.FaultTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 62 ejecutadas
+  Fase 2: T11=1 destino(s), 1 ejecutadas, T13=5 destino(s), 5 ejecutadas, T24=1 destino(s), 1 ejecutadas, T25=8 destino(s), 10 ejecutadas, T26=2 destino(s), 3 ejecutadas, T30=2 destino(s), 3 ejecutadas, T35=2 destino(s), 2 ejecutadas, T45=4 destino(s), 12 ejecutadas
+  Fase 3: T03=1 destino(s), 1 ejecutadas, T04=1 destino(s), 1 ejecutadas, T17=1 destino(s), 1 ejecutadas, T18=3 destino(s), 3 ejecutadas, T21=1 destino(s), 1 ejecutadas, T33=1 destino(s), 1 ejecutadas, T37=4 destino(s), 5 ejecutadas, T46=1 destino(s), 1 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
+Mutaciones ejecutadas, cada una revertida después:
+
+- **Confirmar el salto antes del bloqueo** (el comportamiento anterior): `A_clock_jump_whose_block_failed_is_not_forgotten` falla.
+- **Guardas de plazo de J13 reemplazadas por `1 = 1`**: `Release_from_retry_wait_has_its_own_deadline_guard` falla.
+- **`WorkOrderNeeded` consulta al ERP de forma síncrona** (la mutación de la revisión): T03 falla.
+
+En la primera compuerta falló `Tx_e_d08_with_recirculated_carton`. La prueba activaba la revisión 8 y armaba el plan de TX-E con la 7. Con la decisión 11, TX-E no actúa con una revisión vieja, como debe. Se corrigió el dato: el plan usa la revisión activa.
+
+
+### Segunda revisión independiente
+
+Subagente `revisor-adversarial` sobre una copia limpia de `b391083` (2026-10-15). Comprobó que los doce hallazgos de la primera revisión quedaron resueltos y que sus pruebas fallan sin la corrección: repitió M1, M8 y M10 y probó M6 y M9, nuevas. Ejecutó la compuerta: 164, 83 y 50. Dos errores de conexión a SQL Server por la carga se repitieron aislados en verde. Hizo dos experimentos (EXP1 y EXP2). Resultado: 0 ALTA, 1 MEDIA y 5 BAJA.
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| MEDIA-1: tras confirmar el bloqueo, los plazos calculados antes del salto se evaluaban con el reloj nuevo; un claim se aceptó 5 min después del plazo real (EXP1). Con otro bloqueo vigente, el salto no quedaba en SQL (EXP2) | Media | SI-16 (clase B), decidido por la persona: lo pendiente vence al confirmar el salto. El salto solo se confirma con el bloqueo `CLOCK_JUMP` vigente. Pruebas `Pending_work_from_before_a_clock_jump_is_never_printed_after_the_unblock` y `A_clock_jump_on_a_station_blocked_for_another_reason_is_recorded_once_that_block_is_lifted` |
+| BAJA-1: la revisión del claim era opcional y nadie probaba que `ClaimService` la pasara (M2 sobrevivía) | Baja | Parámetro obligatorio y no anulable en `ClaimRequest`. El reintento ante `RevisionChanged` es el del sender de la Fase 4 (decisión 11) |
+| BAJA-2: las guardas de revisión del barrido y el `UPDLOCK` de TX-E sin prueba (M3 a M5 sobrevivían) | Baja | Prueba `Sweep_expirations_require_the_revision_they_were_computed_with`; el `UPDLOCK` se quitó (BAJA-3) |
+| BAJA-3: el `UPDLOCK, HOLDLOCK` de TX-E formaba un ciclo de bloqueos con TX-A (deducido) | Baja | Quitado (decisión 11) |
+| BAJA-4: el salto retenido vive solo en memoria (deducido) | Baja | Declarado en los riesgos |
+| BAJA-5: TX-A y TX-E no consultan la guarda (deducido) | Baja | Declarado en `TEST_STATUS` (T37) y en lo no verificado |
+
+Decisiones de la persona (2026-10-15):
+
+- SI-16: lo pendiente vence al confirmar el salto.
+- SI-14: se mantiene el plazo efectivo en el barrido.
+- SI-15: se mantiene el interino, declarado.
+
+Compuerta completa después de las correcciones de la segunda revisión, 2026-10-15 01:22 (`powershell -File build/ci.ps1 --fase 3`):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   164, Omitido:     0, Total:   164, Duración: 20 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    83, Omitido:     0, Total:    83, Duración: 2 m 8 s - CartonPrinting.IntegrationTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    53, Omitido:     0, Total:    53, Duración: 3 m 11 s - CartonPrinting.FaultTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 62 ejecutadas
+  Fase 2: T11=1 destino(s), 1 ejecutadas, T13=5 destino(s), 5 ejecutadas, T24=1 destino(s), 1 ejecutadas, T25=8 destino(s), 10 ejecutadas, T26=2 destino(s), 3 ejecutadas, T30=2 destino(s), 3 ejecutadas, T35=2 destino(s), 2 ejecutadas, T45=4 destino(s), 12 ejecutadas
+  Fase 3: T03=1 destino(s), 1 ejecutadas, T04=1 destino(s), 1 ejecutadas, T17=1 destino(s), 1 ejecutadas, T18=4 destino(s), 4 ejecutadas, T21=1 destino(s), 1 ejecutadas, T33=1 destino(s), 1 ejecutadas, T37=6 destino(s), 7 ejecutadas, T46=1 destino(s), 1 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
+Sin hallazgos ALTA en la segunda revisión: no se pide una tercera.
+
+### Lo que no se verificó
+
+- Ningún ERP real: el contrato y el formato son del simulador.
+- TX-A y TX-E no consultan el `ClockGuard`: hasta el próximo barrido o claim (200 ms) pueden calcular o evaluar un plazo con el reloj saltado (segunda revisión, BAJA-5).
+- La composición de los servicios de la estación en el EdgeHost (`AddStationServices`, `StationServicesHostedService`) no tiene prueba: los servicios se prueban construidos a mano.
+- `CLOCK_SKEW` no detecta un adelanto menor que la tolerancia más la latencia de subida ni un PLC atrasado (SI-15).
+- El ajuste de NTP se simula con `ManualTimeProvider`; no se cambió el reloj del sistema.
+- `CLOCK_SKEW` solo detecta un PLC adelantado.
+- Los tiempos del barrido y de la sincronización ERP en el EdgeHost (200 ms y 100 ms) no se ajustaron con carga (Fase 7).
+
+### Riesgos
+
+- Una latencia del ERP cercana al plazo deja la detección en `WAITING_ERP` y la vence: es el comportamiento pedido, pero en la máquina de pruebas depende del ruido.
+- El `ClockGuard` compara entre comprobaciones: si nada lo consulta durante un rato, un salto se detecta en la siguiente comprobación (el barrido corre cada 200 ms).
+- El salto retenido vive en memoria: si el proceso muere entre detectarlo y registrarlo en SQL (por ejemplo, con SQL caído), la guarda nueva arranca de cero y el salto se olvida (segunda revisión, BAJA-4).
+
