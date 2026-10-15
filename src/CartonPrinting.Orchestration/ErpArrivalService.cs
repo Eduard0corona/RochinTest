@@ -1,6 +1,7 @@
 using CartonPrinting.Contracts;
 using CartonPrinting.Infrastructure.Data;
 using CartonPrinting.Infrastructure.Observability;
+using CartonPrinting.Infrastructure.Signals;
 using CartonPrinting.Infrastructure.Time;
 using CartonPrinting.Infrastructure.Transactions;
 
@@ -13,7 +14,8 @@ namespace CartonPrinting.Orchestration;
 /// barrido aplica D07. Devuelve null si TX-E no hizo ninguna transición.
 /// </summary>
 public sealed class ErpArrivalService(
-    TxeErpArrival txe, StationConfigStore stations, LabelSerialSource serials, StationSettings station, EdgeClock clock, CartonMetrics metrics)
+    TxeErpArrival txe, StationConfigStore stations, LabelSerialSource serials, StationSettings station, EdgeClock clock, CartonMetrics metrics,
+    ReadyJobSignal? readySignal = null)
 {
     public async Task<ErpArrivalResult?> ProcessAsync(DetectionRecord detection, ErpSnapshot snapshot, CancellationToken ct)
     {
@@ -46,6 +48,7 @@ public sealed class ErpArrivalService(
         if (result.PrintJobId is not null)
         {
             metrics.Record(MetricNames.ErpSnapshotWaitMs, (clock.UtcNow - detection.ReceivedAt).TotalMilliseconds);
+            readySignal?.Notify();
         }
         else if (result.Published is not null && result.FinalStatus == DetectionStatus.Blocked)
         {

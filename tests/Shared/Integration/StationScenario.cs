@@ -211,6 +211,27 @@ public sealed class StationScenario
         return (job, attempt);
     }
 
+    /// <summary>
+    /// Renueva cada minuto el lease de la impresora de línea del escenario (dura 10 minutos), como lo haría el ciclo de
+    /// propiedad del EdgeHost: para las pruebas largas con reloj real. TX-B valida el lease en SQL, no el objeto.
+    /// </summary>
+    public async Task KeepLeaseAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromMinutes(1), ct);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            await Leases.AcquireAsync(PrinterId, OwnerInstanceId, "host-test", 600_000, 2_000, Clock.UtcNow, CancellationToken.None);
+        }
+    }
+
     public Task<WriteOutcome> TransmitAsync(Guid attemptId, CancellationToken ct = default)
     {
         var now = Clock.UtcNow;

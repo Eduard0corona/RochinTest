@@ -110,6 +110,17 @@ public sealed class OutboxRelay(
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Outbox Relay: publicación fallida; reintento en {Backoff}", backoff);
+
+                // Con el broker caído, outbox_pending_age_seconds tiene que seguir creciendo: es la alerta de esa caída (T08).
+                try
+                {
+                    await UpdatePendingAgeAsync(stoppingToken);
+                }
+                catch (Exception gaugeError) when (gaugeError is not OperationCanceledException)
+                {
+                    _logger.LogWarning(gaugeError, "Outbox Relay: no se pudo medir la edad del pendiente");
+                }
+
                 await Task.Delay(backoff, clock.TimeProvider, stoppingToken);
                 backoff = TimeSpan.FromTicks(Math.Min(backoff.Ticks * 2, options.MaxBackoff.Ticks));
             }

@@ -22,6 +22,8 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
 
     private readonly ConcurrentDictionary<Guid, DateTime> _printedAt = new();
     private readonly ConcurrentDictionary<Guid, DateTime> _appliedAt = new();
+    private readonly ConcurrentDictionary<Guid, DateTime> _appliedForVerified = new();
+    private readonly ConcurrentDictionary<Guid, DateTime> _verifiedFirst = new();
     private readonly ConcurrentDictionary<Guid, ConcurrentQueue<(string Level, DateTime ObservedAt)>> _pending = new();
 
     /// <summary>
@@ -261,10 +263,12 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
     private void Measure(Guid jobId, DateTime sent, string level, DateTime observedAt, bool confirmed)
     {
         // Solo para métricas: si los pares sin completar se acumulan (jobs que nunca llegan a APPLIED), se descartan.
-        if (_printedAt.Count > 10_000 || _appliedAt.Count > 10_000)
+        if (_printedAt.Count > 10_000 || _appliedAt.Count > 10_000 || _appliedForVerified.Count > 10_000 || _verifiedFirst.Count > 10_000)
         {
             _printedAt.Clear();
             _appliedAt.Clear();
+            _appliedForVerified.Clear();
+            _verifiedFirst.Clear();
         }
 
         switch (level)
@@ -279,6 +283,8 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
 
                 break;
             case EvidenceLevel.Applied:
+                metrics.Record(MetricNames.SendStartToAppliedMs, (observedAt - sent).TotalMilliseconds);
+
                 // PRINTED (por job) y APPLIED (por ciclo) pueden medirse en cualquier orden: el par se registra cuando
                 // se conocen los dos instantes observados.
                 if (_printedAt.TryRemove(jobId, out var printed))
@@ -290,9 +296,32 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
                     _appliedAt[jobId] = observedAt;
                 }
 
+                // APPLIED y VERIFIED (los dos por ciclo) también en cualquier orden.
+                if (_verifiedFirst.TryRemove(jobId, out var verifiedEarlier))
+                {
+                    metrics.Record(MetricNames.AppliedToVerifiedMs, (verifiedEarlier - observedAt).TotalMilliseconds);
+                }
+                else
+                {
+                    _appliedForVerified[jobId] = observedAt;
+                }
+
                 break;
-            case EvidenceLevel.Verified when confirmed:
-                metrics.Record(MetricNames.SendToVerifiedMs, (observedAt - sent).TotalMilliseconds);
+            case EvidenceLevel.Verified:
+                if (confirmed)
+                {
+                    metrics.Record(MetricNames.SendToVerifiedMs, (observedAt - sent).TotalMilliseconds);
+                }
+
+                if (_appliedForVerified.TryRemove(jobId, out var applied))
+                {
+                    metrics.Record(MetricNames.AppliedToVerifiedMs, (observedAt - applied).TotalMilliseconds);
+                }
+                else
+                {
+                    _verifiedFirst[jobId] = observedAt;
+                }
+
                 break;
         }
     }

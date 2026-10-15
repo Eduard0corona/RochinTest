@@ -68,7 +68,7 @@ public static class StationComposition
         services.AddSingleton(sp => new StationSweepService(station, new CartonPrinting.Infrastructure.Transactions.TxsSweep(sp.GetRequiredService<CartonPrinting.Infrastructure.Data.SqlDb>()),
             new CartonPrinting.Infrastructure.Data.StationConfigStore(sp.GetRequiredService<CartonPrinting.Infrastructure.Data.SqlDb>()), sp.GetRequiredService<ClockGuard>(),
             sp.GetRequiredService<EdgeClock>(), sp.GetRequiredService<CartonPrinting.Infrastructure.Observability.CartonMetrics>(),
-            sp.GetRequiredService<ILogger<StationSweepService>>()));
+            sp.GetRequiredService<ILogger<StationSweepService>>(), sp.GetService<CartonPrinting.Infrastructure.Signals.ReadyJobSignal>()));
 
         var erpOptions = configuration.GetSection("ErpSync").Get<ErpSyncOptions>();
         if (!string.IsNullOrWhiteSpace(erpOptions?.BaseUrl))

@@ -1,6 +1,7 @@
 using System.Threading.Channels;
 using CartonPrinting.Infrastructure.Data;
 using CartonPrinting.Infrastructure.Observability;
+using CartonPrinting.Infrastructure.Signals;
 using CartonPrinting.Infrastructure.Time;
 using CartonPrinting.Infrastructure.Transactions;
 using CartonPrinting.Orchestration;
@@ -54,7 +55,7 @@ public sealed class IngestHostedService : BackgroundService
 
     public IngestHostedService(
         IngestHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers, IErpDemand? erpDemand = null,
-        bool coordinated = false)
+        bool coordinated = false, ReadyJobSignal? readySignal = null)
     {
         _options = options;
         _clock = clock;
@@ -62,7 +63,7 @@ public sealed class IngestHostedService : BackgroundService
         _logger = loggers.CreateLogger<IngestHostedService>();
         var station = new StationSettings(options.SiteId, options.StationId, options.LabelSerialPrefix, options.Opc.RecordNodeId);
         var stations = new StationConfigStore(db);
-        var registration = new RegistrationService(new TxaRegisterDetection(db), new ErpCacheStore(db), new LabelSerialSource(db), clock, metrics);
+        var registration = new RegistrationService(new TxaRegisterDetection(db), new ErpCacheStore(db), new LabelSerialSource(db), clock, metrics, readySignal);
         Service = new StationIngestService(station, registration, stations, new PlcEpochStore(db), new SequenceStore(db), new TxsSweep(db),
             new TxmManualActions(db), clock, metrics, loggers.CreateLogger<StationIngestService>(), erpDemand);
         _channel = Channel.CreateBounded<RawNotification>(new BoundedChannelOptions(options.ChannelCapacity)
@@ -77,6 +78,9 @@ public sealed class IngestHostedService : BackgroundService
 
     /// <summary>La ingesta (para recargar épocas o reingresar registros retenidos desde la operación).</summary>
     public StationIngestService Service { get; }
+
+    /// <summary>La suscripción OPC UA: los intervalos negociados quedan en sus propiedades Revised* (T12).</summary>
+    public OpcUaCycleSource Source => _source;
 
     /// <summary>Etapa 5: revisión activa, épocas y marca alta por época desde SQL.</summary>
     public async Task LoadStateAsync(CancellationToken ct)

@@ -28,6 +28,9 @@ builder.Services.AddSingleton<CartonMetrics>();
 builder.Services.AddSingleton(new DatabaseOptions { ConnectionString = builder.Configuration.GetConnectionString("CartonPrinting") ?? string.Empty });
 builder.Services.AddSingleton<SqlDb>();
 
+// Señal en proceso hacia el sender de línea: un job READY nuevo lo despierta sin esperar su sondeo (G11).
+builder.Services.AddSingleton<CartonPrinting.Infrastructure.Signals.ReadyJobSignal>();
+
 // Arranque ordenado (Fase 5): cada módulo registra sus pasos; StartupHostedService los ejecuta en orden.
 var startup = new StartupCoordinator(TimeProvider.System);
 startup.Add(StartupStage.LabelingReadyLow, "LabelingReady sin escribir hasta la etapa 8", _ => Task.CompletedTask);
@@ -68,7 +71,7 @@ if (!string.IsNullOrWhiteSpace(ingest?.Opc.EndpointUrl))
     {
         var service = new IngestHostedService(ingest, sp.GetRequiredService<SqlDb>(), sp.GetRequiredService<EdgeClock>(),
             sp.GetRequiredService<CartonMetrics>(), sp.GetRequiredService<ILoggerFactory>(), sp.GetService<CartonPrinting.Orchestration.IErpDemand>(),
-            coordinated: true);
+            coordinated: true, sp.GetRequiredService<CartonPrinting.Infrastructure.Signals.ReadyJobSignal>());
         startup.Add(StartupStage.StateLoaded, $"revisión, épocas y marca alta de {ingest.StationId}", service.LoadStateAsync);
         startup.Add(StartupStage.Subscribed, $"suscripción OPC UA de {ingest.StationId}", service.SubscribeAsync);
         startup.Add(StartupStage.LabelingReady, $"primer LabelingReady de {ingest.StationId}", service.FirstBeatAsync);
@@ -90,7 +93,8 @@ foreach (var (section, role) in new[] { ("Printer", PrinterRole.Line), ("ManualP
     if (!string.IsNullOrWhiteSpace(printer?.PrinterId) && printer.Transport.Port > 0)
     {
         builder.Services.AddHostedService(sp => new PrinterHostedService(role, printer, sp.GetRequiredService<SqlDb>(), sp.GetRequiredService<EdgeClock>(),
-            sp.GetRequiredService<CartonMetrics>(), sp.GetRequiredService<ILoggerFactory>(), startup, sp.GetService<ClockGuard>()));
+            sp.GetRequiredService<CartonMetrics>(), sp.GetRequiredService<ILoggerFactory>(), startup, sp.GetService<ClockGuard>(),
+            sp.GetRequiredService<CartonPrinting.Infrastructure.Signals.ReadyJobSignal>()));
     }
 }
 

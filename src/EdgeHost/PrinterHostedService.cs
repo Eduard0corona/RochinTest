@@ -1,5 +1,6 @@
 using CartonPrinting.Infrastructure.Data;
 using CartonPrinting.Infrastructure.Observability;
+using CartonPrinting.Infrastructure.Signals;
 using CartonPrinting.Infrastructure.Time;
 using CartonPrinting.Infrastructure.Transactions;
 using CartonPrinting.PrintAgent;
@@ -50,11 +51,13 @@ public sealed class PrinterHostedService : BackgroundService
     private readonly PrinterOwnership _ownership;
     private readonly OwnedPrinterRunner _runner;
     private readonly ILogger _logger;
+    private readonly ReadyJobSignal? _readySignal;
 
     public PrinterHostedService(
         PrinterRole role, PrinterHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers, StartupCoordinator startup,
-        ClockGuard? stationClockGuard = null)
+        ClockGuard? stationClockGuard = null, ReadyJobSignal? readySignal = null)
     {
+        _readySignal = readySignal;
         _role = role;
         _options = options;
         _db = db;
@@ -127,7 +130,7 @@ public sealed class PrinterHostedService : BackgroundService
             var sender = new PrinterSenderService(_options.PrinterId, _db, new ClaimService(_db, new TxbClaim(_db), _metrics, _clock, _clockGuard),
                 new TxcWriteResult(_db), new StationConfigStore(_db), lease, transport, _clock, _metrics,
                 logger: _loggers.CreateLogger<PrinterSenderService>(), evidence: evidence);
-            await sender.RunAsync(poll, _clock.TimeProvider, null, ct);
+            await sender.RunAsync(poll, _clock.TimeProvider, _readySignal is null ? null : _readySignal.WaitAsync, ct);
         }
         else
         {

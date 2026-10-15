@@ -16,6 +16,10 @@ public sealed class CartonMetrics : IDisposable
     private readonly ConcurrentDictionary<string, long> _totals = new();
     private readonly ConcurrentDictionary<string, ConcurrentQueue<double>> _samples = new();
     private readonly ConcurrentDictionary<string, double> _gauges = new();
+    private readonly ConcurrentDictionary<Guid, long> _received = new();
+
+    /// <summary>Muestras que se conservan en memoria por serie: las más recientes (el exportador recibe todas).</summary>
+    public const int MaxSamplesPerSeries = 50_000;
 
     public CartonMetrics()
     {
@@ -42,10 +46,35 @@ public sealed class CartonMetrics : IDisposable
     {
         var histogram = _histograms.GetOrAdd(name, n => Meter.CreateHistogram<double>(n));
         histogram.Record(value, ToTagList(tags));
-        _samples.GetOrAdd(Key(name, tags), _ => new ConcurrentQueue<double>()).Enqueue(value);
+        Keep(_samples.GetOrAdd(Key(name, tags), _ => new ConcurrentQueue<double>()), value);
         if (tags.Length > 0)
         {
-            _samples.GetOrAdd(Key(name, []), _ => new ConcurrentQueue<double>()).Enqueue(value);
+            Keep(_samples.GetOrAdd(Key(name, []), _ => new ConcurrentQueue<double>()), value);
+        }
+    }
+
+    /// <summary>
+    /// Marca monotónica de la recepción OPC de una detección con job, para medir <c>opc_receive_to_send_start_ms</c> en el
+    /// sender (otro componente del mismo proceso). Se consume una vez; si se acumulan sin consumir, se descartan.
+    /// </summary>
+    public void MarkReceived(Guid detectionId, long receivedTimestamp)
+    {
+        if (_received.Count > 10_000)
+        {
+            _received.Clear();
+        }
+
+        _received[detectionId] = receivedTimestamp;
+    }
+
+    /// <summary>La marca de recepción de la detección, si este proceso la recibió y nadie la tomó todavía.</summary>
+    public long? TakeReceived(Guid detectionId) => _received.TryRemove(detectionId, out var ts) ? ts : null;
+
+    private static void Keep(ConcurrentQueue<double> samples, double value)
+    {
+        samples.Enqueue(value);
+        while (samples.Count > MaxSamplesPerSeries && samples.TryDequeue(out _))
+        {
         }
     }
 

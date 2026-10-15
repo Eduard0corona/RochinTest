@@ -1,6 +1,7 @@
 using CartonPrinting.Contracts;
 using CartonPrinting.Infrastructure.Data;
 using CartonPrinting.Infrastructure.Observability;
+using CartonPrinting.Infrastructure.Signals;
 using CartonPrinting.Infrastructure.Time;
 using CartonPrinting.Infrastructure.Transactions;
 using Microsoft.Extensions.Logging;
@@ -28,7 +29,7 @@ public sealed record SweepReport(
 /// </summary>
 public sealed class StationSweepService(
     StationSettings station, TxsSweep txs, StationConfigStore stations, ClockGuard clockGuard, EdgeClock clock, CartonMetrics metrics,
-    ILogger<StationSweepService>? logger = null)
+    ILogger<StationSweepService>? logger = null, ReadyJobSignal? readySignal = null)
 {
     private readonly ILogger _logger = logger ?? NullLogger<StationSweepService>.Instance;
 
@@ -118,6 +119,11 @@ public sealed class StationSweepService(
         foreach (var gap in gaps.Where(g => g.UnrecoveredCount > 0))
         {
             metrics.Add(MetricNames.CyclesUnobserved, (long)gap.UnrecoveredCount, ("station", station.StationId));
+        }
+
+        if (released.Count > 0)
+        {
+            readySignal?.Notify();   // RETRY_WAIT → READY (J13)
         }
 
         return new SweepReport(false, expired, released, waiting, evidence, gaps);

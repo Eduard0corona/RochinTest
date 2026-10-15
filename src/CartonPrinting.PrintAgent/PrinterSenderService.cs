@@ -165,6 +165,11 @@ public sealed class PrinterSenderService(
         var writeStartedAt = clock.UtcNow;
         var writeTs = clock.GetTimestamp();
         metrics.Record(MetricNames.PresendCheckToWriteMs, clock.GetElapsedTime(checkTs, writeTs).TotalMilliseconds);
+        metrics.Record(MetricNames.PrintDeadlineSlackMs, clock.GetElapsedTime(writeTs, deadlineTs).TotalMilliseconds + context.EffectiveSendMarginMs);
+        if (metrics.TakeReceived(context.Job.DetectionId) is { } received)
+        {
+            metrics.Record(MetricNames.OpcReceiveToSendStartMs, clock.GetElapsedTime(received, writeTs).TotalMilliseconds);
+        }
         DateTime? deviceAcceptedAt;
         try
         {

@@ -1,6 +1,7 @@
 using CartonPrinting.Contracts;
 using CartonPrinting.Infrastructure.Data;
 using CartonPrinting.Infrastructure.Observability;
+using CartonPrinting.Infrastructure.Signals;
 using CartonPrinting.Infrastructure.Time;
 using CartonPrinting.Infrastructure.Transactions;
 
@@ -33,7 +34,8 @@ public sealed class RegistrationService(
     ErpCacheStore erpCache,
     LabelSerialSource serials,
     EdgeClock clock,
-    CartonMetrics metrics)
+    CartonMetrics metrics,
+    ReadyJobSignal? readySignal = null)
 {
     public async Task<RegistrationResult> RegisterAsync(
         CycleRecord record, StationSettings station, StationRevision revision, SequenceDecision sequence, CancellationToken ct)
@@ -53,6 +55,7 @@ public sealed class RegistrationService(
         {
             activity?.SetTag(CartonTelemetry.Tags.PrintJobId, jobId);
             activity?.SetTag(CartonTelemetry.Tags.LabelSerial, plan.Job?.LabelSerial);
+            readySignal?.Notify();
         }
 
         return result;
@@ -140,6 +143,13 @@ public sealed class RegistrationService(
 
     private void Record(RegistrationResult result, CycleRecord record, RegistrationPlan plan)
     {
+        // Flanco a notificación (sección 10.4): solo una notificación en vivo, y válido solo con los relojes del PLC y del
+        // EdgeHost sincronizados (lo vigila clock_skew_ms).
+        if (record is { Transport: Transport.Subscription, QueueOverflow: false, DetectionTimestamp: { } flank } && result.Outcome != RegistrationOutcome.Duplicate)
+        {
+            metrics.Record(MetricNames.PlcToOpcReceiveMs, (record.ReceivedAt - flank).TotalMilliseconds);
+        }
+
         switch (result.Outcome)
         {
             case RegistrationOutcome.Duplicate:
@@ -160,6 +170,7 @@ public sealed class RegistrationService(
                 break;
             case DetectionStatus.JobCreated when record.ReceivedTimestamp is { } received:
                 metrics.Record(MetricNames.OpcReceiveToJobReadyMs, clock.GetElapsedTime(received).TotalMilliseconds);
+                metrics.MarkReceived(result.DetectionId, received);
                 break;
         }
 
