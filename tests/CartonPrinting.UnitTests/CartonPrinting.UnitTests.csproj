@@ -19,6 +19,7 @@
     <ProjectReference Include="..\..\src\CartonPrinting.Infrastructure\CartonPrinting.Infrastructure.csproj" />
     <ProjectReference Include="..\..\src\CartonPrinting.Orchestration\CartonPrinting.Orchestration.csproj" />
     <ProjectReference Include="..\..\src\CartonPrinting.OpcIngest\CartonPrinting.OpcIngest.csproj" />
+    <ProjectReference Include="..\..\src\CartonPrinting.Recovery\CartonPrinting.Recovery.csproj" />
   </ItemGroup>
 
   <ItemGroup>

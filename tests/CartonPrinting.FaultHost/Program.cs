@@ -9,6 +9,23 @@ using CartonPrinting.PrintAgent;
 // TerminateProcess en Windows, SIGKILL en Linux). Solo para pruebas; nunca se conecta a equipo real.
 //
 // Uso: CartonPrinting.FaultHost <cadena de conexión> <puerto impresora> <PrinterId> <OwnerInstanceId> <LeaseToken> <PrintJobId> <punto>
+//
+// Modo "lock" (T27): CartonPrinting.FaultHost lock <PrinterId> <directorio de locks>. Toma el lock de sistema operativo
+// de la impresora, avisa "LOCKED" (o "BUSY" si otro proceso lo tiene) y lo mantiene hasta que lo maten.
+if (args.Length == 3 && args[0] == "lock")
+{
+    using var held = PrinterOsLock.TryAcquire(args[1], args[2]);
+    Console.WriteLine(held is null ? "BUSY" : "LOCKED");
+    Console.Out.Flush();
+    if (held is null)
+    {
+        return 3;
+    }
+
+    await Task.Delay(Timeout.Infinite);
+    return 0;
+}
+
 if (args.Length != 7)
 {
     Console.Error.WriteLine("Uso: CartonPrinting.FaultHost <conexión> <puerto> <printerId> <owner> <leaseToken> <printJobId> <punto>");

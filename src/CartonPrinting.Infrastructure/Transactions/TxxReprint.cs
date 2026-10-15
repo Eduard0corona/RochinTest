@@ -34,6 +34,9 @@ public sealed record ReprintExecution(long AuthorizationId, Guid PrintJobId, Gui
 /// </summary>
 public sealed class TxxReprint(SqlDb db)
 {
+    /// <summary>TR_PrintAttempt_Guard rechaza el intento excepcional (51021).</summary>
+    public const int AttemptRejected = 51021;
+
     public const int NotExecutable = 52001;
 
     public async Task<ReprintExecution> ExecuteAsync(

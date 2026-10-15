@@ -47,8 +47,10 @@ public sealed class ManualReprintSender(
         {
             execution = await txx.ExecuteAsync(authorizationId, printerId, lease.OwnerInstanceId, lease.FencingToken, attemptId, clock.UtcNow, ct);
         }
-        catch (SqlException ex) when (ex.Number == TxxReprint.NotExecutable)
+        catch (SqlException ex) when (ex.Number is TxxReprint.NotExecutable or TxxReprint.AttemptRejected)
         {
+            // Sin autorización ejecutable (revocada, vencida, de otro job), o el trigger rechaza el intento (por ejemplo,
+            // LABEL_DAMAGED sin el retiro de la etiqueta original registrado): nada se envía.
             _logger.LogWarning("Autorización {Authorization} no ejecutable en {Printer}: {Error}", authorizationId, printerId, ex.Message);
             return new ReprintSendResult(authorizationId, null, null, false);
         }

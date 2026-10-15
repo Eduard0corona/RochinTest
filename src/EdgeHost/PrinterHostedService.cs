@@ -48,9 +48,8 @@ public sealed class PrinterHostedService : BackgroundService
     private readonly StartupCoordinator _startup;
     private readonly ClockGuard _clockGuard;
     private readonly PrinterOwnership _ownership;
-    private readonly SenderRecovery _recovery;
+    private readonly OwnedPrinterRunner _runner;
     private readonly ILogger _logger;
-    private volatile bool _owned;
 
     public PrinterHostedService(
         PrinterRole role, PrinterHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers, StartupCoordinator startup,
@@ -67,16 +66,11 @@ public sealed class PrinterHostedService : BackgroundService
         _logger = loggers.CreateLogger<PrinterHostedService>();
         _ownership = new PrinterOwnership(options.PrinterId, $"{Environment.MachineName}:{Environment.ProcessId}", Environment.MachineName,
             new PrinterLeaseStore(db), clock, metrics, options.LeaseDurationMs, options.LeaseGraceMs, loggers.CreateLogger<PrinterOwnership>());
-        _recovery = new SenderRecovery(new Txr0Recovery(db), clock, metrics, loggers.CreateLogger<SenderRecovery>());
+        _runner = new OwnedPrinterRunner(_ownership, new SenderRecovery(new Txr0Recovery(db), clock, metrics, loggers.CreateLogger<SenderRecovery>()),
+            clock, loggers.CreateLogger<OwnedPrinterRunner>());
 
-        startup.Add(StartupStage.Ownership, $"lock y lease de {options.PrinterId}", async ct => _owned = await _ownership.TryAcquireAsync(ct) is not null);
-        startup.Add(StartupStage.SendingRecovered, $"TX-R0 de {options.PrinterId}", async ct =>
-        {
-            if (_owned)
-            {
-                await _recovery.RecoverAsync(options.PrinterId, ct);
-            }
-        });
+        startup.Add(StartupStage.Ownership, $"lock y lease de {options.PrinterId}", _runner.AcquireAsync);
+        startup.Add(StartupStage.SendingRecovered, $"TX-R0 de {options.PrinterId}", _runner.RecoverAsync);
         startup.Add(StartupStage.DeviceQueue, $"cola de {options.PrinterId}", _ =>
         {
             _logger.LogInformation("Impresora {Printer}: sin capacidad confirmada de vaciar la cola del dispositivo (OT-07); no se vacía", options.PrinterId);
@@ -85,47 +79,12 @@ public sealed class PrinterHostedService : BackgroundService
     }
 
     /// <summary>Este proceso es dueño de la impresora (lock y lease).</summary>
-    public bool Owned => _owned;
+    public bool Owned => _runner.Owned;
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         await _startup.WhenReached(StartupStage.Swept).WaitAsync(stoppingToken);
-        while (!stoppingToken.IsCancellationRequested)
-        {
-            if (!_owned)
-            {
-                await Task.Delay(TimeSpan.FromMilliseconds(_options.LeaseDurationMs), _clock.TimeProvider, stoppingToken);
-                if (await _ownership.TryAcquireAsync(stoppingToken) is null)
-                {
-                    continue;
-                }
-
-                await _recovery.RecoverAsync(_options.PrinterId, stoppingToken);
-                _owned = true;
-            }
-
-            using var lost = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-            var renewal = _ownership.RenewAsync(lost, stoppingToken);
-            try
-            {
-                await RunSenderAsync(_ownership.Lease!, lost.Token);
-            }
-            catch (OperationCanceledException) when (lost.IsCancellationRequested && !stoppingToken.IsCancellationRequested)
-            {
-                _logger.LogError("Impresora {Printer}: lease perdido; el sender se detuvo y no envía hasta volver a tomarla", _options.PrinterId);
-            }
-
-            _owned = false;
-            await lost.CancelAsync();
-            try
-            {
-                await renewal;
-            }
-            catch (OperationCanceledException)
-            {
-                // Detención o lease perdido.
-            }
-        }
+        await _runner.RunAsync(RunSenderAsync, stoppingToken);
     }
 
     private async Task RunSenderAsync(LeaseGrant lease, CancellationToken ct)

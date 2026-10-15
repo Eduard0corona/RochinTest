@@ -105,6 +105,10 @@ public sealed class StationSweepService(
             {
                 evidence.Add(t);
                 metrics.Increment(MetricNames.EvidenceWindowElapsed);
+                if (t.Reason == JobReason.ExceptionalReprintUnresolved)
+                {
+                    metrics.Increment(MetricNames.ExceptionalReprints, ("result", "UNRESOLVED"));
+                }
             }
         }
 

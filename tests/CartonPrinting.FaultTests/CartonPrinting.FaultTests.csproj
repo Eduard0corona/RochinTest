@@ -27,6 +27,7 @@
     <ProjectReference Include="..\..\src\CartonPrinting.ErpSync\CartonPrinting.ErpSync.csproj" />
     <!-- Proceso aparte que ejecuta el sender y se mata en un punto de falla (T07); solo dependencia de compilación. -->
     <ProjectReference Include="..\CartonPrinting.FaultHost\CartonPrinting.FaultHost.csproj" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\..\src\CartonPrinting.Recovery\CartonPrinting.Recovery.csproj" />
   </ItemGroup>
 
   <ItemGroup>
