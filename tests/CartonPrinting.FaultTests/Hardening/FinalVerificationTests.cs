@@ -103,10 +103,88 @@ public sealed class FinalVerificationTests(SqlServerFixture sql) : IAsyncLifetim
             Assert.Equal(JobStatus.Ready, (await s.JobAsync(later, Ct)).Status);
 
             rig.Printer.Mode = PrinterMode.Normal;
-            await WaitAsync(async () => (await s.JobAsync(later, Ct)).Status != JobStatus.Ready, "el job siguiente al volver la impresora");
+            await WaitAsync(async () => (await s.JobAsync(later, Ct)).Status is not (JobStatus.Ready or JobStatus.Sending), "el job siguiente al volver la impresora");
             Assert.False(rig.Sender.Paused);
             Assert.False(readiness.Paused);
             Assert.Equal(0d, s.Metrics.Gauge(MetricNames.PrinterSenderPaused, ("printer", s.PrinterId)));
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await sender.ContinueWith(_ => { }, TaskScheduler.Default);
+        }
+    }
+
+    /// <summary>
+    /// Un sender nuevo (el ciclo de propiedad lo crea al volver a tomar la impresora, por ejemplo después de perder el lease estando en
+    /// pausa) hereda la pausa de la estación: la sigue probando y la levanta cuando la impresora responde. Sin eso, LabelingReady
+    /// quedaría en falso para siempre (verificación de las correcciones, MEDIA).
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T05")]
+    public async Task A_new_sender_inherits_the_pause_and_lifts_it_when_the_printer_answers()
+    {
+        var s = await StationScenario.CreateAsync(_db, r => r with { TransitBudgetMs = 60_000 }, Ct, TimeProvider.System);
+        var readiness = new LinePrinterReadiness();
+        readiness.Attach(() => true);
+        readiness.SetPaused(true);   // la pausa que dejó el sender anterior
+        await using var rig = PrintRig.Create(s, readiness: readiness);
+        Assert.True(rig.Sender.Paused);
+        var job = await s.ReadyJobAsync(950, Ct);
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        var sender = rig.Sender.RunAsync(TimeSpan.FromMilliseconds(50), TimeProvider.System, null, stop.Token);
+        try
+        {
+            await WaitAsync(() => Task.FromResult(!readiness.Paused), "la pausa heredada levantada");
+            await WaitAsync(async () => (await s.JobAsync(job, Ct)).Status is not (JobStatus.Ready or JobStatus.Sending), "el job después de la pausa");
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await sender.ContinueWith(_ => { }, TaskScheduler.Default);
+        }
+    }
+
+    /// <summary>
+    /// Una impresora que acepta conexiones pero corta la escritura: aceptar una conexión no prueba que imprima. Después de la pausa, el
+    /// período de prueba deja un solo intento: el primer fallo vuelve a pausar, con la espera duplicada (verificación de las
+    /// correcciones, MEDIA). Las cajas siguientes esperan en READY en lugar de ir perdiéndose de a tres.
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T06")]
+    public async Task A_printer_that_cuts_every_write_costs_one_attempt_per_probation_with_a_growing_pause()
+    {
+        var s = await StationScenario.CreateAsync(_db, r => r with { TransitBudgetMs = 120_000 }, Ct, TimeProvider.System);
+        var readiness = new LinePrinterReadiness();
+        readiness.Attach(() => true);
+        await using var rig = PrintRig.Create(s, readiness: readiness);
+        rig.Printer.Mode = PrinterMode.CutMidWrite;
+        var jobs = new List<Guid>();
+        for (ulong cycle = 960; cycle <= 964; cycle++)
+        {
+            jobs.Add(await s.ReadyJobAsync(cycle, Ct));
+        }
+
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+        var sender = rig.Sender.RunAsync(TimeSpan.FromMilliseconds(50), TimeProvider.System, null, stop.Token);
+        try
+        {
+            await WaitAsync(() => Task.FromResult(s.Metrics.Total(MetricNames.PrinterSenderPauses, ("printer", s.PrinterId)) == 1), "la primera pausa");
+            var firstPause = DateTime.UtcNow;
+            await WaitAsync(() => Task.FromResult(s.Metrics.Total(MetricNames.PrinterSenderPauses, ("printer", s.PrinterId)) == 2), "la segunda pausa");
+            Assert.True(DateTime.UtcNow - firstPause >= PrinterSenderService.MinPause - TimeSpan.FromMilliseconds(200),
+                "la pausa se levantó antes de la espera mínima");
+            Assert.True(readiness.Paused);
+
+            // Tres fallos, la pausa, un solo intento de prueba y otra pausa: cuatro jobs UNKNOWN y el quinto esperando.
+            await Task.Delay(TimeSpan.FromSeconds(3), Ct);
+            var statuses = new List<string>();
+            foreach (var job in jobs)
+            {
+                statuses.Add((await s.JobAsync(job, Ct)).Status);
+            }
+
+            Assert.Equal([JobStatus.Unknown, JobStatus.Unknown, JobStatus.Unknown, JobStatus.Unknown, JobStatus.Ready], statuses);
         }
         finally
         {
@@ -154,7 +232,7 @@ public sealed class FinalVerificationTests(SqlServerFixture sql) : IAsyncLifetim
         {
             await Task.Delay(TimeSpan.FromMilliseconds(500), Ct);   // al menos un error fuera de la escritura
             proxy.AcceptNew = true;
-            await WaitAsync(async () => (await s.JobAsync(next, Ct)).Status != JobStatus.Ready, "el job siguiente");
+            await WaitAsync(async () => (await s.JobAsync(next, Ct)).Status is not (JobStatus.Ready or JobStatus.Sending), "el job siguiente");
         }
         finally
         {
@@ -164,7 +242,9 @@ public sealed class FinalVerificationTests(SqlServerFixture sql) : IAsyncLifetim
 
         var closed = await s.JobAsync(orphan, Ct);
         Assert.Equal((JobStatus.Unknown, "RESTART_DURING_SEND"), (closed.Status, closed.Reason));
-        Assert.Equal(JobStatus.Transmitted, (await s.JobAsync(next, Ct)).Status);
+        var attempts = await s.QueryAsync("SELECT Outcome, ISNULL(FailureDetail, '-') FROM dbo.PrintAttempt WHERE PrintJobId = @j ORDER BY AttemptNumber",
+            c => c.Parameters.AddWithValue("@j", next), r => $"{r.GetString(0)}: {r.GetString(1)}", Ct);
+        Assert.True((await s.JobAsync(next, Ct)).Status == JobStatus.Transmitted, $"intentos del job siguiente: {string.Join(" | ", attempts)}");
         Assert.Single(printer.Received);
     }
 
@@ -174,7 +254,7 @@ public sealed class FinalVerificationTests(SqlServerFixture sql) : IAsyncLifetim
     /// STATION_DISABLED). Con RCSI y sin ese lock verían la estación habilitada y crearían un job que la purga no vence.
     /// </summary>
     [Fact]
-    [Trait("Spec", "T21")]
+    [Trait("Spec", "T37")]
     public async Task A_station_block_in_progress_makes_tx_a_and_tx_e_wait_and_see_it()
     {
         var s = await StationScenario.CreateAsync(_db, ct: Ct);

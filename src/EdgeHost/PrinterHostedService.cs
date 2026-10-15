@@ -58,6 +58,9 @@ public sealed class PrinterHostedService : BackgroundService
     private readonly LinePrinterReadiness? _readiness;
     private readonly SenderRecovery _recovery;
 
+    // El sender de línea corriendo: sin la fila de PrinterSendOrder no arranca, y la estación no se anuncia lista.
+    private volatile bool _senderRunning;
+
     public PrinterHostedService(
         PrinterRole role, PrinterHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers, StartupCoordinator startup,
         ClockGuard? stationClockGuard = null, ReadyJobSignal? readySignal = null, SqlOutage? sqlOutage = null,
@@ -80,7 +83,7 @@ public sealed class PrinterHostedService : BackgroundService
             new PrinterLeaseStore(db), clock, metrics, options.LeaseDurationMs, options.LeaseGraceMs, loggers.CreateLogger<PrinterOwnership>());
         _recovery = new SenderRecovery(new Txr0Recovery(db), clock, metrics, loggers.CreateLogger<SenderRecovery>());
         _runner = new OwnedPrinterRunner(_ownership, _recovery, clock, loggers.CreateLogger<OwnedPrinterRunner>());
-        _readiness?.Attach(() => _runner.InService);
+        _readiness?.Attach(() => _runner.InService && _senderRunning);
 
         // Sin la impresora de línea el arranque no sigue (se reintenta); la manual no detiene la estación: la toma el ciclo
         // de propiedad, con TX-R0, antes de su primera reimpresión.
@@ -154,6 +157,7 @@ public sealed class PrinterHostedService : BackgroundService
                 _logger.LogError(ex, "Arranque de {Printer}: no se pudo reaplicar la evidencia pendiente", _options.PrinterId);
             }
         }, ct);
+        _senderRunning = true;
         try
         {
             var sender = new PrinterSenderService(_options.PrinterId, _db, new ClaimService(_db, new TxbClaim(_db), _metrics, _clock, _clockGuard),
@@ -163,6 +167,7 @@ public sealed class PrinterHostedService : BackgroundService
         }
         finally
         {
+            _senderRunning = false;
             await reapply.ContinueWith(_ => { }, TaskScheduler.Default);
         }
     }

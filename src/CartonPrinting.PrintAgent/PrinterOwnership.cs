@@ -292,9 +292,17 @@ public sealed class OwnedPrinterRunner(PrinterOwnership ownership, SenderRecover
                 // Entre la etapa 2 y el primer envío pasan las etapas 3 a 6 sin renovar: si el lease dejó de ser de este
                 // proceso, se vuelve a tomar la impresora con TX-R0 (segunda revisión de la Fase 5, BAJA 1).
                 verify = false;
+                var token = ownership.Lease?.FencingToken;
                 try
                 {
                     _owned = await AcquireAsync(ct);
+                    if (_owned && ownership.Lease?.FencingToken != token)
+                    {
+                        // El lease venció y se volvió a tomar con otro token: otra instancia pudo reclamar entretanto. TX-R0 otra vez.
+                        _inService = false;
+                        await recovery.RecoverAsync(ownership.PrinterId, ct);
+                        _inService = true;
+                    }
                 }
                 catch (Exception ex) when (!ct.IsCancellationRequested)
                 {

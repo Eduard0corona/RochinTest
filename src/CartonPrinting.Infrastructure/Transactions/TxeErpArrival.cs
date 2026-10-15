@@ -36,17 +36,23 @@ public sealed class TxeErpArrival(SqlDb db)
     public Task<ErpArrivalResult> ExecuteAsync(ErpArrivalPlan plan, CancellationToken ct) =>
         db.InTransactionAsync(async (conn, tx) =>
         {
+            var peek = await DetectionQueries.GetAsync(conn, tx, plan.DetectionId, ct);
+            if (peek is null || peek.Status != DetectionStatus.WaitingErp)
+            {
+                return new ErpArrivalResult(peek?.Status, peek?.Reason, null, null);
+            }
+
+            // La estación se lee con lock compartido hasta el commit, y antes de tomar la detección: el mismo orden que CLOCK_JUMP
+            // (bloquea la estación y después vence las detecciones), así un bloqueo concurrente queda antes o después de TX-E, nunca en
+            // medio y sin un ciclo de locks (SI-16; verificación de las correcciones de la Fase 7). Compartido y no UPDLOCK, para no
+            // serializar TX-E con TX-A.
+            var station = await StationConfigStore.GetActiveAsync(conn, tx, peek.SiteId, peek.StationId, ct, holdShared: true)
+                ?? throw new InvalidOperationException($"La estación {peek.SiteId}/{peek.StationId} no tiene StationConfig.");
             var d = await DetectionQueries.GetAsync(conn, tx, plan.DetectionId, ct, updLock: true);
             if (d is null || d.Status != DetectionStatus.WaitingErp)
             {
                 return new ErpArrivalResult(d?.Status, d?.Reason, null, null);
             }
-
-            // La estación se lee con lock compartido hasta el commit: un bloqueo concurrente (CLOCK_JUMP vence lo pendiente en la
-            // misma transacción, SI-16) queda en orden con TX-E, antes o después, nunca en medio. Compartido y no UPDLOCK, para no
-            // serializar TX-E con TX-A; un ciclo con la TX-A que bloquea la estación termina en un 1205 que se reintenta.
-            var station = await StationConfigStore.GetActiveAsync(conn, tx, d.SiteId, d.StationId, ct, holdShared: true)
-                ?? throw new InvalidOperationException($"La estación {d.SiteId}/{d.StationId} no tiene StationConfig.");
             if (station.Active.ConfigRevisionId != plan.ActiveConfigRevisionId)
             {
                 return new ErpArrivalResult(d.Status, d.Reason, null, null);

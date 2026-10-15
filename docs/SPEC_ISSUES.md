@@ -210,10 +210,16 @@ Clasificación de `CLAUDE.md`:
     3. toma, con `LOCK_TIMEOUT`, el rango donde TX-A insertará el ciclo siguiente;
     4. marca la recuperación.
 
-    El latido levanta `LabelingReady` después (etapa 8). El barrido sigue con su intervalo (etapa 6). TX-R0 (etapa 3) no se repite: un intento que quedó en `SENDING` por la caída detiene el sender (código 70), y el reinicio del proceso lo ejecuta.
+    El latido levanta `LabelingReady` después (etapa 8). El barrido sigue con su intervalo (etapa 6).
+  - **TX-R0 (etapa 3).** Se repite en dos casos:
+    - cuando el ciclo de propiedad vuelve a tomar la impresora, si el lease se perdió durante la caída;
+    - en el sender, antes del claim siguiente a un error fuera de la escritura, solo sobre los intentos de su propio token de lease.
+
+    El segundo es una extensión del disparador de J09, que la máquina de estados describe para el arranque: el resultado (`UNKNOWN` con `RESTART_DURING_SEND`) y la guarda son los mismos. Un intento que quedó en `SENDING` porque TX-C no pudo registrarse detiene el sender (código 70), y el reinicio del proceso lo cierra.
   - **Ciclos de la caída.** Un ciclo recibido antes de la recuperación es parte del hueco.
-  - **La impresora de línea también cuenta (verificación final de la Fase 7).** `LabelingReady` exige la impresora de línea tomada (lock y lease) con TX-R0 hecho desde que se tomó: etapas 2 y 3. Si la caída dura más que la cobertura del lease, la impresora se vuelve a tomar con TX-R0 antes de que la estación se anuncie lista. Tres fallos seguidos del dispositivo ponen el sender en pausa con `LabelingReady` en falso, como dice §3, Impresora.
-  - **Después de un error del claim** el sender ejecuta TX-R0 de su impresora antes de reclamar otra vez: un commit de TX-B cuya respuesta se perdió no deja la impresora ocupada.
+  - **La impresora de línea también cuenta (verificación final de la Fase 7).** `LabelingReady` exige la impresora de línea tomada (lock y lease), con TX-R0 hecho desde que se tomó (etapas 2 y 3) y con su sender corriendo. Si la caída dura más que la cobertura del lease, la impresora se vuelve a tomar con TX-R0 antes de que la estación se anuncie lista.
+  - **La pausa del sender.** Tres fallos seguidos del dispositivo la activan, con `LabelingReady` en falso, como dice §3, Impresora. Sale cuando la impresora acepta una conexión, después de al menos 5 s, y con un período de prueba: el primer fallo vuelve a pausar con la espera duplicada. "Vuelve a estar disponible" no tiene una prueba definida en la especificación sin una consulta de estado de la impresora (OT-07): el interino es este.
+  - **Después de un error del claim** el sender ejecuta TX-R0 de su impresora, con su propio token de lease, antes de reclamar otra vez: un commit de TX-B cuya respuesta se perdió no deja la impresora ocupada.
   - **La recuperación es atómica.** No se levanta si alguien informó una falla después de que empezó la prueba. Una recaída dentro de 60 s (más que el `CommandTimeout` de 30 s de SqlClient) duplica la espera.
 - **Límites declarados.**
   - TX-B esperando un lock no se abandona: un claim confirmado después de abandonarlo dejaría un `SENDING` sin escritura. Mientras espera, sus jobs pueden vencer; al agotar el `CommandTimeout` (30 s) recibe un −2, que declara la caída, y `LabelingReady` baja.

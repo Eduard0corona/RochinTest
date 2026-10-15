@@ -162,6 +162,9 @@ public static class MetricNames
     public const string PrinterSenderPaused = "printer_sender_paused";
 
     public const string PrinterSenderPauses = "printer_sender_pauses_total";
+
+    /// <summary>Reintentos cortos de TX-A con SQL Server sin responder (ESTRATEGIA_RECUPERACION §3).</summary>
+    public const string IngestSqlRetries = "ingest_sql_retries_total";
     public const string RestartRecoveredSending = "restart_recovered_sending_total";
     public const string InboxDuplicates = "inbox_duplicates_total";
     public const string DetectionsExpired = "detections_expired_total";

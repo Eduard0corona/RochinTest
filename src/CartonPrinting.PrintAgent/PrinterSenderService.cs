@@ -57,9 +57,22 @@ public sealed class PrinterSenderService(
     /// <summary>Con el sender en pausa, cada cuánto se prueba si la impresora vuelve a aceptar conexiones.</summary>
     public static readonly TimeSpan PausedProbeInterval = TimeSpan.FromSeconds(1);
 
+    /// <summary>
+    /// Pausa mínima, que el latido (500 ms) llega a ver. Una recaída en el período de prueba la duplica, hasta <see cref="MaxPause"/>:
+    /// una impresora que acepta conexiones pero corta la escritura cuesta un intento por vuelta, cada vez más espaciados.
+    /// </summary>
+    public static readonly TimeSpan MinPause = TimeSpan.FromSeconds(5);
+
+    public static readonly TimeSpan MaxPause = TimeSpan.FromSeconds(60);
+
     private readonly ILogger _logger = logger ?? NullLogger<PrinterSenderService>.Instance;
     private int _deviceFailures;
-    private volatile bool _paused;
+
+    // Un sender nuevo (al volver a tomar la impresora) hereda la pausa de la estación: la sigue probando y la levanta él.
+    private volatile bool _paused = readiness?.Paused ?? false;
+    private long _pausedAt = clock.GetTimestamp();
+    private TimeSpan _pauseHold = MinPause;
+    private bool _probation = readiness?.Paused ?? false;
     private bool _recoverBeforeClaim;
 
     /// <summary>En pausa por fallos seguidos del dispositivo: no reclama hasta que la impresora vuelva a aceptar conexiones.</summary>
@@ -230,6 +243,7 @@ public sealed class PrinterSenderService(
             deviceAcceptedAt is { } accepted ? CanonicalTimestamp.Truncate(accepted) : null, clock.UtcNow, CancellationToken.None));
         metrics.Increment(MetricNames.PrintAttempts, ("outcome", AttemptOutcome.Transmitted));
         _deviceFailures = 0;
+        _probation = false;
         await ReapplyEvidenceAsync(context, claim.ClaimedAtUtc);
         return new SendResult(printJobId, claim, transmitted, true);
     }
@@ -245,12 +259,15 @@ public sealed class PrinterSenderService(
             return;
         }
 
+        // Una recaída en el período de prueba (sin un envío transmitido desde la última vuelta) alarga la pausa.
+        _pauseHold = _probation ? TimeSpan.FromTicks(Math.Min(_pauseHold.Ticks * 2, MaxPause.Ticks)) : MinPause;
+        _pausedAt = clock.GetTimestamp();
         _paused = true;
         readiness?.SetPaused(true);
         metrics.SetGauge(MetricNames.PrinterSenderPaused, 1, ("printer", printerId));
         metrics.Increment(MetricNames.PrinterSenderPauses, ("printer", printerId));
-        _logger.LogError("Impresora {Printer}: {Count} fallos seguidos del dispositivo (el último: {What}). Sender en pausa, LabelingReady en falso; se prueba la conexión hasta que vuelva",
-            printerId, _deviceFailures, what);
+        _logger.LogError("Impresora {Printer}: {Count} fallos seguidos del dispositivo (el último: {What}). Sender en pausa al menos {Hold}, LabelingReady en falso; después se prueba la conexión",
+            printerId, _deviceFailures, what, _pauseHold);
     }
 
     /// <summary>
@@ -260,6 +277,11 @@ public sealed class PrinterSenderService(
     /// </summary>
     private async Task<bool> ResumeIfPrinterAnswersAsync(CancellationToken ct)
     {
+        if (clock.GetElapsedTime(_pausedAt) < _pauseHold)
+        {
+            return false;
+        }
+
         try
         {
             transport.Reset();
@@ -273,8 +295,11 @@ public sealed class PrinterSenderService(
             return false;
         }
 
+        // Período de prueba: aceptar una conexión no prueba que la impresora imprima (puede cortar la escritura). El primer fallo
+        // vuelve a pausar, con la espera duplicada; un envío transmitido termina la prueba.
         _paused = false;
-        _deviceFailures = 0;
+        _probation = true;
+        _deviceFailures = MaxConsecutiveDeviceFailures - 1;
         readiness?.SetPaused(false);
         metrics.SetGauge(MetricNames.PrinterSenderPaused, 0, ("printer", printerId));
         _logger.LogWarning("Impresora {Printer}: vuelve a aceptar conexiones; el sender sigue con la siguiente caja (la cola del dispositivo no se vacía, OT-07)",
@@ -351,7 +376,8 @@ public sealed class PrinterSenderService(
                 {
                     if (_recoverBeforeClaim && recovery is not null)
                     {
-                        await recovery.RecoverAsync(printerId, ct);
+                        // Solo lo reclamado con este lease: nunca el SENDING de otra instancia que haya tomado la impresora.
+                        await recovery.RecoverAsync(printerId, ct, lease.FencingToken);
                     }
 
                     _recoverBeforeClaim = false;

@@ -62,7 +62,7 @@ Vuelven a hacerse con el equipo real, porque su criterio físico se comprobó en
 - **T36:** el aislamiento real del canal de la impresora al cambiar de dueño.
 - **T42:** orden de envío con la impresora real fuera de línea y de vuelta.
 - **T08 y T19:** caída real de RabbitMQ y de SQL Server en la red de planta. T08 simula la caída del broker con un proxy TCP. T19 la simula con un proxy (cortes y congelamiento) y además con el contenedor de SQL Server detenido y vuelto a arrancar, en la misma máquina. En T19, además, lo que hace la línea mientras `LabelingReady` está en falso (OT-09).
-- **T05 con la impresora real:** tres fallos seguidos ponen el sender en pausa con `LabelingReady` en falso, y vuelve solo cuando la impresora acepta conexiones.
+- **T05 y T06 con la impresora real:** tres fallos seguidos ponen el sender en pausa con `LabelingReady` en falso. Vuelve cuando la impresora acepta conexiones, con un período de prueba. Con una impresora que acepta la conexión y corta la escritura, cada vuelta cuesta un intento `UNKNOWN`. Si la impresora real ofrece una consulta de estado (OT-07), la vuelta debería usarla.
 - **SQL Server caído y reinicio del PLC a la vez:** si el ciclo siguiente a la caída llega con una época nueva, los ciclos descartados durante la caída no quedan como hueco de la época anterior. Solo los cuenta `opc_records_rejected_total{cause=SQL_UNAVAILABLE}`, con su alerta.
 
 ## 4. Configuración y seguridad que se verifican al instalar

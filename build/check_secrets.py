@@ -34,6 +34,9 @@ VARIABLE = re.compile(r"\$\(|\$\{|\{\{|%[A-Za-z_]+%")
 PLACEHOLDER = re.compile(r"""^["']?(<|\.\.\.|…)""")
 # En el código solo cuenta una cadena literal entre comillas (una expresión como options.Password no es un secreto).
 CODE = re.compile(r"\.(cs|py|ps1|sh|js|ts)$")
+# Una contraseña dentro de una cadena de conexión, también en código ("Server=...;Password=abc;"): después de ";" o de comillas y sin
+# espacios alrededor de "=", que es como se escribe en una cadena de conexión y no en una asignación de código.
+CONNECTION_PASSWORD = re.compile(r"""(?i)[";](?:password|pwd)=(?P<value>[^;"'\s]+)""")
 AMQP_CREDENTIALS = re.compile(r"amqps?://[^:/@\s\"'<]+:[^@/\s\"'<]+@")
 
 
@@ -67,6 +70,9 @@ def main() -> int:
             for match in SECRET_KEY.finditer(line):
                 if literal(match.group("value"), bool(CODE.search(name))):
                     errors.append(f"{name}:{number}: valor literal para {match.group(0).split(match.group('value'))[0].strip()!r}")
+            for match in CONNECTION_PASSWORD.finditer(line):
+                if literal(match.group("value"), False):
+                    errors.append(f"{name}:{number}: contraseña literal en una cadena de conexión")
             if AMQP_CREDENTIALS.search(line):
                 errors.append(f"{name}:{number}: credenciales en un Uri de RabbitMQ")
     for e in errors:

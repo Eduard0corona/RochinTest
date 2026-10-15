@@ -1238,17 +1238,25 @@ Compuerta en verde.
    - Diez cajas de calentamiento quedan fuera de la medición.
    - **Corregida por la verificación final (MEDIA 7).** El conteo absoluto ("ninguna caja vencida en toda la corrida") era más estricto que el catálogo y falló en la compuerta por una caja vencida 9 s antes del corte, sin relación con RabbitMQ. T08 ahora evalúa primero el criterio del catálogo: cero eventos perdidos, mismo EventId, orden de `OutboxSequence` e Inbox. Después, las latencias. Al final, lo que no terminó `CONFIRMED`:
      - ningún job sin `CONFIRMED` llegó a escribirse (I04: nada se imprimió tarde);
-     - durante la caída hay, como mucho, la proporción de vencidos de antes más una caja.
+     - durante la caída y al volver el broker hay, como mucho, la proporción de vencidos de antes más una caja;
+     - en toda la corrida, como mucho el 1 % de las cajas, y al menos 2.
 10. **LabelingReady con la impresora de línea** (verificación final, MEDIA 1 y 4; SI-20). `LinePrinterReadiness` está en verdadero solo con la impresora de línea tomada (lock y lease), con TX-R0 hecho desde que se tomó y con su sender sin pausa. El latido la combina con lo demás.
     - **La pausa.** Tres fallos seguidos del dispositivo (no acepta la conexión o corta la escritura) ponen el sender en pausa (ESTRATEGIA_RECUPERACION §3, Impresora): no reclama, `LabelingReady` baja, el gauge `printer_sender_paused` queda en 1 y se registra la alerta.
-    - **La vuelta.** El sender prueba la conexión cada segundo. Cuando la impresora vuelve, sigue con la siguiente caja: los vencidos los descartan J03 y el barrido, y la cola del dispositivo no se vacía (OT-07, como en el arranque).
+    - **La vuelta.** El sender espera al menos 5 s (el latido llega a ver la pausa) y prueba la conexión cada segundo. Cuando la impresora acepta una, sigue con la siguiente caja: los vencidos los descartan J03 y el barrido, y la cola del dispositivo no se vacía (OT-07, como en el arranque).
+    - **Período de prueba.** Aceptar una conexión no prueba que la impresora imprima: puede cortar cada escritura. Después de la pausa, el primer fallo vuelve a pausar con la espera duplicada, hasta 60 s. Un envío transmitido termina la prueba. Una impresora que corta cada escritura cuesta un intento `UNKNOWN` por vuelta, cada vez más espaciados.
+    - **Herencia.** Un sender nuevo hereda la pausa de la estación y la levanta él. El ciclo de propiedad crea uno al volver a tomar la impresora, por ejemplo después de perder el lease estando en pausa.
+    - **El sender corriendo.** La impresora en servicio exige que el sender esté corriendo: sin su fila de `PrinterSendOrder` no arranca, y la estación no se anuncia lista.
 11. **TX-R0 después de un error del claim** (MEDIA 3). Un error fuera de la escritura pudo llegar después del commit de TX-B, con la respuesta perdida. Entonces el intento quedó en `SENDING` sin escritura y la impresora ocupada (PrinterBusy).
-    - Antes del claim siguiente, el sender ejecuta TX-R0 de su impresora: tiene el lease y no está escribiendo. Ese intento pasa a `UNKNOWN` con `RESTART_DURING_SEND`, como en un reinicio.
+    - Antes del claim siguiente, el sender ejecuta TX-R0 de su impresora, solo sobre los intentos reclamados con su propio token de lease: nunca toca el `SENDING` en curso de otra instancia que haya tomado la impresora. Ese intento pasa a `UNKNOWN` con `RESTART_DURING_SEND`, como en un reinicio. Es una extensión del disparador de J09, que la máquina de estados describe para el arranque (SI-20).
     - Sin errores, no hay TX-R0 extra.
-12. **TX-A y TX-E leen la estación con lock compartido hasta el commit** (`REPEATABLEREAD`; MEDIA 2). Así un bloqueo en curso (CLOCK_JUMP vence lo pendiente en la misma transacción, SI-16) queda en orden con ellas: lo esperan y lo ven, o él las espera y su purga ve sus jobs. Un ciclo con la TX-A que bloquea la estación termina en un 1205 que se reintenta.
+    - **Verificación previa al primer envío.** Si el lease se volvió a tomar con otro token entre el arranque y el primer envío, se repite TX-R0.
+12. **TX-A y TX-E leen la estación con lock compartido hasta el commit** (`REPEATABLEREAD`; MEDIA 2). Así un bloqueo en curso (CLOCK_JUMP vence lo pendiente en la misma transacción, SI-16) queda en orden con ellas: lo esperan y lo ven, o él las espera y su purga ve sus jobs.
+    - **Orden de locks.** TX-E lee la estación antes de tomar la detección, el mismo orden que CLOCK_JUMP: estación y después las filas. Así no hay un ciclo de locks que, además de un 1205, haría esperar a la ingesta hasta declarar una caída falsa.
+    - **TX-A.** Inserta su detección antes de leer la estación, como manda "inserción primero". La purga no ve una detección sin confirmar y no la espera.
 13. **Tramos de evidencia monotónicos** (MEDIA 5). El sender guarda las marcas monotónicas de la escritura de cada job (invocación y escritura completa). `EvidenceService` mide hasta la recepción de cada observación en el EdgeHost, nunca con el `ObservedAt` del dispositivo, que viene de otro reloj.
     - Incluyen la latencia de la integración: es la cota conservadora para `DeviceLeadTimeMs`.
     - Sin las marcas (el job lo escribió otro proceso), el tramo desde la escritura no se mide.
+    - Una reimpresión excepcional también deja sus marcas: la evidencia posterior se mide desde la escritura más reciente del job.
 14. **Alerta del Outbox independiente** (MEDIA 6). `outbox_pending_age_seconds` se mide cada segundo, aparte de la publicación, y cada publicación espera su confirm como máximo 10 s (`PublishTimeout`). Un broker bloqueado o colgado hace crecer la alerta, cuenta como falla y se republica con el mismo EventId (I22).
 15. **Revisión de secretos ampliada** (BAJA-14).
     - **Qué busca.** Valores literales en cualquier clave que nombre una contraseña, una frase de paso o un secreto, con `=` o `:` y también entre comillas JSON, en todos los archivos de texto salvo `spec/` y `tests/`.
@@ -1333,7 +1341,7 @@ Después de la verificación final, con la máquina en reposo:
 - **`FinalVerificationTests`:** las cinco correctas.
 - **`BrokerStallTests`:** correcta (49 s).
 - **`A_short_cut_is_absorbed_by_the_retries_within_the_deadline`:** correcta dos veces seguidas.
-- **`RecirculationTests`:** las nueve correctas.
+- **`RecirculationTests`:** las ocho correctas.
 - **Unidades de `SqlOutage`:** las cinco correctas.
 - **Las seis mutaciones** de la verificación final: todas detectadas.
 
@@ -1448,6 +1456,56 @@ Mutaciones después de las correcciones, cada una revertida; todas hacen fallar 
 - **`LabelingReady` sin la impresora de línea:** la señal sube sin TX-R0.
 - **La edad del Outbox medida solo al publicar:** la alerta no crece con el broker colgado.
 - **Sin reintentos dentro del plazo:** el corte de 150 ms deja el ciclo como hueco.
+
+### Verificación de las correcciones
+
+Workflow de 10 agentes `revisor-adversarial` sobre el diff `c790f7e..0f5697c`, sin compilar ni ejecutar pruebas. Tres revisores (impresora y caída; transacciones y métricas; pruebas y documentos) y un escéptico por cada ALTA o MEDIA.
+
+- **Confirmados:** 6 hallazgos, uno de ellos repetido. Quedaron 2 MEDIA distintos y 3 BAJA, bajados desde MEDIA.
+- **Refutado:** 1 (el CHANGELOG solo dirá "en verde" con la compuerta final).
+- **Sin verificar:** 11 BAJA, juzgadas una por una.
+
+Ninguna prueba corrió a la par.
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| La pausa quedaba fija en `LinePrinterReadiness` cuando el sender en pausa se reemplazaba (lease perdido): `LabelingReady` en falso para siempre (reportado dos veces) | Media | Decisión 10: el sender nuevo hereda la pausa y la levanta. Prueba `A_new_sender_inherits_the_pause_and_lifts_it_when_the_printer_answers` |
+| Después de tres fallos de escritura, un connect TCP levantaba la pausa: el latido no la veía y se seguía perdiendo de a tres cajas | Media | Decisión 10: pausa mínima de 5 s, período de prueba y espera que se duplica. Prueba `A_printer_that_cuts_every_write_costs_one_attempt_per_probation_with_a_growing_pause` |
+| Nuevo interbloqueo entre TX-E y CLOCK_JUMP por el orden de locks | Baja | Decisión 12: TX-E lee la estación antes de tomar la detección |
+| T08: las ventanas de antes y de la vuelta del broker quedaban sin cota | Baja | Decisión 9: la vuelta con la misma regla que la caída, y un tope del 1 % para toda la corrida |
+| `check_secrets.py` dejó de ver una contraseña dentro de una cadena de conexión en código | Baja | Patrón propio para `;Password=` o `"Password=` sin espacios, que no confunde una asignación de código |
+| El TX-R0 del sender en marcha no comprobaba el lease | Baja | Solo toca los intentos con su propio token (decisión 11) |
+| `InService` en verdadero sin sender, si falta la fila de `PrinterSendOrder` | Baja | La impresora en servicio exige el sender corriendo |
+| La verificación previa al primer envío no repetía TX-R0 con otro token de lease | Baja | Lo repite (decisión 11) |
+| SI-20 decía que TX-R0 no se repite y que el sender lo ejecuta; J09 en marcha no estaba registrado | Baja | SI-20 corregido: TX-R0 se repite al volver a tomar la impresora y en el sender después de un error del claim, como extensión registrada de J09 |
+| La evidencia de una reimpresión se medía desde la escritura ordinaria original | Baja | La reimpresión deja sus marcas de escritura |
+| La prueba del corte breve podía pasar sin ningún reintento | Baja | Métrica `ingest_sql_retries_total`; la prueba exige al menos un reintento |
+| Trait de la prueba del bloqueo en curso | Baja | T37 (salto del reloj del EdgeHost con jobs READY), no T21 |
+| Resultados después de la verificación final registrados sin comando ni fecha, y la cuenta de `RecirculationTests` (8 pruebas, no 9) | Baja | Corregido abajo |
+
+Comandos, con la máquina en reposo, 2026-10-15:
+
+- 09:55, `dotnet test tests/CartonPrinting.IntegrationTests --no-build`, sobre `0f5697c`:
+
+  ```
+  Correctas! - Con error: 0, Superado: 105, Omitido: 0, Total: 105, Duración: 1 m 35 s - CartonPrinting.IntegrationTests.dll (net10.0)
+  ```
+
+- 10:00, `dotnet test tests/CartonPrinting.FaultTests --no-build --filter "FullyQualifiedName!~BrokerOutageTests&FullyQualifiedName!~LatencySegmentsTests&FullyQualifiedName!~BrokerStallTests"`, sobre `0f5697c`:
+
+  ```
+  Correctas! - Con error: 0, Superado: 111, Omitido: 0, Total: 111, Duración: 3 m 38 s - CartonPrinting.FaultTests.dll (net10.0)
+  ```
+
+- 10:05 a 10:12, `dotnet test tests/CartonPrinting.FaultTests --no-build --filter "FullyQualifiedName~FinalVerificationTests"`, dos veces seguidas con estas correcciones: las siete correctas las dos veces.
+  - La primera corrida previa falló en `A_claim_whose_answer_was_lost...`, con "UNKNOWN: Escritura interrumpida: A task was canceled".
+  - La causa estaba en la prueba: esperaba "ya no READY" y detenía el sender con el job todavía en SENDING. Ahora las tres esperas exigen un estado final.
+- Mutaciones de esta ronda, cada una revertida, todas detectadas:
+  - sin heredar la pausa: falla la prueba de la pausa heredada;
+  - sin período de prueba: no hay segunda pausa.
+
+  Las seis de la verificación final, a las 09:35, también se detectaron.
+- La compuerta completa, con `--carga`, se ejecuta después de esta ronda, con la máquina en reposo (sección siguiente).
 
 ### Lo que no se verificó
 

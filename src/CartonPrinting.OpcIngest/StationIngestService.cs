@@ -246,6 +246,7 @@ public sealed class StationIngestService
                 var backoff = TimeSpan.FromMilliseconds(100 * attempt);
                 if (attempt < 3 && (deadline is null || _clock.UtcNow + backoff < deadline))
                 {
+                    _metrics.Increment(MetricNames.IngestSqlRetries, ("station", _station.StationId));
                     await Task.Delay(backoff, ct);
                     continue;
                 }

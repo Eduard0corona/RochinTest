@@ -285,6 +285,7 @@ public sealed class SqlOutageTests(SqlServerFixture sql) : IAsyncLifetime
         }
 
         Assert.Equal(DetectionStatus.JobCreated, (await s.DetectionAsync(501, Ct))!.Status);
+        Assert.True(metrics.Total(MetricNames.IngestSqlRetries, ("station", s.StationId)) >= 1, "el ciclo se registró sin ningún reintento");
         Assert.False(ingest.SqlUnavailable);
         Assert.DoesNotContain(metrics.Series(MetricNames.OpcRecordsRejected), e => e.Key.Contains("cause=SQL_UNAVAILABLE", StringComparison.Ordinal));
     }

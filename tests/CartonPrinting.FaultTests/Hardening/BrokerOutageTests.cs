@@ -186,8 +186,8 @@ public sealed class BrokerOutageTests(SqlServerFixture sql, RabbitMqFixture rabb
 
         // "Detecciones y jobs avanzan igual" y "sin cambio en la impresión":
         // - una etiqueta por caja, y ninguna caja sin CONFIRMED llegó a escribirse: lo que no alcanzó su plazo nunca se imprimió tarde (I04);
-        // - lo que no terminó CONFIRMED es ruido de la máquina (una pausa de cientos de ms), no la caída: durante ella, como mucho la
-        //   proporción de antes más una caja.
+        // - lo que no terminó CONFIRMED es ruido de la máquina (una pausa de cientos de ms), no la caída: durante ella y al volver el
+        //   broker, como mucho la proporción de antes más una caja; y en toda la corrida, como mucho el 1 % de las cajas (al menos 2).
         Assert.Equal(rig.Printer.Received.Count, rig.Printer.Received.Select(r => r.Serial).Distinct().Count());
         Assert.Equal(await s.CountAsync("FROM dbo.PrintJob WHERE Status = 'CONFIRMED'", null, Ct), rig.Printer.Received.Count);
         Assert.All(notConfirmed, j => Assert.Equal((JobStatus.Expired, 0), (j.Status, j.Written)));
@@ -196,9 +196,16 @@ public sealed class BrokerOutageTests(SqlServerFixture sql, RabbitMqFixture rabb
         var boxesBefore = (int)(firstInOutage - 1000);
         var boxesDuring = (int)(lastInOutage - firstInOutage + 1);
         var allowed = (int)Math.Ceiling((double)expiredBefore / boxesBefore * boxesDuring) + 1;
-        output?.WriteLine($"T08 vencidas: antes {expiredBefore}, durante {expiredDuring} (como mucho {allowed})");
+        var expiredAfter = notConfirmed.Count(j => j.Cycle > lastInOutage);
+        var boxesAfter = (int)(cycle - 1 - lastInOutage);
+        var allowedAfter = (int)Math.Ceiling((double)expiredBefore / boxesBefore * boxesAfter) + 1;
+        var allowedTotal = Math.Max(2, boxes / 100);
+        output?.WriteLine($"T08 vencidas: antes {expiredBefore}, durante {expiredDuring}, después {expiredAfter} " +
+            $"(como mucho {allowed} durante, {allowedAfter} después y {allowedTotal} en total)");
         Assert.True(expiredDuring <= allowed,
             $"{expiredDuring} cajas vencidas durante la caída ({boxesDuring} cajas) frente a {expiredBefore} antes ({boxesBefore} cajas)");
+        Assert.True(expiredAfter <= allowedAfter, $"{expiredAfter} cajas vencidas al volver el broker ({boxesAfter} cajas)");
+        Assert.True(expiredBefore + expiredDuring + expiredAfter <= allowedTotal, $"{notConfirmed.Count} cajas vencidas en {boxes}");
         Assert.Equal(boxes, await s.CountAsync("FROM dbo.PrintJob WHERE CycleId >= 1000", null, Ct));
     }
 

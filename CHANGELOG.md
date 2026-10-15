@@ -37,6 +37,14 @@ Cambios de la implementación. Los de la especificación están en `spec/CHANGEL
   - T08 con el criterio del catálogo primero y los vencidos comparados por ventana;
   - revisión de secretos ampliada y `.env.example` sin contraseñas;
   - SI-19 corregido (la variante de T16 es alcanzable).
+- Verificación de esas correcciones (10 agentes):
+  - pausa heredada por el sender nuevo, con espera mínima y período de prueba;
+  - TX-E toma la estación antes que la detección;
+  - TX-R0 del sender en marcha solo con su token de lease, y TX-R0 otra vez si el lease cambió antes del primer envío;
+  - impresora en servicio solo con el sender corriendo;
+  - marcas de escritura de las reimpresiones;
+  - ventanas de T08 acotadas;
+  - contraseñas en cadenas de conexión dentro de código.
 - Pruebas: T08, T12, T16, T19 y T32 en verde contra SQL Server y RabbitMQ reales y simuladores.
 
 ## Fase 6 · Perfil extendido (2026-10-15)
