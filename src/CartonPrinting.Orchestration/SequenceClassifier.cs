@@ -109,20 +109,29 @@ public sealed class SequenceClassifier
     private SequenceVerdict ClassifyAgainst(EpochMark mark, CycleRecord record, StationRevision revision, DateTime edgeNowUtc)
     {
         var c = record.CycleId;
+        var grace = CanonicalTimestamp.Truncate(edgeNowUtc).AddMilliseconds(revision.GapGraceMs);
         if (mark.HighWater is not { } m)
         {
-            return WithRate(SequenceCase.FirstOfEpoch, new SequenceDecision(), mark, record, revision);
+            // Primera clave de la época. En la primera época de la estación no se sabe desde dónde contaba el PLC;
+            // en una época nueva (reinicio del contador), mientras OT no fije el valor de arranque, la marca alta se
+            // reinicia como si el contador arrancara en 1 y los ciclos anteriores sin datos son un hueco (SI-12,
+            // interino de falla cerrada: se cuentan y, con GATEWAY_RECEIPT, el registro no recibe plazo).
+            if (mark.AcceptanceMode == PlcEpochStore.Initial || c <= 1)
+            {
+                return new SequenceVerdict.Register(SequenceCase.FirstOfEpoch, new SequenceDecision());
+            }
+
+            return new SequenceVerdict.Register(SequenceCase.Gap, new SequenceDecision { Gap = new GapOpen(1, c - 1, grace) });
         }
 
-        if (c == m + 1)
+        if (m < ulong.MaxValue && c == m + 1)
         {
             return WithRate(SequenceCase.InOrder, new SequenceDecision(), mark, record, revision);
         }
 
-        if (c > m + 1)
+        if (m < ulong.MaxValue && c > m + 1)
         {
-            var gap = new GapOpen(m + 1, c - 1, CanonicalTimestamp.Truncate(edgeNowUtc).AddMilliseconds(revision.GapGraceMs));
-            return WithRate(SequenceCase.Gap, new SequenceDecision { Gap = gap }, mark, record, revision);
+            return WithRate(SequenceCase.Gap, new SequenceDecision { Gap = new GapOpen(m + 1, c - 1, grace) }, mark, record, revision);
         }
 
         // Clave nueva (si existiera, TX-A lo resuelve) con CycleId menor o igual que la marca alta.
@@ -177,14 +186,14 @@ public sealed class SequenceClassifier
     }
 
     /// <summary>Época aceptada (INITIAL, AUTO_INCREMENT_BY_ONE u OPERATOR_CONFIRMED): pasa a ser la actual, con marca alta vacía.</summary>
-    public void AcceptEpoch(long epoch, DateTime acceptedAt)
+    public void AcceptEpoch(long epoch, DateTime acceptedAt, string acceptanceMode)
     {
         if (_epochs.Exists(e => e.Epoch == epoch))
         {
             return;
         }
 
-        _epochs.Add(new EpochMark(epoch, acceptedAt, null, null));
+        _epochs.Add(new EpochMark(epoch, acceptedAt, null, null, acceptanceMode));
     }
 
     /// <summary>Actualiza la marca alta y la caché con el resultado de TX-A.</summary>
@@ -197,12 +206,13 @@ public sealed class SequenceClassifier
         }
 
         Remember(key, record.SourceFingerprint());
-        if (outcome != RegistrationOutcome.Registered)
+        if (outcome == RegistrationOutcome.Registered)
         {
-            return;
+            LastWasAmbiguousDecrease = kind == SequenceCase.AmbiguousDecrease;
         }
 
-        LastWasAmbiguousDecrease = kind == SequenceCase.AmbiguousDecrease;
+        // Un duplicado auténtico también mueve la marca alta: la detección existe (la registró otra instancia o un
+        // intento anterior), igual que al reconstruir el estado desde SQL.
         var index = _epochs.FindIndex(e => e.Epoch == record.PlcEpoch);
         if (index < 0)
         {
