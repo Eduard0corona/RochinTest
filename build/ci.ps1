@@ -2,7 +2,9 @@
 # Requiere: .NET SDK 10, Docker (Testcontainers), Python 3.10+ con jsonschema y sqlfluff.
 $ErrorActionPreference = 'Stop'
 # Los argumentos (por ejemplo --fase N) van al paso de trazabilidad; dentro de un scriptblock $args es otro.
-$scriptArgs = $args
+# --carga corre además las pruebas de carga (Category=Load, T12; Fase 7), que tardan unos 45 minutos.
+$withLoad = $args -contains '--carga'
+$scriptArgs = @($args | Where-Object { $_ -ne '--carga' })
 Set-Location (Join-Path $PSScriptRoot '..')
 $py = if ($env:PYTHON) { $env:PYTHON } else { 'py' }
 $env:PYTHONIOENCODING = 'utf-8'
@@ -20,6 +22,11 @@ Step '3/5 Compilación sin advertencias' { dotnet build -warnaserror }
 Step '4/5 Pruebas (sin carga)' {
     if (Test-Path TestResults) { Remove-Item -Recurse -Force TestResults }
     dotnet test --no-build --filter 'Category!=Load' --logger trx --results-directory TestResults
+}
+if ($withLoad) {
+    Step '4b/5 Pruebas de carga (T12)' {
+        dotnet test --no-build --filter 'Category=Load' --logger trx --results-directory TestResults/carga
+    }
 }
 Step '5/5 Trazabilidad Txx' { & $py -B build/check_traceability.py --trx-dir TestResults @scriptArgs }
 Write-Host 'Compuerta en verde.'

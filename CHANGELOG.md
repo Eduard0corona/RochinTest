@@ -2,6 +2,19 @@
 
 Cambios de la implementación. Los de la especificación están en `spec/CHANGELOG.md`.
 
+## Fase 7 · Hardening y demo (2026-10-15)
+
+- SQL Server caído en la ingesta: falla cerrada, sin detección, con `opc_records_rejected_total{cause=SQL_UNAVAILABLE}`; al volver SQL, el hueco de los ciclos perdidos (T19).
+- Recirculación: solo cuentan las detecciones anteriores de la caja, con el modo de identidad más restrictivo (SI-17, decidido por la persona; T16 y T32).
+- `outbox_pending_age_seconds` se actualiza también cuando la publicación falla (T08).
+- Tramos de latencia de la sección 10.4 que faltaban (`plc_to_opc_receive_ms`, `opc_receive_to_send_start_ms`, `print_deadline_slack_ms`, `send_start_to_applied_ms`, `applied_to_verified_ms`), con muestras acotadas por serie.
+- `ReadyJobSignal`: TX-A, TX-E y el barrido despiertan al sender de línea; el sondeo queda como respaldo.
+- Carga sostenida (T12) en `CartonPrinting.LoadTests` y `docs/BENCHMARK.md` generado por `build/benchmark_report.py`, como hipótesis declarada.
+- Seguridad: RabbitMQ con TLS configurable (`RabbitMq__Tls__*` o `amqps://`), `build/check_secrets.py` en la compuerta y `OpcSecurityTests` (SignAndEncrypt con validación estricta contra el PLC simulado).
+- Demo con el EdgeHost real como proceso (`tests/CartonPrinting.DemoHost`, `docs/DEMO.md`) y lista de aceptación en planta (`docs/FAT_CHECKLIST.md`).
+- Compuerta: paso de secretos y opción `--carga`.
+- Pruebas: T08, T12, T16, T19 y T32 en verde contra SQL Server y RabbitMQ reales y simuladores.
+
 ## Fase 6 · Perfil extendido (2026-10-15)
 
 - Sin código: `PERFIL_EXTENDIDO=NO` y OT-14 abierta. T09 y T20 quedan `NO_APLICA (OT-14 abierta)`.

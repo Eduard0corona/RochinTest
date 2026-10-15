@@ -1137,3 +1137,122 @@ Compuerta en verde.
 
 - Todo el perfil extendido: journal SQLite, `AckCycleId`, reproducción tardía del journal, I21 y G09. La FIFO simulada de T11 (Fase 2) es solo la recuperación de ciclos tras reconectar del perfil mínimo.
 
+## Fase 7 · Hardening y demo (T08, T12, T16, T19, T32)
+
+### Plan
+
+- **Entregables:**
+  - **Fallas:** RabbitMQ detenido 10 minutos con carga nominal (T08) y SQL Server caído mientras pasan cajas (T19).
+  - **Recirculación** con identidad física (T16) y sin ella (T32).
+  - **Carga (T12)** con simuladores en `CartonPrinting.LoadTests`, con la duración del catálogo. Se corre aparte (`Category=Load`) y se reporta en `docs/BENCHMARK.md`.
+  - **Seguridad:** OPC UA con SignAndEncrypt en la configuración, secretos fuera del repositorio y RabbitMQ con TLS configurable.
+  - **Demo y FAT:** `docs/DEMO.md` y `docs/FAT_CHECKLIST.md`.
+- **Pruebas que la cierran:** T08, T12, T16, T19 y T32.
+- **Riesgos previstos:**
+  - La tasa y el payload de T12 no están acordados con OT. La persona decidió usar una hipótesis declarada: una caja por segundo con el payload del simulador, 30 minutos a esa tasa y 10 al doble. `BENCHMARK.md` lo dice como hipótesis, no como aceptación en planta.
+  - Las pruebas largas (T08 y T12) comparan latencias y son sensibles a la carga de la máquina.
+
+### Lo hecho
+
+- **SQL Server caído en la ingesta (T19).** `SqlAvailability` distingue "SQL no disponible" de cualquier otro error de SQL.
+  - Con SQL caído, la ingesta reintenta dos veces y rechaza el ciclo (`opc_records_rejected_total{cause=SQL_UNAVAILABLE}`): falla cerrada, sin detección.
+  - Al volver SQL, recarga el estado de la estación, y el ciclo siguiente abre el hueco de los ciclos de la caída.
+  - Cualquier otro error de SQL sigue deteniendo el consumidor.
+- **Recirculación (T16, T32; SI-17 decidido por la persona).** TX-A y TX-E cuentan como recirculación solo las detecciones anteriores de la caja, con el modo de identidad más restrictivo entre el congelado y el activo.
+- **RabbitMQ caído (T08).** El Outbox Relay actualiza `outbox_pending_age_seconds` también cuando la publicación falla. Antes, con el broker caído, la métrica quedaba congelada en su último valor: justo la alerta de esa caída.
+- **Tramos de latencia de la sección 10.4.** De los tramos, solo `opc_receive_to_job_ready_ms` se medía. Ahora también se miden:
+  - `plc_to_opc_receive_ms`, en el registro, solo para notificaciones en vivo;
+  - `opc_receive_to_send_start_ms`: la marca monotónica de recepción viaja de TX-A al sender en `CartonMetrics`;
+  - `print_deadline_slack_ms`, en el sender;
+  - `send_start_to_applied_ms` y `applied_to_verified_ms`, en la evidencia.
+  
+  Las muestras en memoria quedan acotadas a 50 000 por serie, para no crecer sin fin en un proceso de larga duración.
+- **Señal en proceso (G11).** `ReadyJobSignal` (`System.Threading.Channels`): TX-A, TX-E y el barrido, cuando liberan un `RETRY_WAIT`, despiertan al sender de línea sin esperar su sondeo de 50 ms, que queda como respaldo. El EdgeHost lo registra como singleton.
+- **T12.** `StationPipeline` compone la estación como el EdgeHost:
+  - PLC simulado por OPC UA, ingesta real, señal, sender con sondeo de respaldo, impresora, aplicador y escáner simulados;
+  - nivel VERIFIED;
+  - una caja cada segundo durante 30 minutos y dos por segundo durante 10;
+  - 10 cajas de calentamiento fuera de la muestra.
+  
+  Escribe un reporte JSON que `build/benchmark_report.py` convierte en `docs/BENCHMARK.md`. `LatencySegmentsTests`, en la compuerta, comprueba que cada tramo tiene una muestra por caja y que la señal despierta al sender: con un sondeo de 2 s, sin señal la espera supera 500 ms y con señal no.
+- **Seguridad.**
+  - `RabbitMqOptions.CreateConnectionFactory`, que usan el publicador y los consumidores: TLS 1.2 o 1.3 con un Uri `amqps://` o con `Tls.Enabled`, el nombre esperado del broker y un certificado de cliente desde los secretos, sin errores de política aceptados.
+  - `build/check_secrets.py`, en la compuerta: ningún certificado, clave ni contraseña literal versionados fuera de `tests/` y `spec/`.
+  - `OpcSecurityTests`: el PLC simulado solo con SignAndEncrypt; el cliente con los valores por defecto (SignAndEncrypt, sin autoaceptar) rechaza un servidor que no es de confianza y se conecta cifrado cuando lo es.
+- **Demo.** `tests/CartonPrinting.DemoHost`:
+  - siembra una estación y arranca los simuladores (PLC, impresora, ERP, aplicador y escáner);
+  - lanza el EdgeHost real como proceso, configurado solo con variables de entorno, y hace pasar cajas hasta CONFIRMED.
+  
+  `DemoTests` lo ejecuta en la compuerta: es la primera prueba de composición del EdgeHost de punta a punta. `docs/DEMO.md` es el guion; `docs/FAT_CHECKLIST.md` lista lo que solo acepta la planta.
+- **Compuerta.** `build/ci.ps1` y `build/ci.sh`:
+  - agregan el paso de secretos;
+  - con `--carga`, corren además las pruebas de carga (`Category=Load`), para que la trazabilidad de la Fase 7 vea T12.
+
+### Decisiones
+
+1. **SQL caído: falla cerrada en el perfil mínimo** (ESTRATEGIA_RECUPERACION §3, OT-13 por defecto). Un ciclo que no se puede registrar no se registra: al volver SQL es parte de un hueco (`SequenceGap`), nunca una detección inventada (I07, I16). El latido baja `LabelingReady` porque no puede leer la estación.
+2. **RabbitMQ caído: simulado con un proxy TCP** entre el Outbox Relay y el broker, que corta las conexiones y no acepta nuevas. Detener el contenedor cambiaría su puerto en Testcontainers.
+   - El consumidor se conecta al broker directamente: lo que se prueba es la independencia del EdgeHost.
+   - T08 corre sin otras pruebas del ensamblado en paralelo, porque compara la latencia de impresión antes y durante la caída.
+3. **La señal en proceso es solo una señal.** El sender siempre lee de SQL qué enviar. Una señal perdida la cubre el sondeo de respaldo; varias seguidas lo despiertan una vez.
+4. **T12 con valores de laboratorio** (OT-03 abierta): `TransitBudgetMs` 1500, `DeviceLeadTimeMs` 400, `SendMarginMs` 250 y `ClockSkewToleranceMs` 50.
+   - El margen por defecto de las pruebas (100) no cubría p99(`presend_check_to_write_ms`) + `ClockJumpToleranceMs` (200), como pide la sección 17. La corrida corta lo mostró, y T12 lo comprueba junto con la desigualdad y con `DeviceLeadTimeMs` ≥ p99 medido.
+   - El PLC simulado negocia la publicación en 100 ms aunque se pidan 20: está en el reporte.
+5. **La demo hace de integración de evidencia.** El EdgeHost no tiene una entrada de evidencia propia (Fase 4), así que la demo aplica por TX-D la evidencia que informan la impresora, el aplicador y el escáner simulados. El PLC simulado va sin cifrado en la demo (laboratorio); la seguridad de planta la prueba `OpcSecurityTests`.
+6. **Secretos.** La revisión excluye `tests/`, porque las credenciales de los contenedores efímeros no son de planta, y `spec/`. Las variables de sqlcmd, de entorno y de plantilla no cuentan como contraseñas.
+
+### Comandos y resultados
+
+T08, corrida completa con la máquina en reposo, 2026-10-15 06:00 (`dotnet test tests/CartonPrinting.FaultTests --filter FullyQualifiedName~BrokerOutageTests`):
+
+```
+T08 latencia recepción→escritura (ms): antes p50=38 p95=41 máx=80; durante p50=39 p95=108 máx=3941; cajas=690
+Correctas CartonPrinting.FaultTests.Hardening.BrokerOutageTests.Ten_minutes_without_rabbitmq_change_nothing_in_printing_and_lose_no_event [11 m 31 s]
+```
+
+Durante el desarrollo:
+
+- **Las dos primeras corridas completas de T08 fallaron** con los jobs de los últimos 60 segundos de la caída vencidos (`DEADLINE_PASSED`). La causa estaba en la prueba: el lease de la impresora del escenario dura 10 minutos y nadie lo renovaba, así que TX-B rechazaba cada claim. `StationScenario.KeepLeaseAsync` lo renueva, como el ciclo de propiedad del EdgeHost; `StationPipeline` también lo usa.
+- **La tercera corrida pasó** las comprobaciones funcionales (690 cajas, ninguna perdida ni duplicada), pero no la de latencia (p95 de 509 ms durante la caída frente a 46 ms antes). La caída coincidió con las compilaciones y mutaciones de las revisiones de las Fases 4 y 5. Desde entonces T08 corre sola y se repitió con la máquina en reposo.
+- **`LatencySegmentsTests`** falló dos veces bajo la carga de esas revisiones. La primera caja en frío tardaba 1,7 s, con conexión y JIT, y el resto arrastraba el backlog. Además, un job venció sin la señal con un plazo de 5 s. Ahora tiene tres cajas de calentamiento, un plazo de 15 s y la comparación sobre diez cajas a una por segundo: tres corridas seguidas en verde.
+- **La corrida corta de T12** (1 minuto y 30 segundos) mostró que la desigualdad se cumplía y el margen no. Ver la decisión 4.
+
+T12, corrida completa con la máquina en reposo, terminada el 2026-10-15 a las 06:46 hora local (13:46 UTC):
+
+```
+CARTONPRINTING_BENCHMARK_OUT=<scratchpad>/benchmark-t12.json dotnet test tests/CartonPrinting.LoadTests --no-build --filter "Category=Load"
+  Correctas CartonPrinting.LoadTests.SustainedLoadTests.Thirty_minutes_at_the_agreed_rate_and_ten_at_double_keep_the_backlog_stable_and_the_deadline_feasible [40 m 18 s]
+Pruebas totales: 1
+     Correcto: 1
+ Tiempo total: 40.4510 Minutos
+```
+
+- **Carga:** 3010 cajas, 10 de calentamiento, 1800 a una por segundo y 1200 a dos por segundo. Todas `CONFIRMED` con VERIFIED, una etiqueta cada una. El backlog, muestreado cada segundo, quedó en 0 en ambas fases.
+- **Notificación → invocación de la escritura:**
+  - a la tasa pactada: p50 20,6 ms, p99 59,9 ms y máximo 267 ms;
+  - al doble: p99 61,1 ms.
+- **Desigualdad de factibilidad (PLC_TIMESTAMP):** 110 + 60 + 250 + 50 + 37 = 507 ms < 1500 ms.
+  - `SendMarginMs` 250 ≥ 0 + 200.
+  - `DeviceLeadTimeMs` 400 ≥ 37 medido.
+- **OPC UA:** publicación pedida en 20 ms y negociada en 100 ms, muestreo en 10 ms.
+
+`docs/BENCHMARK.md` se generó con `py build/benchmark_report.py <scratchpad>/benchmark-t12.json --fecha "2026-10-15 13:46 UTC (40 min 18 s)"`.
+
+### Pruebas de la fase
+
+- **T08, T12, T16, T19 y T32: PASA** (detalle en `docs/TEST_STATUS.md`). T12 corre aparte, con `Category=Load`, y en la compuerta de la fase con `--carga`.
+
+### Lo que no se verificó
+
+- **Ningún equipo real.** PLC, impresora, aplicador, escáner y ERP son simuladores; las garantías físicas y la aceptación están en `docs/FAT_CHECKLIST.md`.
+- **T08 y T19** simulan la caída con un proxy TCP, no deteniendo el broker ni el servidor de SQL. En T08 el consumidor no pierde su conexión.
+- **T12** es una hipótesis declarada: una sola máquina, red local, SQL Server en contenedor y simuladores sin tiempos físicos. El PLC simulado negocia la publicación en 100 ms. No mide la capacidad de una impresora o un aplicador reales (G12).
+- **TLS de RabbitMQ:** se prueba la configuración de la conexión (`RabbitMqTlsTests`), no una conexión TLS real contra un broker con certificados.
+- **OPC UA con SignAndEncrypt:** se prueba contra el PLC simulado con certificados autofirmados en directorios temporales; la PKI de planta (emisor, revocación) no se probó.
+- **La revisión de secretos** busca patrones conocidos (certificados, claves privadas, contraseñas literales, credenciales en Uri de RabbitMQ). No reemplaza una herramienta de detección de secretos.
+- **La demo** hace de integración de evidencia (el EdgeHost no tiene una propia) y conecta el PLC simulado sin cifrado.
+
+### Riesgos
+
+- Las pruebas que comparan latencias (T08 y `LatencySegmentsTests`) dependen de que la máquina no esté cargada. T08 corre sola; las demás tienen calentamiento y márgenes amplios.
+- La compuerta completa con `--carga` tarda más de una hora.

@@ -7,7 +7,8 @@ Revisa los archivos versionados (git ls-files) y falla (código 1) si encuentra:
 - en src/, build/, la configuración (*.json) y docker-compose: una contraseña literal en una cadena de conexión
   (Password= o Pwd= con un valor que no es una variable) o credenciales dentro de un Uri amqp/amqps.
 
-Quedan fuera tests/ (credenciales efímeras de los contenedores de Testcontainers) y spec/ (solo lectura).
+Quedan fuera tests/ (credenciales efímeras de los contenedores de Testcontainers), spec/ (solo lectura) y este
+script, cuyos patrones coinciden consigo mismos.
 Uso: py build/check_secrets.py
 """
 from __future__ import annotations
@@ -18,6 +19,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+SELF = Path(__file__).resolve().relative_to(ROOT).as_posix()
 CERT_FILES = re.compile(r"\.(pfx|p12|pem|key|der|crt|cer)$", re.IGNORECASE)
 PRIVATE_KEY = re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")
 PASSWORD = re.compile(r"(?i)\b(password|pwd)\s*=\s*(.*)")
@@ -32,7 +34,7 @@ def main() -> int:
     files = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True).stdout.splitlines()
     errors = []
     for name in files:
-        if name.startswith(("spec/", "tests/")):
+        if name.startswith(("spec/", "tests/")) or name == SELF:
             continue
         if CERT_FILES.search(name):
             errors.append(f"{name}: certificado o clave versionado")

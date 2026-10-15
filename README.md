@@ -1,6 +1,6 @@
 # CartonPrinting
 
-Implementación en .NET 10 del MVP de etiquetado industrial idempotente especificado en [`spec/`](spec/README.md) (paquete 1.1.3): ciclo OPC UA → `CartonDetected` → `PrintJob` → `PrintJobResult`, sin imprimir dos etiquetas por un evento duplicado.
+Implementación en .NET 10 del MVP de etiquetado industrial idempotente especificado en [`spec/`](spec/README.md) (paquete 1.1.4): ciclo OPC UA → `CartonDetected` → `PrintJob` → `PrintJobResult`, sin imprimir dos etiquetas por un evento duplicado.
 
 En el MVP, simuladores reemplazan al PLC, la impresora, el aplicador, el escáner y el ERP. **Nunca se conecta equipo real**: cualquier conexión con equipos de planta requiere autorización explícita de OT. Ninguna garantía física (etiqueta aplicada, ventana física, etiqueta en la caja correcta) se da por demostrada con simuladores.
 
@@ -8,11 +8,15 @@ En el MVP, simuladores reemplazan al PLC, la impresora, el aplicador, el escáne
 
 El estado real de cada prueba T01 a T47, con su evidencia, está en [`docs/TEST_STATUS.md`](docs/TEST_STATUS.md). Las decisiones, comandos ejecutados y riesgos por fase están en [`docs/IMPLEMENTATION_LOG.md`](docs/IMPLEMENTATION_LOG.md); los defectos encontrados en la especificación, en [`docs/SPEC_ISSUES.md`](docs/SPEC_ISSUES.md). Cada fase cerrada tiene su etiqueta git `fase-N-ok`.
 
+- **Demo** del flujo completo con el EdgeHost real y simuladores: [`docs/DEMO.md`](docs/DEMO.md).
+- **Benchmark** de carga (T12), con hipótesis declarada y sin tiempos físicos: [`docs/BENCHMARK.md`](docs/BENCHMARK.md).
+- **Aceptación en planta**: lo que solo la línea real puede demostrar, en [`docs/FAT_CHECKLIST.md`](docs/FAT_CHECKLIST.md).
+
 ## Estructura
 
 | Ruta | Contenido |
 | --- | --- |
-| `spec/` | Especificación 1.1.3, de solo lectura |
+| `spec/` | Especificación 1.1.4, de solo lectura |
 | `src/CartonPrinting.Contracts` | Tipos de `CartonDetected` y `PrintJobResult`, UUIDv5, huella JCS, validación JSON Schema y reglas de negocio |
 | `src/CartonPrinting.Infrastructure` | SQL Server, migraciones, reloj, telemetría |
 | `src/CartonPrinting.{OpcIngest,Orchestration,ErpSync,PrintAgent,Outbox,Recovery,Operations}` | Módulos de `spec/docs/ARQUITECTURA_TECNICA.md` |
@@ -61,6 +65,22 @@ powershell -ExecutionPolicy Bypass -File build/ci.ps1
 
 ```bash
 build/ci.sh
+```
+
+La compuerta revisa también que no haya secretos versionados (`build/check_secrets.py`). Con `--carga` corre además las pruebas de carga (T12, unos 45 minutos), que la compuerta de la Fase 7 necesita para su trazabilidad:
+
+```bash
+powershell -ExecutionPolicy Bypass -File build/ci.ps1 --fase 7 --carga
+```
+
+Las pruebas de carga por separado, con el reporte JSON que `build/benchmark_report.py` convierte en `docs/BENCHMARK.md`:
+
+```bash
+CARTONPRINTING_BENCHMARK_OUT=benchmark-t12.json dotnet test tests/CartonPrinting.LoadTests --filter "Category=Load"
+```
+
+```bash
+py build/benchmark_report.py benchmark-t12.json > docs/BENCHMARK.md
 ```
 
 ## Entorno local con Docker Compose
