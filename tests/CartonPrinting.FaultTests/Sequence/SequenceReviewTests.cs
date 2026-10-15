@@ -1,5 +1,7 @@
+using System.Threading.Channels;
 using CartonPrinting.Contracts;
 using CartonPrinting.Infrastructure.Data;
+using CartonPrinting.Infrastructure.Observability;
 using CartonPrinting.Infrastructure.Transactions;
 using CartonPrinting.OpcIngest;
 using CartonPrinting.Orchestration;
@@ -9,8 +11,8 @@ namespace CartonPrinting.FaultTests.Sequence;
 
 /// <summary>
 /// Regresiones de la revisión independiente de la Fase 2 contra SQL Server real: época confirmada que llega a
-/// la ingesta en ejecución, dos instancias en la misma estación, registros incoherentes que no alimentan el
-/// estado, canal saturado y los bloqueos RESET_SUSPECTED y AMBIGUOUS_DECREASE.
+/// la ingesta en ejecución, dos instancias en la misma estación, registros incoherentes con la misma regla en
+/// memoria y al recargar, canal saturado, reingresos concurrentes y los bloqueos RESET_SUSPECTED y AMBIGUOUS_DECREASE.
 /// </summary>
 public sealed class SequenceReviewTests(SqlServerFixture sql) : IAsyncLifetime
 {
@@ -45,6 +47,9 @@ public sealed class SequenceReviewTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Equal(IngestKind.Registered, live.Kind);
         Assert.Equal(DetectionStatus.JobCreated, live.Result!.FinalStatus);
         Assert.True((await s.Stations.GetActiveAsync(StationScenario.SiteId, s.StationId, Ct))!.Value.State.LabelingEnabled);
+
+        // B6: la época confirmada se cuenta una vez, al aparecer en la recarga.
+        Assert.Equal(1, s.Metrics.Total(MetricNames.PlcEpochChanges, ("mode", PlcEpochStore.OperatorConfirmed)));
     }
 
     /// <summary>M2: con dos instancias, los registros de la otra son duplicados que mueven la marca alta; ningún hueco espurio.</summary>
@@ -71,36 +76,114 @@ public sealed class SequenceReviewTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Equal((704UL, 704UL), (a.Classifier.Current!.HighWater!.Value, b.Classifier.Current!.HighWater!.Value));
     }
 
-    /// <summary>B1: un registro incoherente no acepta épocas ni mueve la marca alta ni abre huecos.</summary>
+    /// <summary>
+    /// B1 y MEDIA-3 (segunda revisión): un registro incoherente queda BLOCKED, abre su hueco y mueve la marca alta sin
+    /// aportar su hora, igual en memoria que al recargar el estado desde SQL; no acepta épocas.
+    /// </summary>
     [Fact]
     [Trait("Spec", "T13")]
-    public async Task An_incoherent_record_does_not_feed_the_sequence_state()
+    public async Task An_incoherent_record_feeds_the_mark_the_same_in_memory_and_after_reload()
     {
         var (s, ingest) = await StationAsync(_db);
         await ingest.ProcessRecordAsync(s.Cycle(100), Ct);
+        s.AdvanceMs(300);
         var mixed = await ingest.ProcessRecordAsync(s.Cycle(105) with { Coherent = false }, Ct);
-        Assert.Equal((DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot), (mixed.Result!.FinalStatus, mixed.Result.FinalReason));
-        Assert.Equal(100UL, ingest.Classifier.Current!.HighWater);
-        Assert.Equal(SequenceCase.InOrder, (await ingest.ProcessRecordAsync(s.Cycle(101), Ct)).Case);
-        Assert.Equal(0, await s.CountAsync("FROM dbo.SequenceGap WHERE StationId = @st", c => c.Parameters.AddWithValue("@st", s.StationId), Ct));
+        Assert.Equal((SequenceCase.Gap, DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot),
+            (mixed.Case, mixed.Result!.FinalStatus, mixed.Result.FinalReason));
+        Assert.Equal(1, await s.CountAsync("FROM dbo.SequenceGap WHERE StationId = @st AND FromCycleId = 101 AND ToCycleId = 104",
+            c => c.Parameters.AddWithValue("@st", s.StationId), Ct));
+
+        var reloaded = s.Ingest();
+        await reloaded.ReloadAsync(Ct);
+        Assert.Equal((105UL, (DateTime?)null), (ingest.Classifier.Current!.HighWater, ingest.Classifier.Current.HighWaterTimestamp));
+        Assert.Equal(ingest.Classifier.Current, reloaded.Classifier.Current);
+
+        // El 101 legítimo se clasifica igual en las dos: sin hora confiable en la marca, un tardío no se distingue de
+        // un reinicio (AMBIGUOUS_DECREASE, WARNING, sin bloquear la estación).
+        s.AdvanceMs(300);
+        var late = s.Cycle(101);
+        var before = Assert.IsType<SequenceVerdict.Register>(ingest.Classifier.Classify(late, s.Revision, s.Clock.UtcNow));
+        var after = Assert.IsType<SequenceVerdict.Register>(reloaded.Classifier.Classify(late, s.Revision, s.Clock.UtcNow));
+        Assert.Equal((SequenceCase.AmbiguousDecrease, SequenceCase.AmbiguousDecrease), (before.Case, after.Case));
 
         var unknownEpoch = await ingest.ProcessRecordAsync(s.Cycle(1, epoch: 43) with { Coherent = false }, Ct);
         Assert.Equal(IngestKind.Retained, unknownEpoch.Kind);
         Assert.DoesNotContain(await s.Epochs.ListAsync(StationScenario.SiteId, s.StationId, Ct), e => e.Epoch == 43);
     }
 
-    /// <summary>M4: con el canal de la ingesta saturado, LabelingReady baja.</summary>
+    /// <summary>BAJA-2 (segunda revisión): un incoherente de una época recién confirmada se registra; no vuelve a bloquear la estación.</summary>
+    [Fact]
+    [Trait("Spec", "T25")]
+    public async Task An_incoherent_record_of_a_just_confirmed_epoch_does_not_block_the_station_again()
+    {
+        var (s, ingest) = await StationAsync(_db, r => r with { EpochChangePolicy = "REQUIRE_CONFIRMATION" });
+        await ingest.ProcessRecordAsync(s.Cycle(100), Ct);
+        Assert.Equal(IngestKind.Retained, (await ingest.ProcessRecordAsync(s.Cycle(1, epoch: 43), Ct)).Kind);
+
+        // Otra instancia (la API de operación) confirma y desbloquea: esta ingesta no lo sabe todavía.
+        await s.Txm.ConfirmEpochAsync(StationScenario.SiteId, s.StationId, 43, 1, s.Revision.ConfigRevisionId, "supervisor.ramos", "OT confirma", s.Clock.UtcNow, Ct);
+        await s.Txm.UnblockStationAsync(StationScenario.SiteId, s.StationId, "supervisor.ramos", "Época confirmada", s.Clock.UtcNow, Ct);
+        var mixed = await ingest.ProcessRecordAsync(s.Cycle(2, epoch: 43) with { Coherent = false }, Ct);
+        Assert.Equal(IngestKind.Registered, mixed.Kind);
+        Assert.Equal((DetectionStatus.Blocked, DetectionReason.IncoherentSnapshot), (mixed.Result!.FinalStatus, mixed.Result.FinalReason));
+        Assert.True((await s.Stations.GetActiveAsync(StationScenario.SiteId, s.StationId, Ct))!.Value.State.LabelingEnabled);
+    }
+
+    /// <summary>
+    /// M4 y BAJA-4 (segunda revisión): con el canal acotado real al 90 % o con notificaciones descartadas desde el
+    /// latido anterior, LabelingReady baja. Los descartes se cuentan en cada latido, también sin conexión.
+    /// </summary>
     [Fact]
     public async Task A_saturated_channel_lowers_labeling_ready()
     {
         var s = await StationScenario.CreateAsync(_db, ct: Ct);
-        var saturated = false;
+        var channel = Channel.CreateBounded<RawNotification>(10);
+        long dropped = 0;
+        var pressure = new ChannelPressure(channel.Reader, 10, () => Interlocked.Read(ref dropped));
         var sink = new IngestScenario.RecordingSink();
-        var heartbeat = new LabelingReadyHeartbeat(s.Settings, s.Stations, sink, s.Metrics, overloaded: () => saturated);
+        var heartbeat = new LabelingReadyHeartbeat(s.Settings, s.Stations, sink, s.Metrics, overloaded: pressure.Overloaded);
+        var raw = new RawNotification("x", true, 0, false, Transport.Subscription, s.Clock.UtcNow, 0, null, null, 1, "ns=2;s=Record");
+
         Assert.True(await heartbeat.BeatAsync(Ct));
-        saturated = true;
-        Assert.False(await heartbeat.BeatAsync(Ct));
-        Assert.Equal([true, false], sink.Writes);
+        for (var i = 0; i < 8; i++)
+        {
+            Assert.True(channel.Writer.TryWrite(raw));
+        }
+
+        Assert.True(await heartbeat.BeatAsync(Ct));    // 8 de 10
+        Assert.True(channel.Writer.TryWrite(raw));
+        Assert.False(await heartbeat.BeatAsync(Ct));   // 9 de 10
+        while (channel.Reader.TryRead(out _))
+        {
+        }
+
+        Assert.True(await heartbeat.BeatAsync(Ct));
+        Interlocked.Increment(ref dropped);
+        Assert.False(await heartbeat.BeatAsync(Ct));   // descartes desde el latido anterior
+        Assert.True(await heartbeat.BeatAsync(Ct));
+
+        sink.Connected = false;
+        Interlocked.Increment(ref dropped);
+        Assert.False(await heartbeat.BeatAsync(Ct));   // sin conexión: no escribe, pero cuenta el descarte
+        sink.Connected = true;
+        Assert.True(await heartbeat.BeatAsync(Ct));
+        Assert.Equal([true, true, false, true, false, true, true], sink.Writes);
+    }
+
+    /// <summary>BAJA-6 (segunda revisión): una anomalía ya resuelta no se vuelve a resolver ni deja una OperatorAction sin efecto.</summary>
+    [Fact]
+    public async Task Resolving_an_already_resolved_anomaly_leaves_no_operator_action()
+    {
+        var (s, ingest) = await StationAsync(_db, r => r with { EpochChangePolicy = "REQUIRE_CONFIRMATION" });
+        await ingest.ProcessRecordAsync(s.Cycle(100), Ct);
+        var retained = await ingest.ProcessRecordAsync(s.Cycle(1, epoch: 43), Ct);
+        var anomalyId = retained.AnomalyId!.Value;
+
+        var first = await s.Txm.ResolveAnomalyAsync(anomalyId, StationScenario.SiteId, s.StationId, "supervisor.ramos", "Reingresado", s.Clock.UtcNow, Ct);
+        var second = await s.Txm.ResolveAnomalyAsync(anomalyId, StationScenario.SiteId, s.StationId, "supervisor.lopez", "Reingresado", s.Clock.UtcNow, Ct);
+        Assert.Equal((true, false), (first.Applied, second.Applied));
+        Assert.Equal(1, await s.CountAsync("FROM dbo.OperatorAction WHERE ActionType = 'RESOLVE_ANOMALY' AND StationId = @st",
+            c => c.Parameters.AddWithValue("@st", s.StationId), Ct));
     }
 
     /// <summary>RESET_SUSPECTED y AMBIGUOUS_DECREASE repetido bloquean la estación y dejan la detección BLOCKED.</summary>

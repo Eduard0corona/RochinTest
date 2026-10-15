@@ -44,8 +44,10 @@ public sealed record ErpWorkOrder
 public sealed class ErpSimulatorServer : IAsyncDisposable
 {
     private readonly ConcurrentDictionary<string, ErpWorkOrder> _orders = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, int> _answered = new(StringComparer.Ordinal);
     private WebApplication? _app;
     private int _requests;
+    private TaskCompletionSource _gate = Completed();
 
     public ErpMode Mode { get; set; } = ErpMode.Up;
 
@@ -71,9 +73,37 @@ public sealed class ErpSimulatorServer : IAsyncDisposable
 
     public void Set(ErpWorkOrder order) => _orders[order.WorkOrderId] = order;
 
+    /// <summary>Retiene toda petición (después de contarla) hasta <see cref="Release"/>.</summary>
+    public void Hold() => Interlocked.Exchange(ref _gate, new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously));
+
+    public void Release() => Volatile.Read(ref _gate).TrySetResult();
+
+    /// <summary>Respuestas ya enviadas para una orden (cualquier código).</summary>
+    public int Answered(string workOrderId) => _answered.TryGetValue(workOrderId, out var n) ? n : 0;
+
+    private static TaskCompletionSource Completed()
+    {
+        var done = new TaskCompletionSource();
+        done.SetResult();
+        return done;
+    }
+
     private async Task<IResult> HandleAsync(string id, HttpContext http)
     {
         Interlocked.Increment(ref _requests);
+        try
+        {
+            return await AnswerAsync(id, http);
+        }
+        finally
+        {
+            _answered.AddOrUpdate(id, 1, (_, n) => n + 1);
+        }
+    }
+
+    private async Task<IResult> AnswerAsync(string id, HttpContext http)
+    {
+        await Volatile.Read(ref _gate).Task.WaitAsync(http.RequestAborted);
         if (DelayMs > 0)
         {
             await Task.Delay(DelayMs, http.RequestAborted);

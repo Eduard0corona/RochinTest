@@ -93,20 +93,32 @@ public sealed class ErpSnapshotSync : IErpDemand
             "SiteId = @site AND StationId = @station AND Status = 'WAITING_ERP'",
             c => c.NVarChar("@site", _station.SiteId, 64).NVarChar("@station", _station.StationId, 64), ct), ct);
         var processed = 0;
-        foreach (var order in waiting.Where(d => d.WorkOrderId is not null).GroupBy(d => d.WorkOrderId!, StringComparer.Ordinal))
-        {
-            var snapshot = await _cache.FindValidAsync(order.Key, _clock.UtcNow, ct) ?? await FetchAsync(order.Key, ct);
-            if (snapshot is null)
-            {
-                continue;
-            }
 
-            foreach (var detection in order)
+        // Las órdenes con el plazo más próximo primero; una orden que falla no detiene a las demás.
+        var orders = waiting.Where(d => d.WorkOrderId is not null)
+            .GroupBy(d => d.WorkOrderId!, StringComparer.Ordinal)
+            .OrderBy(g => g.Min(d => d.DeadlineAt));
+        foreach (var order in orders)
+        {
+            try
             {
-                if (await _arrivals.ProcessAsync(detection, snapshot, ct) is not null)
+                var snapshot = await _cache.FindValidAsync(order.Key, _clock.UtcNow, ct) ?? await FetchAsync(order.Key, ct);
+                if (snapshot is null)
                 {
-                    processed++;
+                    continue;
                 }
+
+                foreach (var detection in order.OrderBy(d => d.DeadlineAt))
+                {
+                    if (await _arrivals.ProcessAsync(detection, snapshot, ct) is not null)
+                    {
+                        processed++;
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "Sincronización ERP de la orden {WorkOrder} fallida; las demás órdenes siguen", order.Key);
             }
         }
 
@@ -128,8 +140,19 @@ public sealed class ErpSnapshotSync : IErpDemand
                 return null;
             }
 
+            // El job se arma con la fila de la caché a la que apuntará FK_PrintJob_Erp, no con la respuesta: si la
+            // revisión ya existía con otro contenido, el ERP la reutilizó y el snapshot no está disponible (I10).
             await _cache.UpsertAsync(snapshot, ct);
-            return snapshot.IsValidAt(_clock.UtcNow) ? snapshot : null;
+            var stored = await _cache.GetRevisionAsync(snapshot.WorkOrderId, snapshot.Revision, ct);
+            if (stored is null || !SameContent(stored, snapshot))
+            {
+                _metrics.Increment(MetricNames.ErpRequests, ("outcome", "revision_conflict"));
+                _logger.LogError("El ERP devolvió la revisión {Revision} de {WorkOrder} con otro contenido que el guardado; no se usa",
+                    snapshot.Revision, snapshot.WorkOrderId);
+                return null;
+            }
+
+            return stored.IsValidAt(_clock.UtcNow) ? stored : null;
         }
         catch (Exception ex) when (ex is ErpUnavailableException or TimeoutRejectedException or BrokenCircuitException)
         {
@@ -138,6 +161,9 @@ public sealed class ErpSnapshotSync : IErpDemand
             return null;
         }
     }
+
+    private static bool SameContent(ErpSnapshot a, ErpSnapshot b) =>
+        a.ProductId == b.ProductId && a.LotId == b.LotId && a.Gtin == b.Gtin && a.ValidFrom == b.ValidFrom && a.ValidUntil == b.ValidUntil;
 
     /// <summary>Sondeo con señal: una pasada por señal de la ingesta o cada PollIntervalMs.</summary>
     public async Task RunAsync(TimeProvider loopTime, CancellationToken ct)

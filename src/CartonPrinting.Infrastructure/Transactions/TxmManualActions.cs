@@ -188,8 +188,7 @@ public sealed class TxmManualActions(SqlDb db)
     public Task<ManualResult> ResolveAnomalyAsync(long anomalyId, string siteId, string stationId, string performedBy, string resolution, DateTime edgeNowUtc, CancellationToken ct) =>
         db.InTransactionAsync(async (conn, tx) =>
         {
-            var oa = await InsertOperatorActionAsync(conn, tx, new OperatorActionInput(OperatorActionType.ResolveAnomaly, siteId, stationId, null, null,
-                performedBy, resolution), edgeNowUtc, ct);
+            // La resolución primero: si otra acción ya la resolvió, no queda una OperatorAction que no resolvió nada.
             await using var cmd = conn.Command(tx, """
                 DECLARE @resolved TABLE (AnomalyId BIGINT NOT NULL);
                 UPDATE dbo.SequenceAnomaly SET ResolvedAt = @EdgeNowUtc, ResolvedBy = @PerformedBy, Resolution = @Resolution
@@ -199,7 +198,14 @@ public sealed class TxmManualActions(SqlDb db)
                 """);
             cmd.DateTime2("@EdgeNowUtc", edgeNowUtc).NVarChar("@PerformedBy", performedBy, 128).NVarChar("@Resolution", resolution, 512)
                 .BigInt("@AnomalyId", anomalyId).NVarChar("@SiteId", siteId, 64).NVarChar("@StationId", stationId, 64);
-            return new ManualResult(oa, (int)(await cmd.ExecuteScalarAsync(ct))! == 1, null);
+            if ((int)(await cmd.ExecuteScalarAsync(ct))! != 1)
+            {
+                return new ManualResult(0, false, null);
+            }
+
+            var oa = await InsertOperatorActionAsync(conn, tx, new OperatorActionInput(OperatorActionType.ResolveAnomaly, siteId, stationId, null, null,
+                performedBy, resolution), edgeNowUtc, ct);
+            return new ManualResult(oa, true, null);
         }, ct);
 
     /// <summary>R01: solicitud aprobada por dos personas. Los CHECK y TR_ReprintAuthorization_Guard validan coherencia.</summary>

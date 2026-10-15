@@ -183,4 +183,45 @@ public sealed class OpcClientTransportTests
         var first = (await h.CollectUntilAsync(l => l.Any(n => n.Value is { Length: > 0 } v && LatchedRecord.Parse(v).CycleId == 760))).Select(Dump).Last();
         Assert.Equal(Transport.Subscription, first.Transport);
     }
+
+    /// <summary>
+    /// Segunda revisión de la Fase 2, MEDIA-2: después de un reinicio del PLC (suscripción recreada), lo publicado
+    /// durante un corte del enlace se recupera de la suscripción viva como REPUBLISH en esa misma recuperación, sin
+    /// esperar a otra reconexión, y nunca como SUBSCRIPTION.
+    /// </summary>
+    [Fact]
+    public async Task After_a_server_restart_changes_during_a_frozen_link_are_recovered_from_the_live_subscription()
+    {
+        await using var h = await OpcHarness.StartAsync("OPC-G", new EdgeClock(TimeProvider.System));
+        await h.NextAsync();
+        await h.RestartServerAsync();
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (!h.Client.Connected && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(100);
+        }
+
+        Assert.True(h.Client.Connected, string.Join(" | ", h.Client.ConnectionEvents));
+        await Task.Delay(500);
+        while (h.Notifications.Reader.TryRead(out _))
+        {
+        }
+
+        h.Server.Nodes.Publish(Record(770));
+        await h.CollectUntilAsync(l => l.Any(n => n.Value is { Length: > 0 } v && LatchedRecord.Parse(v).CycleId == 770));
+
+        h.Proxy.Freeze();
+        await Task.Delay(300);
+        h.Server.Nodes.Publish(Record(771));
+        h.Server.Nodes.Publish(Record(772));
+        await Task.Delay(2500);
+        h.Proxy.SeverAll();
+        h.Proxy.Resume();
+
+        var got = (await h.CollectUntilAsync(l => l.Any(n => n.Transport == Transport.Republish && n.Value is { Length: > 0 } v
+            && LatchedRecord.Parse(v).CycleId == 772), TimeSpan.FromSeconds(15))).Select(Dump).ToList();
+        var events = string.Join(" | ", h.Client.ConnectionEvents);
+        Assert.True(got.Any(n => n.Transport == Transport.Republish && n.Cycle == 772), events);
+        Assert.DoesNotContain(got, n => n.Transport == Transport.Subscription && n.Cycle is 771 or 772);
+    }
 }

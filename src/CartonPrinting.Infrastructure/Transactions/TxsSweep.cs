@@ -8,6 +8,9 @@ public sealed record SweepTransition(string Kind, Guid Id, string From, string T
 
 public sealed record GapClosure(long GapId, string Status, ulong UnrecoveredCount);
 
+/// <summary>Job pendiente (READY o RETRY_WAIT) con su detección, para que el EdgeHost calcule su plazo efectivo.</summary>
+public sealed record PendingJob(Guid PrintJobId, string Status, DateTime DeadlineAt, DateTime? NextAttemptAt, long ConfigRevisionId, DetectionRecord Detection);
+
 /// <summary>
 /// TX-S: barrido por estación. Cierra y publica (D07, J03, J13, J14, J11/A06, X03, G03, R04); no es
 /// la protección contra envíos tardíos, que es la guarda del claim. Cada operación es su propia
@@ -15,7 +18,77 @@ public sealed record GapClosure(long GapId, string Status, ulong UnrecoveredCoun
 /// </summary>
 public sealed class TxsSweep(SqlDb db)
 {
-    /// <summary>J03 y J14 con DEADLINE_PASSED; margen efectivo por job: el mayor entre el congelado y el activo.</summary>
+    /// <summary>
+    /// Jobs READY o RETRY_WAIT de la estación con su detección, en orden de plazo. El barrido calcula con ellos el
+    /// plazo efectivo (DeadlinePolicy.Effective) y lo aplica por job con las guardas de SQL.
+    /// </summary>
+    public Task<IReadOnlyList<PendingJob>> ListPendingJobsAsync(string siteId, string stationId, CancellationToken ct) =>
+        db.ReadAsync<IReadOnlyList<PendingJob>>(async conn =>
+        {
+            var jobs = new List<(Guid Id, string Status, DateTime DeadlineAt, DateTime? NextAttemptAt, long Revision, Guid DetectionId)>();
+            await using (var cmd = conn.Command(null, """
+                SELECT PrintJobId, Status, DeadlineAt, NextAttemptAt, ConfigRevisionId, DetectionId
+                FROM dbo.PrintJob
+                WHERE SiteId = @SiteId AND StationId = @StationId AND Status IN ('READY', 'RETRY_WAIT')
+                ORDER BY DeadlineAt, PrintJobId;
+                """))
+            {
+                cmd.NVarChar("@SiteId", siteId, 64).NVarChar("@StationId", stationId, 64);
+                await using var r = await cmd.ExecuteReaderAsync(ct);
+                while (await r.ReadAsync(ct))
+                {
+                    jobs.Add((r.GetGuid(0), r.GetString(1), r.GetUtc(2), r.GetNullableUtc(3), r.GetInt64(4), r.GetGuid(5)));
+                }
+            }
+
+            var list = new List<PendingJob>();
+            foreach (var j in jobs)
+            {
+                if (await DetectionQueries.GetAsync(conn, null, j.DetectionId, ct) is { } detection)
+                {
+                    list.Add(new PendingJob(j.Id, j.Status, j.DeadlineAt, j.NextAttemptAt, j.Revision, detection));
+                }
+            }
+
+            return list;
+        }, ct);
+
+    /// <summary>Detecciones WAITING_ERP de la estación, en orden de plazo.</summary>
+    public Task<IReadOnlyList<DetectionRecord>> ListWaitingErpAsync(string siteId, string stationId, CancellationToken ct) =>
+        db.ReadAsync<IReadOnlyList<DetectionRecord>>(async conn =>
+            (await DetectionQueries.ListAsync(conn, null, "SiteId = @site AND StationId = @station AND Status = 'WAITING_ERP'",
+                c => c.NVarChar("@site", siteId, 64).NVarChar("@station", stationId, 64), ct)).OrderBy(d => d.DeadlineAt).ToList(), ct);
+
+    /// <summary>
+    /// J03 y J14 con DEADLINE_PASSED para un job cuyo plazo efectivo venció con su margen efectivo (el plazo y el
+    /// margen los calcula el EdgeHost con la revisión activa, que la transacción exige vigente). El plazo efectivo
+    /// nunca es posterior al congelado: esta guarda incluye la de la sentencia de referencia (SI-14).
+    /// </summary>
+    public async Task<SweepTransition?> ExpireEffectiveDeadlineAsync(
+        string siteId, string stationId, Guid printJobId, DateTime effectiveDeadlineUtc, int effectiveSendMarginMs, long activeConfigRevisionId,
+        DateTime edgeNowUtc, CancellationToken ct) =>
+        (await ExpireJobsAsync("""
+            UPDATE pj
+            SET Status = 'EXPIRED', Reason = 'DEADLINE_PASSED', NextAttemptAt = NULL,
+                ResultVersion = pj.ResultVersion + 1, UpdatedAt = @EdgeNowUtc
+            OUTPUT inserted.PrintJobId, deleted.Status INTO @expired (PrintJobId, FromStatus)
+            FROM dbo.PrintJob AS pj
+            INNER JOIN dbo.StationConfig AS sc ON sc.SiteId = pj.SiteId AND sc.StationId = pj.StationId
+            WHERE pj.PrintJobId = @PrintJobId AND pj.SiteId = @SiteId AND pj.StationId = @StationId
+              AND pj.Status IN ('READY', 'RETRY_WAIT')
+              AND sc.ActiveConfigRevisionId = @ActiveConfigRevisionId
+              AND (   pj.DeadlineAt <= DATEADD(MILLISECOND, @EffectiveSendMarginMs, @EdgeNowUtc)
+                   OR @EffectiveDeadlineUtc <= DATEADD(MILLISECOND, @EffectiveSendMarginMs, @EdgeNowUtc));
+            """, JobReason.DeadlinePassed, siteId, stationId,
+            c => c.Guid("@PrintJobId", printJobId).DateTime2("@EffectiveDeadlineUtc", effectiveDeadlineUtc)
+                .Int("@EffectiveSendMarginMs", effectiveSendMarginMs).BigInt("@ActiveConfigRevisionId", activeConfigRevisionId),
+            edgeNowUtc, ct)).SingleOrDefault();
+
+    /// <summary>
+    /// Sentencia de referencia de J03 y J14 con DEADLINE_PASSED (spec/database/sqlserver_operations_reference.sql):
+    /// usa el plazo congelado, no el efectivo (SI-14). El barrido usa <see cref="ExpireEffectiveDeadlineAsync"/>; esta
+    /// queda para las pruebas de las sentencias de referencia.
+    /// </summary>
     public Task<IReadOnlyList<SweepTransition>> ExpireDeadlinesAsync(string siteId, string stationId, int activeSendMarginMs, DateTime edgeNowUtc, CancellationToken ct) =>
         ExpireJobsAsync("""
             UPDATE pj
@@ -51,11 +124,14 @@ public sealed class TxsSweep(SqlDb db)
             """, JobReason.OutOfOrder, siteId, stationId, _ => { }, edgeNowUtc, ct);
 
     /// <summary>
-    /// J13: RETRY_WAIT → READY cuando se cumple NextAttemptAt, con plazo vigente con margen y sin un
-    /// ciclo posterior ya reclamado por la impresora. Devuelve los jobs a señalar al sender.
+    /// J13: RETRY_WAIT → READY de un job cuando se cumple NextAttemptAt, con su plazo efectivo vigente con el margen
+    /// efectivo (los calcula el EdgeHost con la revisión activa, que la transacción exige vigente; el congelado
+    /// también se exige) y sin un ciclo posterior ya reclamado por la impresora. Devuelve la transición, o null si
+    /// alguna guarda no se cumple. No tiene sentencia de referencia: es diseño de esta implementación.
     /// </summary>
-    public Task<IReadOnlyList<SweepTransition>> ReleaseRetriesAsync(string siteId, string stationId, int activeSendMarginMs, DateTime edgeNowUtc, CancellationToken ct) =>
-        db.InTransactionAsync<IReadOnlyList<SweepTransition>>(async (conn, tx) =>
+    public Task<SweepTransition?> ReleaseRetryAsync(
+        Guid printJobId, DateTime effectiveDeadlineUtc, int effectiveSendMarginMs, long activeConfigRevisionId, DateTime edgeNowUtc, CancellationToken ct) =>
+        db.InTransactionAsync<SweepTransition?>(async (conn, tx) =>
         {
             await using var cmd = conn.Command(tx, """
                 DECLARE @ready TABLE (PrintJobId UNIQUEIDENTIFIER NOT NULL);
@@ -63,34 +139,71 @@ public sealed class TxsSweep(SqlDb db)
                 SET Status = 'READY', NextAttemptAt = NULL, UpdatedAt = @EdgeNowUtc
                 OUTPUT inserted.PrintJobId INTO @ready (PrintJobId)
                 FROM dbo.PrintJob AS pj
-                INNER JOIN dbo.StationConfigRevision AS fr ON fr.ConfigRevisionId = pj.ConfigRevisionId
+                INNER JOIN dbo.StationConfig AS sc ON sc.SiteId = pj.SiteId AND sc.StationId = pj.StationId
                 INNER JOIN dbo.PlcEpochHistory AS eh
                     ON eh.SiteId = pj.SiteId AND eh.StationId = pj.StationId AND eh.PlcEpoch = pj.PlcEpoch
                 LEFT JOIN dbo.PrinterSendOrder AS so ON so.PrinterId = pj.PrinterId
-                WHERE pj.SiteId = @SiteId AND pj.StationId = @StationId
+                WHERE pj.PrintJobId = @PrintJobId
                   AND pj.Status = 'RETRY_WAIT' AND pj.NextAttemptAt <= @EdgeNowUtc
-                  AND pj.DeadlineAt > DATEADD(
-                      MILLISECOND,
-                      CASE WHEN fr.SendMarginMs > @ActiveSendMarginMs THEN fr.SendMarginMs ELSE @ActiveSendMarginMs END,
-                      @EdgeNowUtc)
+                  AND sc.ActiveConfigRevisionId = @ActiveConfigRevisionId
+                  AND pj.DeadlineAt > DATEADD(MILLISECOND, @EffectiveSendMarginMs, @EdgeNowUtc)
+                  AND @EffectiveDeadlineUtc > DATEADD(MILLISECOND, @EffectiveSendMarginMs, @EdgeNowUtc)
                   AND (   so.LastPrintJobId IS NULL OR so.LastPrintJobId = pj.PrintJobId
                        OR (pj.PlcEpoch <> so.LastPlcEpoch AND eh.AcceptedAt > so.LastEpochAcceptedAt)
                        OR (pj.PlcEpoch = so.LastPlcEpoch AND pj.CycleId > so.LastCycleId));
-                SELECT PrintJobId FROM @ready;
+                SELECT COUNT(*) FROM @ready;
                 """);
-            cmd.DateTime2("@EdgeNowUtc", edgeNowUtc).NVarChar("@SiteId", siteId, 64).NVarChar("@StationId", stationId, 64)
-                .Int("@ActiveSendMarginMs", activeSendMarginMs);
-            var list = new List<SweepTransition>();
-            await using var r = await cmd.ExecuteReaderAsync(ct);
-            while (await r.ReadAsync(ct))
-            {
-                list.Add(new SweepTransition("PrintJob", r.GetGuid(0), JobStatus.RetryWait, JobStatus.Ready, null, null));
-            }
-
-            return list;
+            cmd.DateTime2("@EdgeNowUtc", edgeNowUtc).Guid("@PrintJobId", printJobId).DateTime2("@EffectiveDeadlineUtc", effectiveDeadlineUtc)
+                .Int("@EffectiveSendMarginMs", effectiveSendMarginMs).BigInt("@ActiveConfigRevisionId", activeConfigRevisionId);
+            return (int)(await cmd.ExecuteScalarAsync(ct))! == 1
+                ? new SweepTransition("PrintJob", printJobId, JobStatus.RetryWait, JobStatus.Ready, null, null)
+                : null;
         }, ct);
 
-    /// <summary>D07: detecciones WAITING_ERP con el plazo vencido quedan EXPIRED con ERP_UNAVAILABLE.</summary>
+    /// <summary>
+    /// D07 de una detección WAITING_ERP cuyo plazo efectivo venció con su margen efectivo (los mismos que usa TX-E,
+    /// así que el barrido nunca vence algo que TX-E aceptaría). La transacción exige vigente la revisión activa con
+    /// que se calcularon.
+    /// </summary>
+    public Task<SweepTransition?> ExpireWaitingErpDetectionAsync(
+        Guid detectionId, DateTime effectiveDeadlineUtc, int effectiveSendMarginMs, long activeConfigRevisionId, DateTime edgeNowUtc, CancellationToken ct) =>
+        db.InTransactionAsync<SweepTransition?>(async (conn, tx) =>
+        {
+            string? labelType;
+            await using (var cmd = conn.Command(tx, """
+                DECLARE @expired TABLE (DetectionId UNIQUEIDENTIFIER NOT NULL, ConfigRevisionId BIGINT NOT NULL);
+                UPDATE cd
+                SET Status = 'EXPIRED', Reason = 'ERP_UNAVAILABLE', UpdatedAt = @EdgeNowUtc
+                OUTPUT inserted.DetectionId, inserted.ConfigRevisionId INTO @expired (DetectionId, ConfigRevisionId)
+                FROM dbo.CartonDetection AS cd
+                INNER JOIN dbo.StationConfig AS sc ON sc.SiteId = cd.SiteId AND sc.StationId = cd.StationId
+                WHERE cd.DetectionId = @DetectionId AND cd.Status = 'WAITING_ERP'
+                  AND sc.ActiveConfigRevisionId = @ActiveConfigRevisionId
+                  AND (   cd.DeadlineAt <= DATEADD(MILLISECOND, @EffectiveSendMarginMs, @EdgeNowUtc)
+                       OR @EffectiveDeadlineUtc <= DATEADD(MILLISECOND, @EffectiveSendMarginMs, @EdgeNowUtc));
+                SELECT r.LabelType FROM @expired AS e
+                INNER JOIN dbo.StationConfigRevision AS r ON r.ConfigRevisionId = e.ConfigRevisionId;
+                """))
+            {
+                cmd.DateTime2("@EdgeNowUtc", edgeNowUtc).Guid("@DetectionId", detectionId).DateTime2("@EffectiveDeadlineUtc", effectiveDeadlineUtc)
+                    .Int("@EffectiveSendMarginMs", effectiveSendMarginMs).BigInt("@ActiveConfigRevisionId", activeConfigRevisionId);
+                labelType = (string?)await cmd.ExecuteScalarAsync(ct);
+            }
+
+            if (labelType is null)
+            {
+                return null;
+            }
+
+            var detection = (await DetectionQueries.GetAsync(conn, tx, detectionId, ct))!;
+            var evt = await ResultPublisher.PublishDetectionAsync(conn, tx, detection, labelType, edgeNowUtc, ct);
+            return new SweepTransition("CartonDetection", detectionId, DetectionStatus.WaitingErp, DetectionStatus.Expired, DetectionReason.ErpUnavailable, evt);
+        }, ct);
+
+    /// <summary>
+    /// Sentencia de referencia de D07: detecciones WAITING_ERP con el plazo congelado vencido quedan EXPIRED con
+    /// ERP_UNAVAILABLE (SI-14). El barrido usa <see cref="ExpireWaitingErpDetectionAsync"/>.
+    /// </summary>
     public Task<IReadOnlyList<SweepTransition>> ExpireWaitingErpAsync(string siteId, string stationId, int activeSendMarginMs, DateTime edgeNowUtc, CancellationToken ct) =>
         db.InTransactionAsync<IReadOnlyList<SweepTransition>>(async (conn, tx) =>
         {

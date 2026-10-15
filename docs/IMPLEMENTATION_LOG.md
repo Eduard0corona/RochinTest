@@ -352,15 +352,15 @@ Las correcciones posteriores a la segunda revisión fueron el cambio de especifi
 3. **`EPOCH_UNEXPECTED`.** Cada registro de una época no aceptada queda como su propia anomalía con el registro completo, y la estación se bloquea una vez. El reingreso exige la época ya aceptada (`CONFIRM_EPOCH`), registra el mismo registro latched con `ANOMALY_REINGEST` y conserva `ReceivedAt`, y después resuelve la anomalía con `RESOLVE_ANOMALY`. Repetirlo da un duplicado auténtico.
 4. **Tardío o reinicio.** Con `DetectionTimestamp` en el registro y en la marca alta, anterior es tardío y posterior o igual es `RESET_SUSPECTED` (la igualdad se trata como reinicio: falla cerrada). Sin alguno de los dos timestamps es `AMBIGUOUS_DECREASE`: `WARNING` y, si la clave nueva anterior también fue ambigua, `BLOCKING` con la estación bloqueada.
 5. **Rebote.** El avance mínimo plausible desde la marca alta es `(CycleId − M) × MinCycleIntervalMs`; sin `DetectionTimestamp` (o sin `MinCycleIntervalMs`) la regla no se aplica, como pide T26. Un registro con rebote que además salta ciclos abre igual su hueco (diagrama 08).
-6. **Registro incoherente.** El formato real del registro latched es una decisión de OT (OT-04). El simulador cierra el registro con un eco del `CycleId`; si el eco no coincide, el registro es incoherente: no alimenta el estado de secuencia (no acepta épocas, no mueve la marca alta, no abre huecos) y queda `BLOCKED` con `INCOHERENT_SNAPSHOT` si su época ya está aceptada, o retenido con la estación bloqueada si no (falla cerrada). Sin eco, la coherencia no se puede comprobar (SI-10).
+6. **Registro incoherente.** El formato real del registro latched es una decisión de OT (OT-04). El simulador cierra el registro con un eco del `CycleId`; si el eco no coincide, el registro es incoherente. Queda `BLOCKED` con `INCOHERENT_SNAPSHOT` y pasa por la clasificación con dos límites (SI-13, clase B, interino): no acepta épocas y su hora no cuenta. Su `CycleId` mueve la marca alta y abre huecos, igual que su fila al recargar desde SQL; la hora de una detección `BLOCKED` con `INCOHERENT_SNAPSHOT` tampoco cuenta al recargar. Texto anterior, reemplazado por la segunda revisión: "no alimenta el estado de secuencia (no acepta épocas, no mueve la marca alta, no abre huecos) y queda `BLOCKED` con `INCOHERENT_SNAPSHOT` si su época ya está aceptada, o retenido con la estación bloqueada si no (falla cerrada). Sin eco, la coherencia no se puede comprobar (SI-10).
 7. **Decodificación.** Solo StatusCode Good produce un registro; vacío, mal formado o sin identidad se descarta con `opc_records_rejected_total{cause,transport}` y nunca llega a TX-A.
 8. **`LabelingReady`** = estación habilitada, OPC conectado con la recuperación terminada y el canal de la ingesta sin saturar (o sin notificaciones descartadas desde el latido anterior); baja si no se puede leer SQL y al detener el servicio. La recuperación tras reconectar termina cuando terminan sus lecturas, no cuando pasa una caja.
 9. **G03 en la ingesta.** Mientras no existe el barrido completo de la Fase 3, el servicio alojado cierra los huecos vencidos cada `GapSweepIntervalMs` y mide `cycles_unobserved_total` y `sequence_gaps_open`.
 10. **El consumidor no salta registros.** Si TX-A falla con un error que no es de identidad ni 1205, el servicio se detiene: la disponibilidad cede ante la consistencia.
 11. **Pruebas de T45 por transporte.** La clasificación del transporte la prueba `OpcClientTransportTests` contra el servidor simulado (primera notificación, Republish tras congelar el enlace, Overflow, reinicio con lectura y FIFO); la regla de plazo por transporte se prueba con registros de cada transporte en la ingesta, más un recorrido completo por OPC (primera notificación tras reiniciar el servidor).
-12. **Precondición de T24 en bloque.** Los 5000 ciclos registrados se cargan con `SqlBulkCopy` (con `FireTriggers` y `CheckConstraints`) y pasan a `EXPIRED` por D04; la inyección (5200 entregas) pasa completa por la ingesta y TX-A.
+12. **Precondición de T24 por TX-A.** Los 5000 ciclos registrados entran por TX-A en paralelo, cada uno con su job (la versión anterior, con `SqlBulkCopy` y detecciones `EXPIRED` sin job, se reemplazó por B8); la inyección (5200 entregas) pasa completa por la ingesta y TX-A.
 
-13. **Transporte tras reconectar.** Una suscripción recreada (reinicio del PLC, sesión nueva o suscripción vencida) vuelve a numerar sus mensajes: el cliente lleva el número de secuencia por suscripción y la primera notificación de la nueva es `READ`. Durante la recuperación, un cambio que el servidor registró antes de la reconexión (por su `ServerTimestamp` frente a la hora del servidor al reconectar) es `REPUBLISH` aunque viaje en un mensaje nuevo; uno posterior es `SUBSCRIPTION`. La recuperación hace, en pasos independientes: hora del servidor, lectura del registro actual, Republish de lo perdido en tránsito y FIFO.
+13. **Transporte tras reconectar.** Una suscripción recreada (reinicio del PLC, sesión nueva o suscripción vencida) vuelve a numerar sus mensajes: el cliente lleva el número de secuencia por suscripción y la primera notificación de la nueva es `READ`. Durante la recuperación, un cambio que el servidor registró antes de la reconexión (por su `ServerTimestamp` frente a la hora del servidor al reconectar) es `REPUBLISH` aunque viaje en un mensaje nuevo; uno posterior es `SUBSCRIPTION`. La suscripción se reconoce por su instancia y por su Id (segunda revisión, MEDIA-1). La recuperación hace, en pasos independientes: hora del servidor, lectura del registro actual, Republish de lo perdido en tránsito y FIFO. El Republish usa la suscripción viva de la sesión y espera una respuesta de publicación posterior a la reconexión (MEDIA-2). Terminada la recuperación, la marca de la última reconexión se conserva: un cambio anterior a ella que llega tarde sigue siendo `REPUBLISH` (BAJA-1).
 14. **Dos instancias.** Un duplicado auténtico también mueve la marca alta (la detección existe), como al reconstruir el estado desde SQL.
 15. **Arranque sin PLC.** El servicio alojado reintenta la conexión con espera exponencial en lugar de detener el EdgeHost.
 
@@ -432,9 +432,55 @@ Resultado: trazabilidad OK, 0 errores
 Compuerta en verde.
 ```
 
+### Segunda revisión independiente
+
+Subagente `revisor-adversarial` sobre una copia limpia de `51bcb88` (2026-10-14). Ejecutó la compuerta (158, 80 y 27 pruebas en verde), comprobó que las pruebas nuevas de A1 y A2 fallan sin su corrección e hizo experimentos propios con el cliente OPC UA real: 32 rondas de corte, reinicios del PLC y cuatro escenarios contra SQL Server real. 0 ALTA, 3 MEDIA y 8 BAJA:
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| MEDIA-1: el reinicio de la numeración dependía de que el servidor cambiara el `SubscriptionId` | Media | También se reinicia cuando cambia la instancia de `Subscription`. El simulador elige Ids al azar, así que ninguna prueba cubre un servidor que repita Ids (ver lo no verificado) |
+| MEDIA-2: tras el primer reinicio del PLC, la recuperación usaba la suscripción muerta; con una lista de disponibles vieja, el Republish no esperaba | Media | La suscripción y el monitored item vivos se toman de la sesión al reconectar y en cada recuperación. La lista de disponibles se lee después de una respuesta de publicación posterior a la reconexión (`LastNotificationTime`). Prueba nueva: tras un reinicio, lo publicado durante un corte llega como `REPUBLISH` en esa recuperación; falla sin la corrección |
+| MEDIA-3: tras recargar, el registro incoherente sí era la marca alta (en memoria no), y ocultaba huecos | Media | Una sola regla en los dos caminos (decisión 6, SI-13). Pruebas: `An_incoherent_record_feeds_the_mark_the_same_in_memory_and_after_reload` contra SQL y cuatro unitarias en `IncoherentSequenceTests` |
+| BAJA-1: la marca de hora del servidor se descartaba al terminar la recuperación; dos recuperaciones superpuestas se pisaban | Baja | Se conserva la marca de la última reconexión: un cambio anterior a ella es `REPUBLISH` aunque llegue después. Contador de generación por recuperación |
+| BAJA-2: un incoherente de una época recién confirmada volvía a bloquear la estación | Baja | El incoherente pasa por la misma relectura previa a retener. Prueba `An_incoherent_record_of_a_just_confirmed_epoch_does_not_block_the_station_again` |
+| BAJA-3: la decisión 6 era un cambio de comportamiento no registrado | Baja | SI-13 (clase B) |
+| BAJA-4: la prueba de M4 no ejercitaba el canal; la saturación no se evaluaba con la estación bloqueada o desconectada | Baja | `ChannelPressure` extraída y probada con un canal acotado real; se evalúa en cada latido |
+| BAJA-5: un arranque fallido dejaba la sesión abierta y enganchada al keep-alive | Baja | Se desengancha y se cierra en `StartAsync` |
+| BAJA-6: un reingreso concurrente informaba éxito y dejaba una `OperatorAction` sin efecto | Baja | `ResolveAnomalyAsync` resuelve primero e inserta la acción solo si resolvió; el reingreso falla si otro ya la resolvió. Prueba `Resolving_an_already_resolved_anomaly_leaves_no_operator_action` |
+| BAJA-7: documentación desfasada (decisión 12, fila T24, B6 sin prueba) | Baja | Decisión 12 y fila T24 corregidas; la métrica `OPERATOR_CONFIRMED` se comprueba en `A_confirmed_epoch_reaches_the_running_ingest`; límite de reinicio en lo no verificado |
+| BAJA-8: el interino de SI-12 abre huecos enormes si la época cambia sin reiniciar el contador | Baja | Agregado a SI-12 con la alternativa `FirstCycleId`, para que la persona decida |
+
+Compuerta completa después de las correcciones de la segunda revisión, 2026-10-14 23:50 (`powershell -File build/ci.ps1`):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   162, Omitido:     0, Total:   162, Duración: 21 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    80, Omitido:     0, Total:    80, Duración: 2 m 14 s - CartonPrinting.IntegrationTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    30, Omitido:     0, Total:    30, Duración: 3 m 35 s - CartonPrinting.FaultTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 62 ejecutadas
+  Fase 2: T11=1 destino(s), 1 ejecutadas, T13=5 destino(s), 5 ejecutadas, T24=1 destino(s), 1 ejecutadas, T25=8 destino(s), 10 ejecutadas, T26=2 destino(s), 3 ejecutadas, T30=2 destino(s), 3 ejecutadas, T35=2 destino(s), 2 ejecutadas, T45=4 destino(s), 12 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
+La prueba nueva de MEDIA-2 se ejecutó también contra `OpcUaCycleSource.cs` de `51bcb88` (sin la corrección): falla (1 de 1). Con la corrección pasó 3 de 3 veces seguidas, junto con la prueba de corte sin reinicio.
+
+Sin hallazgos ALTA en la segunda revisión: no se pide una tercera.
+
+### Decisiones de la persona (2026-10-14)
+
+- **SI-11 (clase A):** edición aprobada y aplicada en `8798b85` (especificación 1.1.4). Después: `py spec/tools/generate_artifacts.py` (regeneró `tests/MATRIZ_PRUEBAS.md`), `py spec/tools/update_checksums.py` (150 archivos) y `py spec/tools/verify_package.py` (`Resultado: 15 grupos OK, 0 errores`); `generate_artifacts.py --check`: artefactos al día.
+- **SI-10, SI-12 y SI-13 (clase B):** se mantienen los interinos de falla cerrada; quedan abiertos para OT-04.
+
 ### Lo que no se verificó
 
 - Ningún PLC real: el servidor OPC UA es el simulador. El formato del registro latched, el eco de cierre y la FIFO son del simulador (OT-04, OT-14).
+- Un servidor OPC UA que repita `SubscriptionId` al reiniciar (MEDIA-1): el cambio de instancia lo cubre en el cliente, pero el simulador elige Ids al azar y ninguna prueba lo ejercita.
+- `plc_epoch_changes_total{mode=OPERATOR_CONFIRMED}` se cuenta al aparecer la época en una recarga del proceso en ejecución; si el EdgeHost reinicia entre la confirmación y la recarga, esa época no se cuenta.
 - La clasificación del transporte tras reconectar se probó con el servidor de OPC Foundation (reinicio, enlace congelado, sesión vencida); otros servidores pueden numerar o sellar distinto.
 - Dos instancias se probaron con dos consumidores en un proceso, no con dos EdgeHost reales (la Fase 5 agrega la propiedad de la impresora).
 - El flujo `REQUIRE_CONFIRMATION` de punta a punta en el EdgeHost necesita la Operations API (Fase 5); aquí se probó con la ingesta y las acciones manuales de TX-M.
@@ -471,10 +517,14 @@ Compuerta en verde.
 2. **Polly**: circuit breaker por fuera y timeout por dentro (un timeout cuenta como falla). Los tiempos de E/S usan el reloj real; los instantes del dominio, el del EdgeHost.
 3. **Snapshot tardío.** `ErpArrivalService` no reserva serial si el plazo efectivo ya venció; TX-E no crea el job y deja la detección en `WAITING_ERP`; el barrido aplica D07 (decisión 11 de la Fase 1).
 4. **`erp_cache_age_seconds`** = segundos desde la última respuesta del ERP (o desde el arranque si nunca respondió).
-5. **Orden del barrido**: reloj primero (con un salto no evalúa nada); después J03 y J14 (plazo y orden) antes de J13, que además exige plazo vigente en SQL; D07; ventanas de evidencia; autorizaciones; G03.
-6. **`CLOCK_JUMP`**: un `ClockGuard` por estación, compartido por el barrido y el claim; la tolerancia es la de la revisión activa; al detectar un salto se bloquea la estación y el claim se rechaza (`ClockJump`) sin evaluar el plazo. Un salto menor que la tolerancia no se detecta (límite declarado en la sección 10.2).
-7. **`CLOCK_SKEW`**: con `PLC_TIMESTAMP`, un `DetectionTimestamp` posterior a la recepción es un límite inferior del adelanto del reloj del PLC; si supera `ClockSkewToleranceMs`, la estación se bloquea antes de registrar el ciclo y el ciclo queda `BLOCKED` con `STATION_DISABLED`. Su `DeadlineAt` se calcula igual (el contrato exige `deadlineAt` posterior a `detectionTimestamp`) pero no decide nada: no se crea job. Un reloj del PLC atrasado acorta los plazos (es restrictivo) y no se distingue de la latencia: no se detecta.
+5. **Orden del barrido**: reloj primero (con un salto no evalúa nada); después J03 y J14 (plazo y orden) antes de J13; D07; ventanas de evidencia; autorizaciones; G03. Los plazos son los efectivos, calculados en el EdgeHost con la revisión activa, y cada transacción exige que esa revisión siga activa (SI-14). J13 exige en SQL vigentes el plazo efectivo y el congelado. Texto anterior, que la revisión encontró incorrecto: "J13, que además exige plazo vigente en SQL" (era el congelado).
+6. **`CLOCK_JUMP`**: un `ClockGuard` por estación, compartido por el barrido y el claim; la tolerancia es la de la revisión activa; al detectar un salto se bloquea la estación y el claim se rechaza (`ClockJump`) sin evaluar el plazo. El salto queda retenido hasta que el bloqueo se confirma en SQL. Si `BlockAsync` falla, toda comprobación posterior lo vuelve a informar y reintenta el bloqueo; un claim concurrente tampoco evalúa su plazo mientras el bloqueo no es visible. El claim y el barrido usan como `@EdgeNowUtc` el instante que la guarda verificó. La guarda es obligatoria en `ClaimService`. Un salto menor que la tolerancia no se detecta (límite declarado en la sección 10.2).
+7. **`CLOCK_SKEW`**: con `PLC_TIMESTAMP`, un `DetectionTimestamp` posterior a la recepción es un límite inferior del adelanto del reloj del PLC; si supera `ClockSkewToleranceMs`, la estación se bloquea antes de registrar el ciclo y el ciclo queda `BLOCKED` con `STATION_DISABLED`. Su `DeadlineAt` se calcula igual (el contrato exige `deadlineAt` posterior a `detectionTimestamp`) pero no decide nada: no se crea job. Un reloj del PLC atrasado acorta los plazos (es restrictivo) y no se distingue de la latencia: no se detecta, y las cajas se publican como `LATE_ARRIVAL`. Ambos límites son SI-15 (clase B).
 8. **El escenario de pruebas admite el reloj real** (`TimeProvider.System`) para las pruebas con latencia real (T03); `ManualTimeProvider` separa el reloj de pared del monotónico para simular un ajuste de NTP (T37).
+9. **Snapshot ERP: la fila de la caché, no la respuesta (I10).** Después del upsert se relee la fila de `(WorkOrderId, Revision)`. Si su contenido (producto, lote, GTIN, vigencia) no coincide con la respuesta, el ERP reutilizó la revisión: el snapshot no está disponible y se mide `erp_requests_total{outcome=revision_conflict}`. Si coincide, el job se arma con la fila. TX-E además exige en SQL que la fila tenga el producto, el lote y el GTIN de la etiqueta. Se compara el contenido y no `SourceHash`, que depende de los bytes del cuerpo HTTP.
+10. **Validación del snapshot.** La vigencia se trunca a milisegundos antes de validarla. El GTIN debe tener 14 dígitos ASCII, y revisión, producto y lote no pueden pasar el largo de su columna (un parámetro `NVarChar(n)` truncaría en silencio). Cada orden va en su propio `try`, y las órdenes se procesan por plazo.
+11. **Revisión activa en la transacción.** El claim (TX-B) exige `sc.ActiveConfigRevisionId` igual a la revisión con que calculó el plazo; si no, el rechazo es `RevisionChanged` y el claim se repite. TX-E lee la estación con `UPDLOCK` y no actúa si cambió la revisión. El barrido exige la revisión en cada transacción.
+12. **Métricas de TX-E.** Solo se mide una transición (job creado o resultado publicado). Una TX-E sin efecto devuelve null y no cuenta en `SyncOnceAsync`.
 
 ### Comandos y resultados
 
@@ -504,9 +554,57 @@ Durante el desarrollo:
 
 - **T03, T04, T17, T18, T21, T33, T37 y T46: PASA** (detalle en `docs/TEST_STATUS.md`).
 
+### Revisión independiente
+
+Subagente `revisor-adversarial` sobre una copia limpia de `a0eaebb` (2026-10-14). Ejecutó la compuerta (159, 83 y 33 pruebas en verde) y seis experimentos contra SQL Server real (EXP1, EXP2 y EXP4 a EXP7). También hizo dos mutaciones: J13 sin guarda de plazo, y una llamada síncrona al ERP desde la ingesta. Con ambas la suite seguía en verde. Resultado: 1 ALTA, 4 MEDIA y 7 BAJA.
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| 1: `ClockGuard` olvidaba el salto antes de que el bloqueo quedara guardado; si `BlockAsync` fallaba, los claims siguientes se evaluaban con el reloj saltado | Alta | El salto queda retenido hasta que el bloqueo se confirma, y el claim usa el instante verificado (decisión 6). Prueba `A_clock_jump_whose_block_failed_is_not_forgotten` (fila de la estación retenida y claim cancelado): falla si la confirmación va antes del bloqueo. Más una prueba unitaria |
+| 2: el barrido usaba el `DeadlineAt` congelado, y J13 devolvía a `READY` un job con el plazo efectivo vencido | Media | Plazo efectivo por fila en J03, J14, J13 y D07; conflicto con la referencia registrado como SI-14 (decisión 5). Prueba `The_sweep_expires_by_the_effective_deadline_after_a_revision_change` |
+| 3: T18 pasaba sin la guarda de J13 | Media | Prueba `Release_from_retry_wait_has_its_own_deadline_guard`, que llama a J13 sin pasar por la expiración: falla con las guardas de plazo reemplazadas por `1 = 1` |
+| 4: T03 no comprobaba que la ingesta no espere al ERP | Media | El ERP retiene las peticiones mientras se procesa el ciclo: la ingesta debe devolver sin respuesta del ERP. Falla con la llamada síncrona de la revisión. Cobertura parcial declarada en `TEST_STATUS` |
+| 5: el job copiaba la respuesta HTTP y no la fila validada de la caché (I10) | Media | Decisión 9. Pruebas `A_reused_erp_revision_with_other_content_is_not_used_and_the_job_matches_the_cache_row` y `Tx_e_does_not_create_a_job_whose_content_differs_from_the_cache_row` |
+| 6: validación antes de truncar, GTIN sin dígitos aceptado, una orden con error detenía la pasada, órdenes sin orden | Baja | Decisión 10. Pruebas `ErpClientValidationTests` (cinco casos inválidos y uno válido) y `An_order_that_fails_does_not_stop_the_others` |
+| 7: una TX-E sin efecto se contaba como transición | Baja | Decisión 12. Prueba `A_tx_e_without_effect_is_not_counted` |
+| 8: plazo efectivo calculado con una revisión leída fuera de la transacción | Baja | Decisión 11. Prueba `Tx_e_and_tx_b_require_the_revision_they_were_computed_with` |
+| 9: límites de `CLOCK_SKEW` sin declarar | Baja | SI-15 (clase B) y decisión 7 |
+| 10: el claim con `ClockGuard` solo existía en las pruebas; `TimeProvider.System` en el servicio de la estación | Baja | Guarda obligatoria en `ClaimService`; el servicio usa el `TimeProvider` inyectado. La composición del EdgeHost no tiene prueba (lo no verificado). El sender del EdgeHost, que compone el claim, es de la Fase 4 |
+| 11: T33 no distinguía el margen efectivo | Baja | El claim se prueba a 120 ms del plazo efectivo |
+| 12: afirmaciones excesivas ("cero bytes", decisión 5) | Baja | `TEST_STATUS` de T04, T17 y T18 dice de dónde se deduce; decisión 5 corregida |
+
+Compuerta completa después de las correcciones, 2026-10-15 00:29 (`powershell -File build/ci.ps1 --fase 3`, rama con `main` integrado: Fase 2 cerrada y especificación 1.1.4):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   164, Omitido:     0, Total:   164, Duración: 20 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    83, Omitido:     0, Total:    83, Duración: 2 m 17 s - CartonPrinting.IntegrationTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    50, Omitido:     0, Total:    50, Duración: 3 m 34 s - CartonPrinting.FaultTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 62 ejecutadas
+  Fase 2: T11=1 destino(s), 1 ejecutadas, T13=5 destino(s), 5 ejecutadas, T24=1 destino(s), 1 ejecutadas, T25=8 destino(s), 10 ejecutadas, T26=2 destino(s), 3 ejecutadas, T30=2 destino(s), 3 ejecutadas, T35=2 destino(s), 2 ejecutadas, T45=4 destino(s), 12 ejecutadas
+  Fase 3: T03=1 destino(s), 1 ejecutadas, T04=1 destino(s), 1 ejecutadas, T17=1 destino(s), 1 ejecutadas, T18=3 destino(s), 3 ejecutadas, T21=1 destino(s), 1 ejecutadas, T33=1 destino(s), 1 ejecutadas, T37=4 destino(s), 5 ejecutadas, T46=1 destino(s), 1 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
+Mutaciones ejecutadas, cada una revertida después:
+
+- **Confirmar el salto antes del bloqueo** (el comportamiento anterior): `A_clock_jump_whose_block_failed_is_not_forgotten` falla.
+- **Guardas de plazo de J13 reemplazadas por `1 = 1`**: `Release_from_retry_wait_has_its_own_deadline_guard` falla.
+- **`WorkOrderNeeded` consulta al ERP de forma síncrona** (la mutación de la revisión): T03 falla.
+
+En la primera compuerta falló `Tx_e_d08_with_recirculated_carton`. La prueba activaba la revisión 8 y armaba el plan de TX-E con la 7. Con la decisión 11, TX-E no actúa con una revisión vieja, como debe. Se corrigió el dato: el plan usa la revisión activa.
+
+
 ### Lo que no se verificó
 
 - Ningún ERP real: el contrato y el formato son del simulador.
+- La composición de los servicios de la estación en el EdgeHost (`AddStationServices`, `StationServicesHostedService`) no tiene prueba: los servicios se prueban construidos a mano.
+- `CLOCK_SKEW` no detecta un adelanto menor que la tolerancia más la latencia de subida ni un PLC atrasado (SI-15).
 - El ajuste de NTP se simula con `ManualTimeProvider`; no se cambió el reloj del sistema.
 - `CLOCK_SKEW` solo detecta un PLC adelantado.
 - Los tiempos del barrido y de la sincronización ERP en el EdgeHost (200 ms y 100 ms) no se ajustaron con carga (Fase 7).
