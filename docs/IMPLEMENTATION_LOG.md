@@ -674,17 +674,20 @@ Sin hallazgos ALTA en la segunda revisión: no se pide una tercera.
 
 1. **Protocolo con el dispositivo.** El del simulador; el real (y qué informa: acuse, fin de impresión, cancelación) es una decisión de integración (OT-01, OT-07) detrás de `IPrinterTransport` y `IDeviceJobControl`. Un acuse de recibo no prueba impresión (I05).
 2. **NOT_SENT solo si la escritura nunca se invocó** (fallo al conectar, o la segunda comprobación rechaza); cualquier error desde que se invoca la escritura, incluido el corte del canal o la falta de acuse, es UNKNOWN (I02) y el canal se descarta.
-3. **Segunda comprobación monotónica, la última antes de escribir** (revisión de la Fase 4, A1). Al reclamar se calcula lo que queda hasta el plazo efectivo menos el margen, medido desde una marca monotónica tomada antes del claim (conservador). Después, en este orden: se relee la estación (bloqueada: NOT_SENT sin consumir intento, J06); se consulta la compuerta física si la revisión la exige (sin compuerta configurada no se envía); se abre el canal si hace falta. Solo entonces, como última instrucción y sin I/O, se compara con el reloj monotónico (§10.2, paso 2). Si el canal no abre y el plazo ya venció, es J08 y no J07. El catálogo no tiene una prueba de la compuerta; su implementación con `PrintWindowCycleId` queda para la integración con el PLC real.
+3. **Segunda comprobación monotónica, la última antes de escribir** (revisión de la Fase 4, A1; segunda revisión, M-1, B-1 y B-2). Al reclamar se calcula lo que queda hasta el plazo efectivo menos el margen, medido desde una marca monotónica tomada antes del claim (conservador). Después, en este orden: se abre el canal si hace falta; se relee la estación (bloqueada: NOT_SENT); se consulta la compuerta física si la revisión la exige (sin compuerta configurada no se envía). Solo entonces, como última instrucción y sin I/O, se compara con el reloj monotónico (§10.2, paso 2). Entre el claim y la escritura nada se invocó: un rechazo, cualquier error (SQL, la compuerta) o un apagado terminan en NOT_SENT, nunca en un `SENDING`. Con el plazo monotónico vencido es J08; si no, J07 cuando falla el canal y J06 en lo demás (no consume intento). El catálogo no tiene una prueba de la compuerta; su implementación con `PrintWindowCycleId` queda para la integración con el PLC real.
 4. **Evidencia durante SENDING, en orden** (revisión de la Fase 4, A2). Con una impresora rápida, la evidencia llega antes de TX-C, cuando todavía no hay transición que aplicar: se registra sin efecto. Cada observación nueva aplica, en orden de `ObservationId`, todo lo registrado para su job o su ciclo desde el último claim. Así, una lectura contradictoria anterior no se pierde detrás de una confirmación posterior. El sender reaplica después de TX-C, y el arranque del sender reaplica, después de TX-R0, la evidencia de sus jobs `TRANSMITTED` y `UNKNOWN`. Las alertas (`serial_mismatch_total`, `confirmed_corrected_total`) se cuentan también en la reaplicación. La medición de tiempos de esa evidencia se completa después de TX-C.
+   - **Bajo concurrencia** (segunda revisión, A-1 y B-8). El orden del pase no basta cuando dos pases se cruzan con TX-C: un pase aplicaba la lectura con el job todavía en `SENDING` y el otro confirmaba después. TX-D lo impide en SQL, bajo el `UPDLOCK` del job. Antes de confirmar (J10, J15, X01 o X02), busca una lectura VERIFIED del ciclo con otro serial que cumpla tres condiciones: recibida desde el claim del intento, registrada antes que la observación que confirma y después de cualquier confirmación del job. Si existe, aplica esa contradicción (J11, J18 o X03) en lugar de confirmar. Además, el registro de una observación de ciclo toma un lock de aplicación exclusivo por ciclo (`sp_getapplock`), y la aplicación de cualquier evidencia del job lo toma compartido. Así, una lectura que todavía se está registrando, con un `ObservationId` menor, no queda detrás de una confirmación. Sin el lock, la prueba de ese caso falla (comprobado por mutación).
+   - **Arranque** (segunda revisión, M-3). Después de TX-R0 se reaplican, dentro de las 24 h anteriores, la evidencia de los jobs `TRANSMITTED` y `UNKNOWN` de la impresora y las lecturas VERIFIED con otro serial de sus jobs `CONFIRMED` o `UNKNOWN`, que son J18. `ReapplySinceAsync`, que no se usaba, se quitó.
 5. **Cancelación (T31).** "No impreso" sin confirmación de cancelación no cambia el job; solo una cancelación confirmada por el dispositivo para ese job aplica A07 y J12.
 6. **T07 con un proceso real.** El sender corre en `CartonPrinting.FaultHost`; la prueba lo mata con `Process.Kill` (TerminateProcess en Windows, equivalente a kill -9) en cada punto, comprueba con el login administrador que la sesión del host no tiene transacciones abiertas durante el I/O (I20) y ejecuta la recuperación de arranque. El UNKNOWN del primer punto (no se escribió nada) es falso: es el costo aceptado de no poder distinguirlo desde SQL.
 7. **El sender del EdgeHost** toma el lease y ejecuta TX-R0 antes de enviar; el lock de sistema operativo, la renovación del lease y la parada ante su pérdida son de la Fase 5.
 8. **Guarda del reloj en el claim.** Desde la corrección de la Fase 3 el `ClockGuard` es obligatorio: el sender del EdgeHost usa el de la estación (el mismo que el barrido), y el FaultHost y las pruebas, uno propio. Un claim rechazado (también `RevisionChanged`) deja el job `READY` y el sender lo reintenta en la vuelta siguiente.
 9. **Métricas de evidencia en cualquier orden.** `printed_to_applied_ms` se registra cuando se conocen los dos instantes observados, lleguen PRINTED (por job) y APPLIED (por ciclo) en el orden que lleguen; lo que quedó pendiente durante `SENDING` se mide antes que la observación nueva.
-10. **TX-C con reintentos y detención** (revisión, M3). TX-C es idempotente (solo actúa sobre el intento en `SENDING`): se reintenta dos veces. Si SQL sigue sin responder, el sender se detiene (`SenderHaltedException`, que el bucle no absorbe): el intento queda en `SENDING`, la impresora no se usa y el arranque siguiente ejecuta TX-R0. NOT_SENT se registra sin el token de la operación, para que un apagado no deje un `SENDING` que TX-R0 volvería `UNKNOWN`.
+10. **TX-C con reintentos y detención** (revisión, M3). TX-C es idempotente (solo actúa sobre el intento en `SENDING`): se reintenta dos veces. Si SQL sigue sin responder, el sender se detiene (`SenderHaltedException`, que el bucle no absorbe): el intento queda en `SENDING`, la impresora no se usa y el arranque siguiente ejecuta TX-R0. NOT_SENT se registra sin el token de la operación, y un apagado entre el claim y la escritura termina en NOT_SENT (decisión 3), para que no deje un `SENDING` que TX-R0 volvería `UNKNOWN`. Cuando el sender se detiene, el EdgeHost sale con el código 70 (segunda revisión, B-3), no con 0: un supervisor configurado para reiniciar ante falla lo relanza y el arranque ejecuta TX-R0.
 11. **Bucle del sender** (revisión, M1). Solo un claim obtenido sigue de inmediato; un rechazo espera el intervalo de sondeo.
 12. **Canal** (revisión, M2). Una conexión que la impresora cerró no cuenta como abierta y se reabre antes de escribir. Cada mitad de la escritura tiene un tiempo máximo (`WriteTimeoutMs`): una ventana TCP llena termina en `UNKNOWN`, no en un `SENDING` sin fin.
 13. **Arranque del sender del EdgeHost** (revisión, M4). Sin su fila de `PrinterSendOrder`, el sender no arranca y se registra un error crítico.
+14. **Consultas de evidencia acotadas** (segunda revisión, M-2). `EvidenceObservation` solo crece y no tiene índice por `PrintJobId` ni por `ReceivedAt` (agregarlo sería cambiar `spec/`). Las consultas de "recibida desde el claim" usan dos ramas. La del ciclo busca en `IX_EvidenceObservation_Cycle`. La del job (PRINTED) parte de una cota de `ObservationId`: el último `ObservationId` recibido más de 5 minutos antes del claim, buscado hacia atrás en la clave primaria, de modo que solo se leen las filas recientes. La cota supone que el reloj de pared no retrocede más de 5 minutos entre dos registros; un retroceso así lo detecta CLOCK_JUMP. Las consultas están en `EvidenceQueries` para que la prueba compruebe su plan.
 
 ### Comandos y resultados
 
@@ -737,11 +740,11 @@ Subagente `revisor-adversarial` sobre una copia limpia de `9a3e78a` (2026-10-15)
 | M2: una conexión ociosa cerrada por la impresora daba UNKNOWN; T42 lo ocultaba con `Reset()` | Media | Decisión 12; `Reset()` quitado de T42. Prueba `An_idle_connection_the_printer_closed_is_reopened_before_writing` |
 | M3: un TX-C fallido después de escribir dejaba la impresora ocupada para siempre | Media | Decisión 10. Prueba `A_result_that_cannot_be_recorded_halts_the_sender` |
 | M4: el sender arrancaba sin su fila de `PrinterSendOrder` | Media | Decisión 13 |
-| M5: `serial_mismatch_total` no se contaba en la reaplicación | Media | Decisión 4; comprobado en la prueba de A2 |
+| M5: `serial_mismatch_total` no se contaba en la reaplicación | Media | Decisión 4. La prueba de A2 solo cubría la rama de `SubmitAsync`; la reaplicación del sender quedó cubierta en la segunda revisión (B-6) |
 | M6: `duplicate_physical_transmissions_total` no se emitía y T06 lo daba por cumplido | Media | Aserción quitada; `TEST_STATUS` y lo no verificado lo declaran |
 | BAJA: el claim directo de N en T42 era vacío para I23 | Baja | T42 prueba el rechazo por orden en TX-B con un job `READY` de un ciclo anterior |
 | BAJA: la relectura de la estación sin prueba | Baja | Prueba `A_station_blocked_after_the_claim_is_not_sent_and_does_not_consume_an_attempt` |
-| BAJA: T31, variante 1 con el job ya UNKNOWN, era vacía | Baja | `TEST_STATUS` dice lo que se prueba: `DeviceCancellation` no consulta al dispositivo sin un intento `TRANSMITTED` |
+| BAJA: T31, variante 1 con el job ya UNKNOWN, era vacía | Baja | `TEST_STATUS` dice lo que se prueba: el job sigue `UNKNOWN`. Que no se consulte al dispositivo no se comprueba (segunda revisión, B-7) |
 | BAJA: T07 dejaba el FaultHost huérfano si una aserción fallaba, y la consulta DMV no filtraba por base | Baja | `finally` que mata el proceso; filtro por `database_id` |
 | BAJA: una cancelación durante el apagado dejaba un SENDING evitable; J07 en lugar de J08 tras un connect lento; escritura sin tiempo máximo; diccionarios de métricas sin límite | Baja | Decisiones 3, 10 y 12; los diccionarios se vacían al pasar de 10.000 |
 | BAJA: el acuse "ACK" no compara el serial; §10.2 paso 1 (plazo monotónico anclado en la recepción con `GATEWAY_RECEIPT`) no implementado; `SendAsync` público sin comprobar la impresora del job | Baja | Declarados en lo no verificado. Un claim de otra impresora no obtiene fila: TX-B exige el lease de la impresora del job |
@@ -770,6 +773,61 @@ Resultado: trazabilidad OK, 0 errores
 Compuerta en verde.
 ```
 
+### Segunda revisión independiente
+
+Subagente `revisor-adversarial` sobre una copia limpia de `7b33ce7` (2026-10-15). Ejecutó la compuerta (164, 88 y 67), la trazabilidad de la fase, once sondas (Q1 a Q11) y nueve mutaciones, cada una dos veces. A1, M1, M2 y el resto de M3 de la primera revisión quedaron bien resueltos. Resultado: 1 ALTA, 4 MEDIA y 8 BAJA.
+
+| Hallazgo | Severidad | Resolución |
+| --- | --- | --- |
+| A-1: A2 resuelta solo en secuencia. Con una impresora rápida, la PRINTED coincide con TX-C; en 200 vueltas de la sonda Q2, entre 28 y 38 jobs terminaron `CONFIRMED` con una lectura ajena posterior al claim | Alta | Decisión 4 (bajo concurrencia). Pruebas `Confirming_evidence_applies_an_earlier_unapplied_contradiction_first` (determinista) y `A_contradiction_during_sending_never_ends_confirmed_under_concurrency` (Q2, 100 vueltas, 0 `CONFIRMED`) |
+| M-1: una excepción entre el claim y la escritura, fuera del connect (SQL al releer la estación, un apagado), dejaba el intento en `SENDING` y la impresora ocupada hasta reiniciar | Media | Decisión 3. Pruebas `A_sql_error_between_the_claim_and_the_write_is_not_sent_and_frees_the_printer` y `A_shutdown_right_after_the_claim_does_not_leave_sending` |
+| M-2: cada observación y cada TX-C recorrían completa `EvidenceObservation` (`Clustered Index Scan`, 200 000 filas leídas para devolver 0 o 1) | Media | Decisión 14. Prueba `Evidence_queries_read_only_recent_rows` (plan real con 100 000 filas antiguas de otra estación) |
+| M-3: el arranque no reaplicaba la evidencia de jobs `CONFIRMED`; una J18 registrada y no aplicada se perdía | Media | Decisión 4 (arranque). Prueba `Startup_reapplies_a_recorded_correction_of_a_confirmed_job` |
+| M-4: la reaplicación del sender después de TX-C no la cubría ninguna prueba | Media | Prueba `The_sender_applies_evidence_that_arrived_before_its_result` |
+| B-1: J06 con el plazo vencido | Baja | Decisión 3: con el plazo monotónico vencido es J08. Prueba `A_station_blocked_after_the_deadline_expires_the_job` |
+| B-2: estación y compuerta se evaluaban antes del connect | Baja | Decisión 3: se releen después de abrir el canal, justo antes de la comprobación monotónica. La compuerta sigue sin implementación (declarado) |
+| B-3: `SenderHaltedException` detenía el EdgeHost con código de salida 0 | Baja | Decisión 10: código 70. Sin prueba automática (no hay pruebas de la composición del EdgeHost) |
+| B-4: `_pending` sin límite | Baja | Se vacía al pasar de 10 000 jobs, como los otros diccionarios de métricas |
+| B-5: `send_to_verified_ms` se perdía si la reaplicación del sender aplicaba la lectura antes que su propio pase | Baja | La muestra cuenta si la observación es la que confirmó el intento, la aplicara quien la aplicara. Sin prueba determinista: el orden depende de la carrera |
+| B-6: la mutación que quita `CountAlerts` de la reaplicación sobrevivía | Baja | La prueba de M-4 comprueba `serial_mismatch_total` contado por la reaplicación del sender |
+| B-7: afirmaciones excesivas en `docs/` (T22 "nunca CONFIRMED", T31 `DeviceCancellation`, A2, M3, M5 y la decisión 10) | Baja | `TEST_STATUS` y esta sección corregidos |
+| B-8: `ObservationId` (IDENTITY) no sigue el orden de commit; una observación antigua que lance aborta el pase | Baja | Lo primero, decisión 4 (lock por ciclo) y prueba `A_contradiction_still_being_recorded_is_not_left_behind_a_confirmation`. Lo segundo se acepta: una excepción al aplicar es un defecto y no se rodea; la observación nueva queda registrada y la aplica el pase siguiente o el arranque |
+
+Mutaciones ejecutadas después de las correcciones, cada una revertida (`PrintAgentSecondReviewTests`):
+
+- **Sin la guarda de contradicción previa en TX-D:** fallan las tres pruebas de A-1 y B-8 (determinista, concurrencia y registro en curso).
+- **Sin la reaplicación del sender después de TX-C:** falla la prueba de M-4.
+- **Sin `CountAlerts` en la reaplicación:** fallan la prueba de M-4 y la de concurrencia.
+- **Arranque sin las lecturas contradictorias de jobs `CONFIRMED`:** falla la prueba de M-3.
+- **Un error antes de escribir se propaga en lugar de NOT_SENT:** fallan las dos pruebas de M-1.
+- **Estación bloqueada con el plazo vencido como J06:** falla la prueba de B-1.
+- **Pase del job sin la cota de `ObservationId`:** falla la prueba de M-2.
+- **Aplicación sin el lock compartido del ciclo:** falla la prueba del registro en curso (B-8).
+
+Sonda del plan de las consultas (M-2), contra SQL Server real con 100 000 observaciones antiguas de otra estación:
+
+- **Pase en orden del job:** lee 7 filas, 3 en la búsqueda hacia atrás de la cota y 4 en `IX_EvidenceObservation_Cycle` y en la clave primaria. Sin `FORCESEEK` leía 100 005: con `@from` como variable local, el optimizador no conoce su valor al compilar y recorría la tabla.
+- **Correcciones pendientes del arranque:** con las 100 000 filas dentro del horizonte de 24 h lee las 100 002, que es el costo previsto del horizonte. Con las filas fuera del horizonte, que es lo que comprueba la prueba, lee solo las recientes.
+
+Compuerta completa después de las correcciones, 2026-10-15 03:30 (`powershell -File build/ci.ps1 --fase 4`):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   164, Omitido:     0, Total:   164, Duración: 23 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    88, Omitido:     0, Total:    88, Duración: 2 m 34 s - CartonPrinting.IntegrationTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    76, Omitido:     0, Total:    76, Duración: 4 m 21 s - CartonPrinting.FaultTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=1 destino(s), 1 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 62 ejecutadas
+  Fase 2: T11=1 destino(s), 1 ejecutadas, T13=5 destino(s), 5 ejecutadas, T24=1 destino(s), 1 ejecutadas, T25=8 destino(s), 10 ejecutadas, T26=2 destino(s), 3 ejecutadas, T30=2 destino(s), 3 ejecutadas, T35=2 destino(s), 2 ejecutadas, T45=4 destino(s), 12 ejecutadas
+  Fase 3: T03=1 destino(s), 1 ejecutadas, T04=1 destino(s), 1 ejecutadas, T17=1 destino(s), 1 ejecutadas, T18=4 destino(s), 4 ejecutadas, T21=1 destino(s), 1 ejecutadas, T33=1 destino(s), 1 ejecutadas, T37=6 destino(s), 7 ejecutadas, T46=1 destino(s), 1 ejecutadas
+  Fase 4: T05=4 destino(s), 4 ejecutadas, T06=1 destino(s), 1 ejecutadas, T07=1 destino(s), 1 ejecutadas, T15=2 destino(s), 2 ejecutadas, T22=5 destino(s), 5 ejecutadas, T29=4 destino(s), 4 ejecutadas, T31=1 destino(s), 1 ejecutadas, T38=1 destino(s), 1 ejecutadas, T39=1 destino(s), 1 ejecutadas, T42=1 destino(s), 1 ejecutadas, T44=2 destino(s), 2 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
 ### Lo que no se verificó
 
 - Ninguna impresora, aplicador ni escáner reales; el protocolo y las capacidades son del simulador.
@@ -781,6 +839,9 @@ Compuerta en verde.
 - `duplicate_physical_transmissions_total` no se emite: necesita que el dispositivo informe impresiones por serial (OT-07).
 - El acuse del simulador ("ACK serial") se acepta sin comparar el serial.
 - §10.2, paso 1: con `GATEWAY_RECEIPT`, el plazo monotónico no se ancla en la marca de recepción, sino que se convierte desde el reloj de pared (acotado por `ClockJumpToleranceMs`).
+- La reaplicación del arranque cubre 24 h: una observación registrada y no aplicada antes de ese horizonte (el proceso cayó entre las dos transacciones de TX-D y tardó más en volver) no se reaplica.
+- La cota de `ObservationId` de las consultas de evidencia supone que el reloj de pared no retrocede más de 5 minutos entre dos registros.
+- El código de salida 70 del EdgeHost (B-3) y `send_to_verified_ms` cuando la reaplicación del sender gana la carrera (B-5) no tienen prueba automática.
 
 
 ## Fase 5 · Propiedad, recuperación y operación (T27, T34, T36, T40, T41, T43)

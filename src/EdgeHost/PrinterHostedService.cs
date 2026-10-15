@@ -84,7 +84,17 @@ public sealed class PrinterHostedService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         await _startup.WhenReached(StartupStage.Swept).WaitAsync(stoppingToken);
-        await _runner.RunAsync(RunSenderAsync, stoppingToken);
+        try
+        {
+            await _runner.RunAsync(RunSenderAsync, stoppingToken);
+        }
+        catch (SenderHaltedException)
+        {
+            // El host se detiene con un código distinto de 0, para que el supervisor lo relance y el arranque siguiente
+            // ejecute TX-R0 (segunda revisión de la Fase 4, B-3).
+            Environment.ExitCode = 70;
+            throw;
+        }
     }
 
     private async Task RunSenderAsync(LeaseGrant lease, CancellationToken ct)
