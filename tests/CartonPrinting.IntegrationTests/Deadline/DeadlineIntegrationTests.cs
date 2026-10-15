@@ -88,8 +88,10 @@ public sealed class DeadlineIntegrationTests(SqlServerFixture sql) : IAsyncLifet
         Assert.True(context.EffectiveDeadline < before.DeadlineAt);
         Assert.Equal(150, context.EffectiveSendMarginMs);
 
-        // Entre el plazo efectivo y el congelado: con la revisión 7 se reclamaría; con la efectiva, no.
-        s.Time.SetUtcNow(new DateTimeOffset(context.EffectiveDeadline.AddMilliseconds(-100), TimeSpan.Zero));
+        // Entre el plazo efectivo y el congelado, y a 120 ms del efectivo: con la revisión 7 se reclamaría; con el
+        // plazo efectivo y el margen 100 también; solo el margen efectivo 150 lo rechaza.
+        s.Time.SetUtcNow(new DateTimeOffset(context.EffectiveDeadline.AddMilliseconds(-120), TimeSpan.Zero));
+        Assert.True(s.Clock.UtcNow < context.EffectiveDeadline.AddMilliseconds(-rev7.SendMarginMs));
         Assert.True(s.Clock.UtcNow < before.DeadlineAt.AddMilliseconds(-rev7.SendMarginMs));
         var outcome = (await s.Claims.TryClaimAsync(job, s.Lease, Ct))!;
         Assert.Equal((false, ClaimRejection.Deadline), (outcome.Claimed, outcome.Rejection));

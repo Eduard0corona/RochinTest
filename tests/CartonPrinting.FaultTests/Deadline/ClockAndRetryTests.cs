@@ -6,6 +6,7 @@ using CartonPrinting.OpcIngest;
 using CartonPrinting.Orchestration;
 using CartonPrinting.PrintAgent;
 using CartonPrinting.Testing;
+using Microsoft.Data.SqlClient;
 
 namespace CartonPrinting.FaultTests.Deadline;
 
@@ -130,5 +131,120 @@ public sealed class ClockAndRetryTests(SqlServerFixture sql) : IAsyncLifetime
                 Assert.Equal(JobStatus.Ready, (await s.JobAsync(job, Ct)).Status);
             }
         }
+    }
+
+    /// <summary>
+    /// Revisión de la Fase 3, ALTA-1: el reloj de pared retrocede 5 s y el bloqueo CLOCK_JUMP no se completa (otra
+    /// transacción retiene la fila de StationConfig y el claim se cancela). El salto no se olvida: el claim siguiente
+    /// lo vuelve a informar, bloquea la estación y no reclama el job, aunque la divergencia nueva sea cero.
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T37")]
+    public async Task A_clock_jump_whose_block_failed_is_not_forgotten()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        var job = await s.ReadyJobAsync(610, Ct);
+        var manual = new ManualTimeProvider(new DateTimeOffset(s.Clock.UtcNow, TimeSpan.Zero));
+        var clock = new EdgeClock(manual);
+        var claims = new ClaimService(s.Sql, s.Txb, s.Metrics, clock, new ClockGuard(clock));
+        manual.Advance(TimeSpan.FromMilliseconds(100));
+        manual.JumpWall(TimeSpan.FromSeconds(-5));
+
+        await using (var holder = new SqlConnection(_db.AdminConnectionString))
+        {
+            await holder.OpenAsync(Ct);
+            await using var tx = (SqlTransaction)await holder.BeginTransactionAsync(Ct);
+            await using (var hold = new SqlCommand(
+                "SELECT LabelingEnabled FROM dbo.StationConfig WITH (UPDLOCK, ROWLOCK) WHERE SiteId = @site AND StationId = @st", holder, tx))
+            {
+                hold.Parameters.AddWithValue("@site", StationScenario.SiteId);
+                hold.Parameters.AddWithValue("@st", s.StationId);
+                await hold.ExecuteScalarAsync(Ct);
+            }
+
+            using var cancel = CancellationTokenSource.CreateLinkedTokenSource(Ct);
+            cancel.CancelAfter(TimeSpan.FromSeconds(1));
+            await Assert.ThrowsAnyAsync<Exception>(() => claims.TryClaimAsync(job, s.Lease, cancel.Token));
+            Assert.True((await s.Stations.GetActiveAsync(StationScenario.SiteId, s.StationId, Ct))!.Value.State.LabelingEnabled);
+            await tx.RollbackAsync(Ct);
+        }
+
+        manual.Advance(TimeSpan.FromMilliseconds(10));
+        var outcome = (await claims.TryClaimAsync(job, s.Lease, Ct))!;
+        Assert.Equal((false, ClaimRejection.ClockJump), (outcome.Claimed, outcome.Rejection));
+        var station = (await s.Stations.GetActiveAsync(StationScenario.SiteId, s.StationId, Ct))!.Value.State;
+        Assert.Equal((false, BlockReason.ClockJump), (station.LabelingEnabled, station.BlockReason));
+        Assert.Empty(await s.AttemptsAsync(job, Ct));
+        Assert.Equal(JobStatus.Ready, (await s.JobAsync(job, Ct)).Status);
+        Assert.Equal(1, s.Metrics.Total(MetricNames.ClockJump, ("station", s.StationId)));
+
+        // Con el bloqueo confirmado, el salto deja de retenerse; la estación sigue bloqueada en SQL.
+        manual.Advance(TimeSpan.FromMilliseconds(10));
+        Assert.Equal(ClaimRejection.StationDisabled, (await claims.TryClaimAsync(job, s.Lease, Ct))!.Rejection);
+    }
+
+    /// <summary>
+    /// Revisión de la Fase 3, MEDIA-3: J13 tiene su propia guarda de plazo. Con NextAttemptAt cumplido y sin pasar
+    /// antes por la expiración, el job no vuelve a READY si su plazo efectivo venció (aunque el congelado siga
+    /// vigente), si la revisión con que se calculó ya no es la activa, o si venció el congelado.
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T18")]
+    public async Task Release_from_retry_wait_has_its_own_deadline_guard()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        var (job, attempt) = await s.SendingJobAsync(420, Ct);
+        await s.Txc.NotSentAsync(attempt, s.Clock.UtcNow, "conexión rechazada", NotSentCause.ConnectionFailed, 10, 3, s.Clock.UtcNow, Ct);
+        var row = await s.JobAsync(job, Ct);
+        Assert.Equal(JobStatus.RetryWait, row.Status);
+        s.AdvanceMs(20);
+        var rev = s.Revision.ConfigRevisionId;
+
+        Assert.Null(await s.Txs.ReleaseRetryAsync(job, s.Clock.UtcNow.AddMilliseconds(50), 100, rev, s.Clock.UtcNow, Ct));    // efectivo vencido
+        Assert.Null(await s.Txs.ReleaseRetryAsync(job, row.DeadlineAt, 100, rev + 1_000, s.Clock.UtcNow, Ct));                 // otra revisión
+        s.AdvanceMs((row.DeadlineAt - s.Clock.UtcNow).TotalMilliseconds);
+        Assert.Null(await s.Txs.ReleaseRetryAsync(job, row.DeadlineAt.AddSeconds(10), 100, rev, s.Clock.UtcNow, Ct));         // congelado vencido
+        Assert.Equal(JobStatus.RetryWait, (await s.JobAsync(job, Ct)).Status);
+        Assert.Single(await s.AttemptsAsync(job, Ct));
+    }
+
+    /// <summary>
+    /// Revisión de la Fase 3, MEDIA-2: el barrido usa el plazo efectivo. Una revisión nueva acorta el presupuesto de
+    /// tránsito; con el plazo congelado todavía vigente, el job en RETRY_WAIT (con NextAttemptAt cumplido) y uno READY
+    /// vencen con DEADLINE_PASSED (J14 y J03), y la detección en WAITING_ERP con ERP_UNAVAILABLE (D07). Ninguno vuelve
+    /// a READY.
+    /// </summary>
+    [Fact]
+    [Trait("Spec", "T18")]
+    public async Task The_sweep_expires_by_the_effective_deadline_after_a_revision_change()
+    {
+        var s = await StationScenario.CreateAsync(_db, ct: Ct);
+        var sweep = new StationSweepService(s.Settings, s.Txs, s.Stations, new ClockGuard(s.Clock), s.Clock, s.Metrics);
+        var ready = await s.ReadyJobAsync(430, Ct);
+        var (retry, attempt) = await s.SendingJobAsync(431, Ct);
+        await s.Txc.NotSentAsync(attempt, s.Clock.UtcNow, "conexión rechazada", NotSentCause.ConnectionFailed, 200, 3, s.Clock.UtcNow, Ct);
+        var waiting = await s.RegisterAsync(s.Cycle(432, workOrder: "WO-SIN"));
+        Assert.Equal(DetectionStatus.WaitingErp, waiting.FinalStatus);
+
+        await s.Stations.ActivateRevisionAsync(StationScenario.DefaultRevision(s.StationId) with
+        {
+            RevisionNumber = 8, TransitBudgetMs = 600, ChangeReason = "Línea más rápida",
+        }, Ct);
+        s.AdvanceMs(300);
+        foreach (var job in new[] { ready, retry })
+        {
+            var context = (await s.Claims.LoadAsync(job, Ct))!;
+            Assert.True(context.EffectiveDeadline <= s.Clock.UtcNow.AddMilliseconds(context.EffectiveSendMarginMs));
+            Assert.True(context.Job.DeadlineAt > s.Clock.UtcNow.AddMilliseconds(context.EffectiveSendMarginMs));
+        }
+
+        var report = await sweep.SweepOnceAsync(Ct);
+        Assert.Empty(report.Released);
+        Assert.Equal(new[] { (ready, JobStatus.Ready), (retry, JobStatus.RetryWait) }.OrderBy(x => x.Item1),
+            report.Expired.Select(t => (t.Id, t.From)).OrderBy(x => x.Item1));
+        Assert.All(report.Expired, t => Assert.Equal(JobReason.DeadlinePassed, t.Reason));
+        Assert.Equal(waiting.DetectionId, Assert.Single(report.WaitingErpExpired).Id);
+        Assert.Equal((DetectionStatus.Expired, DetectionReason.ErpUnavailable),
+            ((await s.DetectionAsync(432, Ct))!.Status, (await s.DetectionAsync(432, Ct))!.Reason));
     }
 }

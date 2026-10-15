@@ -108,8 +108,13 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
     private bool _firstPending = true;
     private uint _highestSequence;
     private uint _subscriptionId;
+    private Subscription? _seenSubscription;
     private bool _recovering;
+    private int _recoveryGeneration;
     private DateTime? _republishedBefore;
+    private DateTime? _lastReconnectServerTime;
+    private DateTime _reconnectedAt;
+    private const string ItemName = "CartonCycleRecord";
 
     public OpcUaCycleSource(OpcIngestOptions options, EdgeClock clock, CartonMetrics metrics, ILogger<OpcUaCycleSource>? logger = null)
     {
@@ -167,7 +172,28 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
         session.KeepAliveInterval = _options.KeepAliveIntervalMs;
         session.KeepAlive += OnKeepAlive;
         _session = session;
-        await CreateSubscriptionAsync(session, ct);
+        try
+        {
+            await CreateSubscriptionAsync(session, ct);
+        }
+        catch
+        {
+            // Un arranque fallido no deja una sesión huérfana enganchada al keep-alive.
+            session.KeepAlive -= OnKeepAlive;
+            _session = null;
+            try
+            {
+                await session.CloseAsync(CancellationToken.None);
+            }
+            catch (ServiceResultException)
+            {
+                // Ya cerrada.
+            }
+
+            session.Dispose();
+            throw;
+        }
+
         _reconnect = new SessionReconnectHandler(Telemetry, true, _options.ReconnectPeriodMs * 10);
     }
 
@@ -211,7 +237,7 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
     {
         var subscription = new Subscription(Telemetry, new SubscriptionOptions
         {
-            DisplayName = "CartonCycleRecord",
+            DisplayName = ItemName,
             PublishingInterval = _options.PublishingIntervalMs,
             KeepAliveCount = 10,
             LifetimeCount = 100,
@@ -222,7 +248,7 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
         });
         var item = new MonitoredItem(Telemetry, new MonitoredItemOptions
         {
-            DisplayName = "CartonCycleRecord",
+            DisplayName = ItemName,
             StartNodeId = NodeId.Parse(_options.RecordNodeId),
             AttributeId = Attributes.Value,
             MonitoringMode = MonitoringMode.Reporting,
@@ -264,15 +290,19 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
         {
             // Una suscripción recreada (reinicio del servidor, sesión nueva o suscripción vencida) vuelve a
             // numerar sus mensajes desde 1 y su primera notificación es el valor actual: READ.
-            if (subscription.Id != _subscriptionId)
+            // Por instancia o por Id: un servidor puede repetir Ids al reiniciar (solo deben ser únicos mientras viven).
+            if (!ReferenceEquals(subscription, _seenSubscription) || subscription.Id != _subscriptionId)
             {
+                _seenSubscription = subscription;
                 _subscriptionId = subscription.Id;
                 _highestSequence = 0;
                 _firstPending = true;
+                _subscription = subscription;
+                _item = subscription.MonitoredItems.FirstOrDefault(i => i.DisplayName == ItemName) ?? _item;
             }
 
             recovering = _recovering;
-            watermark = _republishedBefore;
+            watermark = _recovering ? _republishedBefore : _lastReconnectServerTime;
             messageTransport = seq != 0 && seq <= _highestSequence ? Transport.Republish : Transport.Subscription;
 
             _highestSequence = Math.Max(_highestSequence, seq);
@@ -286,7 +316,14 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
             }
 
             var transport = messageTransport;
-            if (recovering)
+            if (!recovering && watermark is { } last && change.Value.ServerTimestamp != DateTime.MinValue
+                && DateTime.SpecifyKind(change.Value.ServerTimestamp, DateTimeKind.Utc) <= last)
+            {
+                // Un cambio anterior a la última reconexión que llega después de terminada la recuperación también
+                // llegó tarde, aunque su número de secuencia sea nuevo.
+                transport = Transport.Republish;
+            }
+            else if (recovering)
             {
                 // Durante la recuperación, un cambio que el servidor registró antes de la reconexión llegó tarde
                 // (REPUBLISH), aunque viaje en un mensaje nuevo; solo uno posterior es en vivo. Sin la hora del
@@ -363,6 +400,7 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
         lock (_gate)
         {
             _recovering = true;
+            _recoveryGeneration++;
             _republishedBefore = null;
         }
 
@@ -383,7 +421,7 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
         _metrics.Increment(MetricNames.OpcReconnect);
         if (!ReferenceEquals(handler.Session, _session))
         {
-            // Sesión nueva con suscripciones transferidas: la primera notificación vuelve a ser READ.
+            // Sesión nueva con suscripciones transferidas o recreadas: la primera notificación vuelve a ser READ.
             _session = handler.Session;
             _session.KeepAlive += OnKeepAlive;
             lock (_gate)
@@ -392,11 +430,19 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
             }
         }
 
+        int generation;
+        lock (_gate)
+        {
+            RefreshLiveSubscription();
+            _reconnectedAt = DateTime.UtcNow;
+            generation = _recoveryGeneration;
+        }
+
         _ = Task.Run(async () =>
         {
             try
             {
-                await RecoverAfterReconnectAsync(CancellationToken.None);
+                await RecoverAfterReconnectAsync(CancellationToken.None, generation);
             }
             catch (Exception ex)
             {
@@ -411,7 +457,17 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
     /// mensajes que se perdieron en tránsito; lectura de la FIFO (PLC_FIFO). Al terminar, la recuperación termina,
     /// llegue o no una caja. El valor actual nunca se toma como historial: la clasificación abre huecos.
     /// </summary>
-    public async Task RecoverAfterReconnectAsync(CancellationToken ct)
+    /// <summary>La suscripción y el monitored item vivos de la sesión (tras recrearse, los anteriores ya no sirven).</summary>
+    private void RefreshLiveSubscription()
+    {
+        if (_session?.Subscriptions.FirstOrDefault(sub => sub.DisplayName == ItemName) is { } live)
+        {
+            _subscription = live;
+            _item = live.MonitoredItems.FirstOrDefault(i => i.DisplayName == ItemName) ?? _item;
+        }
+    }
+
+    public async Task RecoverAfterReconnectAsync(CancellationToken ct, int? generation = null)
     {
         try
         {
@@ -429,6 +485,7 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
                     lock (_gate)
                     {
                         _republishedBefore = DateTime.SpecifyKind(t, DateTimeKind.Utc);
+                        _lastReconnectServerTime = _republishedBefore;
                     }
                 }
             }
@@ -452,10 +509,19 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
             {
                 // Republish: los mensajes que el servidor envió y no llegaron siguen en su cola de retransmisión
                 // hasta el acuse. La lista llega con la primera respuesta de publicación tras reconectar.
-                if (_subscription is { } subscription)
+                Subscription? subscription;
+                lock (_gate)
                 {
+                    RefreshLiveSubscription();
+                    subscription = _subscription;
+                }
+
+                if (subscription is not null)
+                {
+                    // La lista de disponibles vale solo si llegó con una respuesta de publicación posterior a la
+                    // reconexión (los keep-alive cuentan); una lista vieja no dice qué se perdió.
                     var waited = 0;
-                    while (!(subscription.AvailableSequenceNumbers?.Any() ?? false) && waited < 1000)
+                    while (subscription.LastNotificationTime <= _reconnectedAt && waited < 2000)
                     {
                         await Task.Delay(50, ct);
                         waited += 50;
@@ -504,8 +570,12 @@ public sealed class OpcUaCycleSource : ICycleSource, ILabelingReadySink
         {
             lock (_gate)
             {
-                _recovering = false;
-                _republishedBefore = null;
+                // Si otra interrupción empezó mientras tanto, la recuperación vigente es la suya.
+                if (generation is null || generation == _recoveryGeneration)
+                {
+                    _recovering = false;
+                    _republishedBefore = null;
+                }
             }
 
             Note("recuperación terminada");

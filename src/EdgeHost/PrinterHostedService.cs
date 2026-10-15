@@ -23,10 +23,11 @@ public sealed class PrinterHostOptions
 /// <summary>
 /// Sender único de la impresora de línea en el EdgeHost (Fase 4): toma el lease, ejecuta la recuperación de
 /// arranque (TX-R0) antes de enviar nada y después envía en orden. El lock de sistema operativo, la renovación
-/// del lease y la parada ante su pérdida llegan en la Fase 5 (propiedad de la impresora).
+/// del lease y la parada ante su pérdida llegan en la Fase 5 (propiedad de la impresora). El claim comparte el
+/// ClockGuard de la estación con el barrido (CLOCK_JUMP).
 /// </summary>
 public sealed class PrinterHostedService(
-    PrinterHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers) : BackgroundService
+    PrinterHostOptions options, SqlDb db, EdgeClock clock, CartonMetrics metrics, ILoggerFactory loggers, IServiceProvider services) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -45,7 +46,7 @@ public sealed class PrinterHostedService(
 
         await using var transport = new TcpPrinterTransport(options.Transport, clock.TimeProvider);
         var evidence = new EvidenceService(new TxdEvidence(db), db, clock, metrics);
-        var sender = new PrinterSenderService(options.PrinterId, db, new ClaimService(db, new TxbClaim(db), metrics, clock), new TxcWriteResult(db),
+        var sender = new PrinterSenderService(options.PrinterId, db, new ClaimService(db, new TxbClaim(db), metrics, clock, services.GetService<ClockGuard>() ?? new ClockGuard(clock)), new TxcWriteResult(db),
             new StationConfigStore(db), lease, transport, clock, metrics, logger: loggers.CreateLogger<PrinterSenderService>(), evidence: evidence);
         await sender.RunAsync(TimeSpan.FromMilliseconds(options.PollIntervalMs), clock.TimeProvider, null, stoppingToken);
     }

@@ -15,6 +15,7 @@ namespace CartonPrinting.PrintAgent;
 public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, CartonMetrics metrics)
 {
     private readonly ConcurrentDictionary<Guid, DateTime> _printedAt = new();
+    private readonly ConcurrentDictionary<Guid, DateTime> _appliedAt = new();
     private readonly ConcurrentDictionary<Guid, ConcurrentQueue<(string Level, DateTime ObservedAt)>> _pending = new();
 
     public async Task<EvidenceOutcome> SubmitAsync(ObservationInput observation, CancellationToken ct)
@@ -122,6 +123,8 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
 
         if (await SentAtAsync(jobId, ct) is { } sent)
         {
+            // Lo que quedó pendiente durante SENDING se mide antes, en su orden.
+            await MeasurePendingAsync(jobId, ct);
             Measure(jobId, sent, o.EvidenceLevel, o.ObservedAt, outcome.Action is EvidenceAction.Confirmed or EvidenceAction.ExceptionalConfirmed);
         }
         else
@@ -155,9 +158,24 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
             case EvidenceLevel.Printed:
                 _printedAt[jobId] = observedAt;
                 metrics.Record(MetricNames.SendToPrintedMs, (observedAt - sent).TotalMilliseconds);
+                if (_appliedAt.TryRemove(jobId, out var appliedFirst))
+                {
+                    metrics.Record(MetricNames.PrintedToAppliedMs, (appliedFirst - observedAt).TotalMilliseconds);
+                }
+
                 break;
-            case EvidenceLevel.Applied when _printedAt.TryGetValue(jobId, out var printed):
-                metrics.Record(MetricNames.PrintedToAppliedMs, (observedAt - printed).TotalMilliseconds);
+            case EvidenceLevel.Applied:
+                // PRINTED (por job) y APPLIED (por ciclo) pueden medirse en cualquier orden: el par se registra cuando
+                // se conocen los dos instantes observados.
+                if (_printedAt.TryGetValue(jobId, out var printed))
+                {
+                    metrics.Record(MetricNames.PrintedToAppliedMs, (observedAt - printed).TotalMilliseconds);
+                }
+                else
+                {
+                    _appliedAt[jobId] = observedAt;
+                }
+
                 break;
             case EvidenceLevel.Verified when confirmed:
                 metrics.Record(MetricNames.SendToVerifiedMs, (observedAt - sent).TotalMilliseconds);

@@ -100,6 +100,9 @@ public sealed class PrinterFaultTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Equal(AttemptOutcome.Confirmed, Assert.Single(await s.AttemptsAsync(job, Ct)).Outcome);
         Assert.Equal(1, rig.Printer.TransmissionsOf(unknown.LabelSerial));
         Assert.Single(rig.Printer.Printed);
+        var final = (await s.ResultsAsync(job, Ct)).MaxBy(r => r.GetProperty("resultVersion").GetInt32());
+        Assert.Equal(("CONFIRMED", confirmed.ResultVersion), (final.GetProperty("outcome").GetString(), final.GetProperty("resultVersion").GetInt32()));
+        Assert.Equal(0, s.Metrics.Total(MetricNames.DuplicatePhysicalTransmissions));
     }
 
     /// <summary>
@@ -172,6 +175,10 @@ public sealed class PrinterFaultTests(SqlServerFixture sql) : IAsyncLifetime
             s.AdvanceMs(s.Revision.EvidenceWindowMs!.Value + 10);
             await Sweep(s).SweepOnceAsync(Ct);
             Assert.Equal((JobStatus.Unknown, JobReason.EvidenceWindowElapsed), ((await s.JobAsync(held, Ct)).Status, (await s.JobAsync(held, Ct)).Reason));
+            Assert.Equal(("UNKNOWN", false), ((await s.ResultsAsync(held, Ct)).Last().GetProperty("outcome").GetString(),
+                (await s.ResultsAsync(held, Ct)).Last().GetProperty("final").GetBoolean()));
+            Assert.False(await control.CancelAsync(held, Ct));   // variante 1 con el job ya UNKNOWN: sigue UNKNOWN
+            Assert.Equal(JobStatus.Unknown, (await s.JobAsync(held, Ct)).Status);
 
             // La etiqueta sale tarde de la cola: PRINTED no alcanza APPLIED; el sistema no la declara aplicada.
             Assert.True(rig.Printer.Release(heldRow.LabelSerial));
@@ -229,7 +236,9 @@ public sealed class PrinterFaultTests(SqlServerFixture sql) : IAsyncLifetime
         Assert.Empty(report.Released);
         Assert.Equal((n, JobStatus.RetryWait, JobReason.OutOfOrder), (report.Expired.Single().Id, report.Expired.Single().From, report.Expired.Single().Reason));
         Assert.Equal(1, s.Metrics.Total(MetricNames.JobsExpired, ("from", JobStatus.RetryWait), ("reason", JobReason.OutOfOrder)));
-        Assert.Equal("OUT_OF_ORDER", (await s.ResultsAsync(n, Ct)).Last().GetProperty("reason").GetString());
+        var nResult = (await s.ResultsAsync(n, Ct)).Last();
+        Assert.Equal(("EXPIRED", "OUT_OF_ORDER"), (nResult.GetProperty("outcome").GetString(), nResult.GetProperty("reason").GetString()));
+        Assert.Equal((JobStatus.Expired, JobReason.OutOfOrder), ((await s.JobAsync(n, Ct)).Status, (await s.JobAsync(n, Ct)).Reason));
         Assert.Equal([(await s.JobAsync(n1, Ct)).LabelSerial], rig.Printer.Received.Select(l => l.Serial));
 
         // Reintento del mismo job: después de un NOT_SENT, el siguiente claim del mismo job se permite.

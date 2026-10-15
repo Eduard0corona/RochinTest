@@ -26,7 +26,7 @@ var killAt = Enum.Parse<SenderPoint>(args[6]);
 var clock = new EdgeClock(TimeProvider.System);
 using var metrics = new CartonMetrics();
 var db = new SqlDb(new DatabaseOptions { ConnectionString = connection });
-var claims = new ClaimService(db, new TxbClaim(db), metrics, clock);
+var claims = new ClaimService(db, new TxbClaim(db), metrics, clock, new ClockGuard(clock));
 await using var transport = new TcpPrinterTransport(new PrinterTransportOptions { Port = port, AcceptanceTimeoutMs = 2_000 }, TimeProvider.System);
 var sender = new PrinterSenderService(printerId, db, claims, new TxcWriteResult(db), new StationConfigStore(db),
     new LeaseGrant(printerId, owner, token, DateTime.UtcNow.AddMinutes(10)), transport, clock, metrics, new StopAt(killAt));

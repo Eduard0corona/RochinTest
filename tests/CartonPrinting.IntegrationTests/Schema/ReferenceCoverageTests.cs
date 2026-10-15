@@ -134,7 +134,7 @@ public sealed class ReferenceCoverageTests(SqlServerFixture sql) : IAsyncLifetim
         var d1 = await s.RegisterAsync(s.Cycle(70, workOrder: "WO-RC", cartonId: "C-99"));
         var d2 = await s.RegisterAsync(s.Cycle(71, workOrder: "WO-RC", cartonId: "C-99"));
         Assert.Equal(DetectionStatus.WaitingErp, d2.FinalStatus);
-        await s.Stations.ActivateRevisionAsync(StationScenario.DefaultRevision(s.StationId) with { RevisionNumber = 8, CartonIdentityMode = "CARTON_ID_REQUIRED" }, Ct);
+        var rev8 = await s.Stations.ActivateRevisionAsync(StationScenario.DefaultRevision(s.StationId) with { RevisionNumber = 8, CartonIdentityMode = "CARTON_ID_REQUIRED" }, Ct);
         await s.AddSnapshotAsync("R1", "SKU-RC", "LOT-RC", Ct, "WO-RC");
         var snapshot = (await s.Erp.FindValidAsync("WO-RC", s.Clock.UtcNow, Ct))!;
         var detection = (await s.DetectionAsync(70))!;
@@ -142,7 +142,8 @@ public sealed class ReferenceCoverageTests(SqlServerFixture sql) : IAsyncLifetim
         var label = LabelRenderer.Render(s.Revision, snapshot, detection.Identity, serial, "C-99");
         var plan = new ErpArrivalPlan(d1.DetectionId, new JobInsert(Guid.NewGuid(), s.Revision.LabelType, s.Revision.PrinterId, "WO-RC", snapshot.Revision,
             snapshot.ProductId, snapshot.LotId, serial, s.Revision.TemplateRevision, label.Payload, label.PayloadHash, detection.DeadlineAt),
-            RequiresCartonId: true, detection.DeadlineAt, s.Revision.SendMarginMs, s.Revision.LabelType, s.Clock.UtcNow);
+            RequiresCartonId: true, detection.DeadlineAt, s.Revision.SendMarginMs, s.Revision.LabelType, s.Clock.UtcNow, snapshot.Gtin,
+            rev8.ConfigRevisionId);   // el plazo y el margen se calculan con la revisión activa
 
         var result = await s.Txe.ExecuteAsync(plan, Ct);
         Assert.Equal((DetectionStatus.Blocked, DetectionReason.RecirculatedCarton), (result.FinalStatus, result.FinalReason));

@@ -42,7 +42,9 @@ public sealed class ErpFaultTests(SqlServerFixture sql) : IAsyncLifetime
     /// <summary>
     /// T03 · ERP lento dentro del plazo (reloj real, PLC simulado por OPC UA, ERP con 300 ms de retraso):
     /// la ingesta deja la detección en WAITING_ERP sin esperar al ERP; la sincronización asíncrona trae el
-    /// snapshot y TX-E crea el job dentro del plazo. El callback OPC no se alarga.
+    /// snapshot y TX-E crea el job dentro del plazo. El callback OPC no se alarga. Para comprobar que la ingesta
+    /// no llama al ERP de forma síncrona (revisión de la Fase 3, MEDIA-4), el ERP retiene las peticiones mientras
+    /// se procesa el ciclo: la ingesta debe devolver sin ninguna respuesta del ERP para esa orden.
     /// </summary>
     [Fact]
     [Trait("Spec", "T03")]
@@ -67,9 +69,16 @@ public sealed class ErpFaultTests(SqlServerFixture sql) : IAsyncLifetime
         var loop = sync.RunAsync(TimeProvider.System, running.Token);
         try
         {
+            erp.Hold();
             h.Server.Nodes.Publish(new LatchedRecord { PlcEpoch = s.Epoch, CycleId = 100, WorkOrderId = "WO-1", DetectionTimestamp = DateTime.UtcNow.AddMilliseconds(-10) });
-            var registered = (await ingest.PumpAsync(h, l => l.Any(o => o.Kind == IngestKind.Registered)))[^1];
+            var pump = ingest.PumpAsync(h, l => l.Any(o => o.Kind == IngestKind.Registered), TimeSpan.FromSeconds(10));
+            var finished = await Task.WhenAny(pump, Task.Delay(TimeSpan.FromSeconds(10), Ct));
+            var answeredWhenIngestReturned = erp.Answered("WO-1");
+            erp.Release();
+            Assert.Same(pump, finished);                                                 // con el ERP retenido, la ingesta terminó
+            var registered = (await pump)[^1];
             Assert.Equal(DetectionStatus.WaitingErp, registered.Result!.FinalStatus);   // la ingesta no esperó al ERP
+            Assert.Equal(0, answeredWhenIngestReturned);
 
             var deadline = DateTime.UtcNow.AddSeconds(5);
             while ((await s.DetectionAsync(100, Ct))!.Status == DetectionStatus.WaitingErp && DateTime.UtcNow < deadline)
@@ -79,6 +88,7 @@ public sealed class ErpFaultTests(SqlServerFixture sql) : IAsyncLifetime
         }
         finally
         {
+            erp.Release();
             await running.CancelAsync();
             await loop.ContinueWith(_ => { }, TaskScheduler.Default);
         }

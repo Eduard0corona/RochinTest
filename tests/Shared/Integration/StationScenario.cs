@@ -49,7 +49,7 @@ public sealed class StationScenario
         Leases = new PrinterLeaseStore(Sql);
         Serials = new LabelSerialSource(Sql);
         Registration = new RegistrationService(Txa, Erp, Serials, Clock, Metrics);
-        Claims = new ClaimService(Sql, Txb, Metrics, Clock);
+        Claims = new ClaimService(Sql, Txb, Metrics, Clock, new ClockGuard(Clock));
     }
 
     public TestDatabase Db { get; }

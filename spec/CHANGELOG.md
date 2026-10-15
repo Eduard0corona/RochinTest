@@ -1,5 +1,11 @@
 # CHANGELOG
 
+## 1.1.4 · 2026-10-14 · escenario de T11
+
+Registrado en `docs/SPEC_ISSUES.md` del repositorio de implementación y aprobado por la persona responsable.
+
+- **SI-11 (clase A).** T11 espera el hueco 1001-1020 con 20 cajas pasadas durante la desconexión, pero al reconectar OPC UA entrega el valor actual del registro: si es la caja 1020, el hueco es 1001-1019. `tests/test-catalog.json` (T11, `injection`) dice ahora "reconectar cuando el registro actual ya es la caja siguiente (1021)"; `tests/MATRIZ_PRUEBAS.md` se regeneró. Ninguna regla cambia.
+
 ## 1.1.3 · 2026-10-14 · defectos encontrados por la implementación
 
 Registrados en `docs/SPEC_ISSUES.md` del repositorio de implementación y aprobados por la persona responsable.
