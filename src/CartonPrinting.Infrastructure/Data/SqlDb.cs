@@ -24,6 +24,9 @@ public sealed partial class SqlDb(DatabaseOptions options, ILogger<SqlDb>? logge
 {
     public const int DeadlockVictim = 1205;
 
+    /// <summary>Víctima de interbloqueo en un sp_getapplock (resultado -3): se reintenta como un 1205.</summary>
+    public const int AppLockDeadlockVictim = 50205;
+
     private readonly ILogger _logger = logger ?? NullLogger<SqlDb>.Instance;
 
     public DatabaseOptions Options { get; } = options;
@@ -108,7 +111,7 @@ public sealed partial class SqlDb(DatabaseOptions options, ILogger<SqlDb>? logge
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
-    public static bool IsDeadlock(SqlException ex) => ex.Errors.Cast<SqlError>().Any(e => e.Number == DeadlockVictim);
+    public static bool IsDeadlock(SqlException ex) => ex.Errors.Cast<SqlError>().Any(e => e.Number is DeadlockVictim or AppLockDeadlockVictim);
 
     /// <summary>
     /// ¿Es "clave existente" de la detección? Solo una violación (2627 o 2601) de

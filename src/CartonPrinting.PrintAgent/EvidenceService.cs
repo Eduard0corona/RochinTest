@@ -55,50 +55,19 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
     }
 
     /// <summary>
-    /// Al arrancar el sender, después de TX-R0, reaplica en orden lo que pudo quedar registrado sin aplicar si el proceso cayó
-    /// entre las dos transacciones de TX-D, dentro de <see cref="StartupHorizon"/>:
-    /// <list type="bullet">
-    /// <item>la evidencia de los jobs de la impresora que esperan evidencia o quedaron sin resolver (TRANSMITTED o UNKNOWN);</item>
-    /// <item>las lecturas VERIFIED con otro serial de sus jobs CONFIRMED o UNKNOWN, que son J18 (segunda revisión de la Fase 4,
-    /// M-3; I25 y T44: una corrección nunca se pierde en silencio).</item>
-    /// </list>
+    /// Al arrancar el sender, después de TX-R0, reaplica en orden de ObservationId lo que pudo quedar registrado sin aplicar si
+    /// el proceso cayó entre las dos transacciones de TX-D: la evidencia de la estación recibida dentro de
+    /// <see cref="StartupHorizon"/> cuyo job todavía puede cambiar con ella. Es decir, un job TRANSMITTED o UNKNOWN, o un job
+    /// CONFIRMED con una lectura VERIFIED de otro serial, que es J18 (segunda revisión de la Fase 4, M-3; I25 y T44: una
+    /// corrección nunca se pierde en silencio). Una sola consulta acotada por la clave primaria, guiada por la evidencia
+    /// reciente y no por el histórico de jobs (tercera revisión, MEDIA-3).
     /// </summary>
-    public async Task<int> ReapplyOpenAsync(string printerId, CancellationToken ct)
+    public async Task<int> ReapplyOpenAsync(string siteId, string stationId, CancellationToken ct)
     {
-        var horizon = clock.UtcNow - StartupHorizon;
-        var jobs = await db.ReadAsync<IReadOnlyList<Guid>>(async conn =>
+        var ids = await db.ReadAsync<IReadOnlyList<long>>(async conn =>
         {
-            await using var cmd = conn.Command(null, """
-                SELECT PrintJobId FROM dbo.PrintJob WHERE PrinterId = @printer AND Status IN ('TRANSMITTED', 'UNKNOWN')
-                UNION
-                SELECT pa.PrintJobId FROM dbo.PrintAttempt AS pa
-                INNER JOIN dbo.PrintJob AS pj ON pj.PrintJobId = pa.PrintJobId
-                WHERE pa.PrinterId = @printer AND pj.Status IN ('TRANSMITTED', 'UNKNOWN');
-                """);
-            cmd.NVarChar("@printer", printerId, 64);
-            var list = new List<Guid>();
-            await using var r = await cmd.ExecuteReaderAsync(ct);
-            while (await r.ReadAsync(ct))
-            {
-                list.Add(r.GetGuid(0));
-            }
-
-            return list;
-        }, ct);
-        var applied = 0;
-        foreach (var jobId in jobs)
-        {
-            if (await db.ReadAsync(conn => JobQueries.GetJobAsync(conn, null, jobId, ct), ct) is { } job
-                && await LastClaimAsync(jobId, ct) is { } since)
-            {
-                applied += await ReapplyForJobAsync(job, since > horizon ? since : horizon, ct);
-            }
-        }
-
-        var contradictions = await db.ReadAsync<IReadOnlyList<long>>(async conn =>
-        {
-            await using var cmd = conn.Command(null, EvidenceQueries.StartupContradictions);
-            cmd.DateTime2("@since", horizon).NVarChar("@printer", printerId, 64);
+            await using var cmd = conn.Command(null, EvidenceQueries.StartupReapply);
+            cmd.DateTime2("@since", clock.UtcNow - StartupHorizon).NVarChar("@site", siteId, 64).NVarChar("@station", stationId, 64);
             var list = new List<long>();
             await using var r = await cmd.ExecuteReaderAsync(ct);
             while (await r.ReadAsync(ct))
@@ -108,7 +77,8 @@ public sealed class EvidenceService(TxdEvidence txd, SqlDb db, EdgeClock clock, 
 
             return list;
         }, ct);
-        foreach (var id in contradictions)
+        var applied = 0;
+        foreach (var id in ids)
         {
             var outcome = await txd.ApplyAsync(id, clock.UtcNow, ct);
             CountAlerts(outcome);
@@ -314,9 +284,14 @@ public static class EvidenceQueries
     /// <summary>
     /// Cota inferior de ObservationId para "recibida desde @since": el último ObservationId recibido más de 5 minutos antes de
     /// @since, buscado hacia atrás en la clave primaria, así que solo se leen las filas recientes. ReceivedAt se toma del reloj
-    /// del EdgeHost justo antes de insertar: una fila recibida desde @since no puede tener un ObservationId menor salvo que el
-    /// reloj de pared retroceda más de 5 minutos, lo que CLOCK_JUMP detecta. Quien la usa fuerza la búsqueda en la clave
-    /// primaria (FORCESEEK): al compilar, el optimizador no conoce el valor de @from y elegiría recorrer la tabla.
+    /// del EdgeHost justo antes de insertar: una fila recibida desde @since no puede tener un ObservationId menor salvo que, entre
+    /// dos registros, el reloj retroceda más de 5 minutos, o que otro EdgeHost que comparte SQL Server tenga el reloj atrasado
+    /// más de 5 minutos (supuesto declarado; tercera revisión de la Fase 4, BAJA-2). Una cota por estación evitaría lo segundo,
+    /// pero recorre la tabla completa cuando la estación no tiene evidencia anterior (una estación nueva o con nivel NONE). Si el
+    /// supuesto falla, el efecto es conservador: la rama del job (PRINTED) puede no reaplicar una observación y el job termina
+    /// UNKNOWN por ventana vencida; las lecturas de ciclo y la guarda de TX-D usan IX_EvidenceObservation_Cycle, sin cota.
+    /// Quien la usa fuerza la búsqueda por rango en la clave primaria (FORCESEEK): en las pruebas el plan ya era ese sin la
+    /// sugerencia; se deja para que no dependa de las estadísticas.
     /// </summary>
     public const string FromObservation = """
         DECLARE @from BIGINT = ISNULL((SELECT TOP (1) ObservationId FROM dbo.EvidenceObservation
@@ -333,18 +308,29 @@ public static class EvidenceQueries
         WHERE SiteId = @site AND StationId = @station AND PlcEpoch = @epoch AND CycleId = @cycle AND ReceivedAt >= @since
         UNION
         SELECT ObservationId FROM dbo.EvidenceObservation WITH (INDEX (PK_EvidenceObservation), FORCESEEK)
-        WHERE ObservationId > @from AND PrintJobId = @job AND ReceivedAt >= @since
+        WHERE ObservationId > @from AND PrintJobId = @job AND ReceivedAt >= @since AND SiteId = @site AND StationId = @station
         ORDER BY ObservationId;
         """;
 
-    /// <summary>Las lecturas VERIFIED con otro serial, recibidas desde @since, de jobs CONFIRMED o UNKNOWN de @printer (J18 pendientes).</summary>
-    public const string StartupContradictions = FromObservation + """
+    /// <summary>
+    /// La evidencia de la estación recibida desde @since cuyo job todavía puede cambiar con ella (TRANSMITTED, UNKNOWN, o
+    /// CONFIRMED con una lectura VERIFIED de otro serial), en orden. El job sale por PrintJobId (clave primaria) o por el ciclo
+    /// (UQ_CartonDetection_Identity y UQ_PrintJob_DetectionLabel): nunca se recorre el histórico de jobs.
+    /// </summary>
+    public const string StartupReapply = FromObservation + """
         SELECT eo.ObservationId
         FROM dbo.EvidenceObservation AS eo WITH (INDEX (PK_EvidenceObservation), FORCESEEK)
-        INNER JOIN dbo.PrintJob AS pj
-            ON pj.SiteId = eo.SiteId AND pj.StationId = eo.StationId AND pj.PlcEpoch = eo.PlcEpoch AND pj.CycleId = eo.CycleId
-        WHERE eo.ObservationId > @from AND eo.ReceivedAt >= @since AND eo.EvidenceLevel = 'VERIFIED'
-          AND pj.PrinterId = @printer AND pj.Status IN ('CONFIRMED', 'UNKNOWN') AND eo.ReadSerial <> pj.LabelSerial
+        CROSS APPLY (
+            SELECT pj.Status, pj.LabelSerial FROM dbo.PrintJob AS pj WHERE pj.PrintJobId = eo.PrintJobId
+            UNION ALL
+            SELECT pj.Status, pj.LabelSerial
+            FROM dbo.CartonDetection AS cd
+            INNER JOIN dbo.PrintJob AS pj ON pj.DetectionId = cd.DetectionId
+            WHERE eo.PrintJobId IS NULL AND cd.SiteId = eo.SiteId AND cd.StationId = eo.StationId AND cd.PlcEpoch = eo.PlcEpoch
+              AND cd.CycleId = eo.CycleId
+        ) AS j
+        WHERE eo.ObservationId > @from AND eo.ReceivedAt >= @since AND eo.SiteId = @site AND eo.StationId = @station
+          AND (j.Status IN ('TRANSMITTED', 'UNKNOWN') OR (j.Status = 'CONFIRMED' AND eo.EvidenceLevel = 'VERIFIED' AND eo.ReadSerial <> j.LabelSerial))
         ORDER BY eo.ObservationId;
         """;
 }

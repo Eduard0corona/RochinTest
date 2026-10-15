@@ -93,17 +93,22 @@ public sealed class TxdEvidence(SqlDb db)
 
             // APPLIED y VERIFIED correlacionan por ciclo: el job es el de ese ciclo. Un PrintJobId que no
             // coincide con el job del ciclo hace la observación incoherente: queda registrada, sin efecto.
+            // El lock compartido del ciclo se toma antes del UPDLOCK del job, en el mismo orden que el registro (lock
+            // del ciclo, después las FK): al revés, un registro con AttemptId, TX-C y esta aplicación podían
+            // interbloquearse (tercera revisión de la Fase 4, BAJA-1).
             JobRecord? job = null;
             if (o.CorrelatedTo == CorrelatedTo.Cycle && o.PlcEpoch is { } epoch && o.CycleId is { } cycle)
             {
                 var found = await JobQueries.GetJobByCycleAsync(conn, tx, new CycleIdentity(o.SiteId, o.StationId, epoch, cycle), ct);
                 if (found is not null && (o.PrintJobId is null || o.PrintJobId == found.PrintJobId))
                 {
+                    await LockCycleAsync(conn, tx, o.SiteId, o.StationId, epoch, cycle, "Shared", ct);
                     job = await JobQueries.GetJobAsync(conn, tx, found.PrintJobId, ct, updLock: true);
                 }
             }
-            else if (o.PrintJobId is { } jid)
+            else if (o.PrintJobId is { } jid && await JobQueries.GetJobAsync(conn, tx, jid, ct) is { } unlocked)
             {
+                await LockCycleAsync(conn, tx, unlocked.SiteId, unlocked.StationId, unlocked.PlcEpoch, unlocked.CycleId, "Shared", ct);
                 job = await JobQueries.GetJobAsync(conn, tx, jid, ct, updLock: true);
             }
 
@@ -112,7 +117,6 @@ public sealed class TxdEvidence(SqlDb db)
                 return new EvidenceOutcome(EvidenceAction.Recorded, null, null, null, null);
             }
 
-            await LockCycleAsync(conn, tx, job.SiteId, job.StationId, job.PlcEpoch, job.CycleId, "Shared", ct);
             var attempts = await JobQueries.GetAttemptsAsync(conn, tx, job.PrintJobId, ct);
 
             // Una observación que referencia un intento de otro job es incoherente: registrada, sin efecto.
@@ -377,7 +381,8 @@ public sealed class TxdEvidence(SqlDb db)
     /// registrada antes que la observación que se va a aplicar y después de cualquier confirmación del job. Si existe, todavía
     /// no se aplicó: llegó con el intento en SENDING (sin transición posible) y otro pase llegó antes a esta confirmación.
     /// Confirmar primero la dejaría sin efecto para siempre, porque ya no sería posterior a la etiqueta vigente (ADR 0016).
-    /// Un intento excepcional solo se contradice con una lectura que lo referencia (X03).
+    /// La lectura cuenta con la misma coherencia que en <see cref="ApplyAsync"/>: sin intento o con cualquier intento del job
+    /// (tercera revisión de la Fase 4, MEDIA-1); <see cref="ApplyContradictionAsync"/> decide qué transición aplica.
     /// </summary>
     private static async Task<ObservationRecord?> EarlierContradictionAsync(
         SqlConnection conn, SqlTransaction tx, JobRecord job, AttemptRecord attempt, IReadOnlyList<AttemptRecord> attempts, long observationId,
@@ -389,13 +394,12 @@ public sealed class TxdEvidence(SqlDb db)
               AND EvidenceLevel = 'VERIFIED' AND ReadSerial <> @LabelSerial
               AND ReceivedAt >= @ClaimedAt AND ObservationId < @ObservationId AND ObservationId > @LastConfirming
               AND (PrintJobId IS NULL OR PrintJobId = @PrintJobId)
-              AND (AttemptId = @AttemptId OR (@Exceptional = 0 AND AttemptId IS NULL))
+              AND (AttemptId IS NULL OR AttemptId IN (SELECT pa.AttemptId FROM dbo.PrintAttempt AS pa WHERE pa.PrintJobId = @PrintJobId))
             ORDER BY ObservationId;
             """);
         cmd.NVarChar("@SiteId", job.SiteId, 64).NVarChar("@StationId", job.StationId, 64).BigInt("@PlcEpoch", job.PlcEpoch).Cycle("@CycleId", job.CycleId)
             .VarChar("@LabelSerial", job.LabelSerial, 40).DateTime2("@ClaimedAt", attempt.ClaimedAt).BigInt("@ObservationId", observationId)
-            .BigInt("@LastConfirming", attempts.Max(a => a.ConfirmingObservationId) ?? 0).Guid("@PrintJobId", job.PrintJobId)
-            .Guid("@AttemptId", attempt.AttemptId).Bit("@Exceptional", attempt.Kind == AttemptKind.ExceptionalReprint);
+            .BigInt("@LastConfirming", attempts.Max(a => a.ConfirmingObservationId) ?? 0).Guid("@PrintJobId", job.PrintJobId);
         return await cmd.ExecuteScalarAsync(ct) is long id ? await JobQueries.GetObservationAsync(conn, tx, id, ct) : null;
     }
 
@@ -412,6 +416,7 @@ public sealed class TxdEvidence(SqlDb db)
         await using var cmd = conn.Command(tx, """
             DECLARE @result INT;
             EXEC @result = sys.sp_getapplock @Resource = @Resource, @LockMode = @LockMode, @LockOwner = 'Transaction', @LockTimeout = 10000;
+            IF @result = -3 THROW 50205, N'Víctima de interbloqueo en el lock de evidencia del ciclo.', 1;
             IF @result < 0 THROW 50204, N'No se obtuvo el lock de evidencia del ciclo.', 1;
             """);
         cmd.NVarChar("@Resource", CycleLockResource(siteId, stationId, epoch, cycle), 255).VarChar("@LockMode", mode, 32);
