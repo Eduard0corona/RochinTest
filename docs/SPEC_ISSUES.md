@@ -16,6 +16,8 @@ Clasificación de `CLAUDE.md`:
 | SI-07 | B (vacío de guarda) | 1 | `spec/database/sqlserver_schema.sql` (`TR_PrintJob_StateMachine`, rama CORRECTION) | Resuelto: la persona eligió endurecer el trigger; ADR 0016 en `5eb9695` (spec 1.1.3) |
 | SI-08 | B (vacío de guarda) | 1 | `spec/database/sqlserver_schema.sql` (`TR_PlcEpochHistory_Guard`) | Abierto: el código inserta una acción por confirmación |
 | SI-09 | B (vacío) | 1 | `docs/ARQUITECTURA_TECNICA.md` (plazo efectivo tras cambiar la revisión) | Abierto: comportamiento interino de falla cerrada |
+| SI-10 | Vacío de integración (OT-04) | 2 | `DOCUMENTO_PRINCIPAL.md` sección 4, ADR 0001 | Abierto: eco de cierre en el simulador detrás de `CycleDecoder` |
+| SI-11 | Observación | 2 | `spec/tests/test-catalog.json` (T11) | Abierto: interpretación documentada en la prueba |
 
 ## SI-01 · Rango de códigos de error en el criterio de T47
 
@@ -77,3 +79,15 @@ Clasificación de `CLAUDE.md`:
 - **Vacío.** El plazo efectivo de un job es el mínimo entre el congelado y el recalculado con la revisión activa ("nunca más permisivo que el congelado"). La especificación no dice qué hacer si la revisión activa no puede dar un plazo confiable para ese registro: por ejemplo, cambió a `PLC_TIMESTAMP` y el registro no trae `DetectionTimestamp`, o cambió a `GATEWAY_RECEIPT` y el registro no llegó en vivo.
 - **Comportamiento interino (falla cerrada).** El plazo efectivo es la recepción del registro (`DeadlineAt = ReceivedAt`, la misma regla que I26 aplica al registrar): el job ya no se envía como operación ordinaria y vence en el claim (J03). No imprime de más.
 - **Por qué clase B.** Es una decisión de comportamiento (otra lectura posible: conservar el plazo congelado). Pendiente de la persona.
+
+## SI-10 · Cómo se reconoce un registro latched incoherente
+
+- **Vacío.** La sección 4 y el ADR 0001 dicen que, si los campos del registro no corresponden al mismo ciclo, la detección queda `BLOCKED` con `INCOHERENT_SNAPSHOT` (T13), pero no definen cómo lo reconoce el gateway: un valor atómico no trae, por sí mismo, una prueba de que sus campos son del mismo ciclo.
+- **Qué hace la implementación.** Es una capacidad del PLC no confirmada por OT (regla 6 de `spec/AI_CONTEXT.md`): queda detrás de `CycleDecoder` y del simulador. El registro del simulador termina con un eco del `CycleId` que el PLC escribe al cerrar el registro (`closingCycleId`); si no coincide con `cycleId`, el registro es incoherente. Sin eco, la coherencia no se puede comprobar y el registro se acepta.
+- **Pendiente de OT (OT-04).** El formato real del registro y su mecanismo de coherencia (eco, contador de escritura, estructura OPC UA atómica).
+
+## SI-11 · T11: el hueco 1001-1020 y la lectura tras reconectar
+
+- **Observación.** T11 espera "hueco 1001-1020 OPEN" con 20 cajas pasadas durante la desconexión. Tras reconectar, OPC UA entrega el valor actual del registro (sección 9.2); si es la caja 1020, el hueco que abre es 1001-1019 y la FIFO entrega 19 cajas nuevas.
+- **Interpretación usada.** La prueba reconecta cuando el registro actual ya es la caja 1021: la lectura abre el hueco 1001-1020 y la FIFO entrega las 20 como `RECOVERED`. Ninguna regla cambia; solo se precisa el escenario.
+

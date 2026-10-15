@@ -329,3 +329,77 @@ Las correcciones posteriores a la segunda revisión fueron el cambio de especifi
 - **Evidencia registrada y no aplicada.** TX-D registra la observación en su propia transacción y la aplica en otra. Si el proceso muere entre las dos, la observación queda sin aplicar. La Fase 4 la reaplica al arrancar; con el ADR 0016, una lectura anterior al estado vigente queda sin efecto en el trigger y en TX-D.
 - Las pruebas de concurrencia dependen del planificador de SQL Server; T02 se repite en cinco rondas y con un bloqueo retenido explícito.
 - SI-04, SI-05, SI-08 y SI-09 quedan con su interino de falla cerrada, por decisión de la persona (2026-10-14).
+
+## Fase 2 · Ingesta OPC simulada (T11, T13, T24, T25, T26, T30, T35, T45)
+
+### Plan
+
+- **Entregables:** abstracción de la fuente de ciclos (`ICycleSource`) con el cliente OPC UA real (OPC Foundation UA .NET Standard) y el PLC simulado como servidor OPC UA en proceso (registro latched, `PlcEpoch`, bit Overflow, Republish, FIFO para T11, `LabelingReady`); decodificación (solo StatusCode Good); clasificación de la sección 9.2 y del diagrama 08 (duplicados, colisiones, tardíos, reinicio sospechado, disminución ambigua, huecos, épocas, rebote); `SequenceAnomaly`, `SequenceGap`, `PlcEpochHistory`; reglas de plazo de `GATEWAY_RECEIPT`; ingesta alojada en el EdgeHost.
+- **Pruebas que la cierran:** T11, T13, T24, T25, T26, T30, T35 y T45, con el cliente real contra el servidor simulado donde el transporte importa.
+- **Riesgos previstos:** que el SDK no entregue lo perdido en tránsito tras reconectar; que el orden entre la primera notificación y las lecturas de recuperación vuelva no determinista T11; el costo de T24 a escala completa.
+
+### Lo hecho
+
+- **Simuladores** (`CartonPrinting.Simulators`): `PlcSimulatorServer` y `PlcNodeManager` (registro latched como String JSON con eco de cierre `closingCycleId`, FIFO `PendingCycles`, `LabelingReady` escribible, `PrintWindowCycleId`), `TcpProxy` para congelar o cortar el enlace.
+- **Ingesta** (`CartonPrinting.OpcIngest`): `OpcUaCycleSource` (clasificación del transporte por mensaje; primera notificación `READ`; `REPUBLISH` tras perder el keep-alive y Republish explícito de los números de secuencia disponibles; lectura del registro actual y de la FIFO al reconectar), `CycleDecoder`, `StationIngestService` (un consumidor por estación), `LabelingReadyHeartbeat`, `IngestHostedService` (sección `Ingest` del EdgeHost).
+- **Clasificación** (`CartonPrinting.Orchestration`): `SequenceClassifier` (estado en memoria reconstruido desde SQL, caché de huellas), `RetainedRecords` (registro retenido y reingreso `ANOMALY_REINGEST`).
+- **Datos**: `SequenceStore` (épocas con su marca alta, retención `EPOCH_UNEXPECTED` con bloqueo en una transacción, registros retenidos, huecos abiertos).
+
+### Decisiones
+
+1. **TX-A sigue siendo la autoridad.** La marca alta y la caché de huellas son de la ingesta (barrera 2): evitan ir a SQL con repeticiones, pero la unicidad la decide la inserción primero. La caché solo guarda claves que este proceso registró o confirmó como duplicado; una clave con otra huella siempre va a TX-A.
+2. **Épocas.** La primera época de una estación se acepta como `INITIAL`; la actual + 1 con `AUTO_INCREMENT_BY_ONE`; lo demás es `EPOCH_UNEXPECTED`. La aceptación es una transacción propia antes de TX-A (la detección tiene FK a la época), con `FirstCycleId` = primer ciclo recibido. El primer registro de una época no abre hueco: no se sabe en qué valor arrancó el contador.
+3. **`EPOCH_UNEXPECTED`.** Cada registro de una época no aceptada queda como su propia anomalía con el registro completo, y la estación se bloquea una vez. El reingreso exige la época ya aceptada (`CONFIRM_EPOCH`), registra el mismo registro latched con `ANOMALY_REINGEST` y conserva `ReceivedAt`, y después resuelve la anomalía con `RESOLVE_ANOMALY`. Repetirlo da un duplicado auténtico.
+4. **Tardío o reinicio.** Con `DetectionTimestamp` en el registro y en la marca alta, anterior es tardío y posterior o igual es `RESET_SUSPECTED` (la igualdad se trata como reinicio: falla cerrada). Sin alguno de los dos timestamps es `AMBIGUOUS_DECREASE`: `WARNING` y, si la clave nueva anterior también fue ambigua, `BLOCKING` con la estación bloqueada.
+5. **Rebote.** El avance mínimo plausible desde la marca alta es `(CycleId − M) × MinCycleIntervalMs`; sin `DetectionTimestamp` (o sin `MinCycleIntervalMs`) la regla no se aplica, como pide T26. Un registro con rebote que además salta ciclos abre igual su hueco (diagrama 08).
+6. **Registro incoherente.** El formato real del registro latched es una decisión de OT (OT-04). El simulador cierra el registro con un eco del `CycleId`; si el eco no coincide, el registro es incoherente y queda `BLOCKED` con `INCOHERENT_SNAPSHOT` antes que cualquier otra clasificación (D05), igual que un registro sin orden. Sin eco, la coherencia no se puede comprobar (SI-10).
+7. **Decodificación.** Solo StatusCode Good produce un registro; vacío, mal formado o sin identidad se descarta con `opc_records_rejected_total{cause,transport}` y nunca llega a TX-A.
+8. **`LabelingReady`** = estación habilitada y OPC conectado; baja si no se puede leer SQL y al detener el servicio.
+9. **G03 en la ingesta.** Mientras no existe el barrido completo de la Fase 3, el servicio alojado cierra los huecos vencidos cada `GapSweepIntervalMs` y mide `cycles_unobserved_total` y `sequence_gaps_open`.
+10. **El consumidor no salta registros.** Si TX-A falla con un error que no es de identidad ni 1205, el servicio se detiene: la disponibilidad cede ante la consistencia.
+11. **Pruebas de T45 por transporte.** La clasificación del transporte la prueba `OpcClientTransportTests` contra el servidor simulado (primera notificación, Republish tras congelar el enlace, Overflow, reinicio con lectura y FIFO); la regla de plazo por transporte se prueba con registros de cada transporte en la ingesta, más un recorrido completo por OPC (primera notificación tras reiniciar el servidor).
+12. **Precondición de T24 en bloque.** Los 5000 ciclos registrados se cargan con `SqlBulkCopy` (con `FireTriggers` y `CheckConstraints`) y pasan a `EXPIRED` por D04; la inyección (5200 entregas) pasa completa por la ingesta y TX-A.
+
+### Comandos y resultados
+
+Compuerta completa, 2026-10-14 22:00 (`powershell -File build/ci.ps1`):
+
+```
+Resultado: 15 grupos OK, 0 errores
+Artefactos generados al día.
+    0 Advertencia(s)
+    0 Errores
+Correctas! - Con error:     0, Superado:   155, Omitido:     0, Total:   155, Duración: 22 s - CartonPrinting.UnitTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    80, Omitido:     0, Total:    80, Duración: 1 m 38 s - CartonPrinting.IntegrationTests.dll (net10.0)
+Correctas! - Con error:     0, Superado:    20, Omitido:     0, Total:    20, Duración: 2 m 39 s - CartonPrinting.FaultTests.dll (net10.0)
+  Fase 0: T23=3 destino(s), 20 ejecutadas, T28=CI(verify_package.py)
+  Fase 1: T01=2 destino(s), 2 ejecutadas, T02=1 destino(s), 2 ejecutadas, T10=1 destino(s), 1 ejecutadas, T14=1 destino(s), 2 ejecutadas, T47=4 destino(s), 62 ejecutadas
+  Fase 2: T11=1 destino(s), 1 ejecutadas, T13=2 destino(s), 2 ejecutadas, T24=2 destino(s), 2 ejecutadas, T25=4 destino(s), 7 ejecutadas, T26=2 destino(s), 3 ejecutadas, T30=2 destino(s), 3 ejecutadas, T35=2 destino(s), 2 ejecutadas, T45=3 destino(s), 8 ejecutadas
+Resultado: trazabilidad OK, 0 errores
+Compuerta en verde.
+```
+
+Durante el desarrollo:
+
+- `GatewayReceiptTests` falló al esperar `CK_CartonDetection_GatewayLive` también para el ciclo en vivo que abre un hueco: la CHECK no lo distingue (la regla del hueco es de código en TX-A, SI-05) y lo rechaza la máquina de estados (51011). Se corrigió la prueba.
+- `FifoReconnectTests` falló con dos cajas "perdidas" cuyo timestamp tenía menos de 1 s: datos de prueba irreales (el reloj del EdgeHost no avanzaba durante la desconexión). La prueba ahora avanza el reloj lo que dura la desconexión.
+- `TestRevisions.cs` en la carpeta compartida rompía la compilación de `LoadTests`; pasó al proyecto de pruebas unitarias.
+
+### Pruebas de la fase
+
+- **T11, T13, T24, T25, T26, T30, T35 y T45: PASA** (detalle en `docs/TEST_STATUS.md`).
+
+### Lo que no se verificó
+
+- Ningún PLC real: el servidor OPC UA es el simulador. El formato del registro latched, el eco de cierre y la FIFO son del simulador (OT-04, OT-14).
+- Seguridad OPC UA: las pruebas usan `SecurityMode = None` contra el simulador; `SignAndEncrypt` con certificados de planta no se probó.
+- Un solo `IngestHostedService` por proceso (una estación); varias estaciones por EdgeHost no se probaron.
+- Los intervalos revisados por el servidor y el bit Overflow se observaron solo con el servidor de OPC Foundation.
+- `LabelingReady` se verificó como valor escrito en el simulador; qué hace el PLC cuando cae es una decisión de OT.
+
+### Riesgos
+
+- La marca alta se reconstruye con el mayor `CycleId` registrado de cada época: un registro retenido sin detección no la mueve, a propósito.
+- T24 a escala completa tarda unos 2,5 minutos (5200 entregas reales contra SQL).
+- La caché de huellas es de 4096 claves: una repetición más vieja va a TX-A, que la resuelve igual.
+
