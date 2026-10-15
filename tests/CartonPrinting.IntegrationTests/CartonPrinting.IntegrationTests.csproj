@@ -19,6 +19,9 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\CartonPrinting.Contracts\CartonPrinting.Contracts.csproj" />
     <ProjectReference Include="..\..\src\CartonPrinting.Infrastructure\CartonPrinting.Infrastructure.csproj" />
+    <ProjectReference Include="..\..\src\CartonPrinting.Orchestration\CartonPrinting.Orchestration.csproj" />
+    <ProjectReference Include="..\..\src\CartonPrinting.PrintAgent\CartonPrinting.PrintAgent.csproj" />
+    <ProjectReference Include="..\..\src\CartonPrinting.Outbox\CartonPrinting.Outbox.csproj" />
   </ItemGroup>
 
   <ItemGroup>

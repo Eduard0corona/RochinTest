@@ -231,7 +231,7 @@ public sealed class TxaRegisterDetection(SqlDb db)
         var recovered = await GapWriter.RecoverCompletedAsync(conn, tx, d.SiteId, d.StationId, d.PlcEpoch, d.CycleId, plan.EdgeNowUtc, ct);
 
         // 6. Outbox: CartonDetected y, si es terminal sin job, PrintJobResult.
-        await OutboxWriter.InsertCartonDetectedAsync(conn, tx, d.ToEvent(), ct);
+        await OutboxWriter.InsertCartonDetectedAsync(conn, tx, d.ToEvent(), opensGapWithoutDeadline: plan.Gap is not null, ct);
         if (status is DetectionStatus.Blocked or DetectionStatus.Expired)
         {
             var record = await DetectionQueries.GetAsync(conn, tx, d.DetectionId, ct)

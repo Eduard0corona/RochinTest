@@ -158,3 +158,12 @@ El revisor notó archivos sin seguimiento que aparecían en el árbol durante su
 
 - Las pruebas que comparan con la implementación de referencia dependen de Python con jsonschema en el entorno de pruebas.
 - `migrations.AppliedScript` impide reaplicar un `sqlserver_schema.sql` distinto: un cambio futuro del DDL necesitará una migración incremental explícita.
+
+## Fase 1 · Datos e idempotencia lógica (T01, T02, T10, T14, T47)
+
+### Plan
+
+- **Entregables:** capa de datos con `Microsoft.Data.SqlClient` y una clase por transacción (TX-A, TX-B, TX-C, TX-D, TX-E, TX-S, TX-M, TX-X, TX-R0), con las sentencias de `spec/database/sqlserver_operations_reference.sql`; TX-A con el serial obtenido antes, inserción primero, clave existente reconocida por el nombre de la restricción y reintento de 1205; Outbox en la misma transacción; Outbox Relay con publisher confirms y `message-id` = `EventId`; consumidor de prueba con `InboxMessage`.
+- **Pruebas que la cierran:** T01 (tag duplicado), T02 (concurrencia en el claim), T10 (cambio de lote en carrera), T14 (resultado republicado) y T47 (DDL y sentencias de referencia: cada sentencia con 0 y con N filas, cada `THROW` 51001 a 51032 y 52001 con su código exacto).
+- **Decisiones previstas:** la capa de datos implementa ya todas las transacciones porque T47 exige ejecutar cada sentencia de referencia; los servicios que las usan (ingesta, sender, barrido, API) llegan en sus fases. En T01 el "sender" es un arnés de prueba que reclama y escribe a un simulador en memoria que cuenta transmisiones; en la Fase 4 se repite con el sender real y el simulador TCP.
+- **Riesgos:** que una sentencia de referencia o un trigger no ejecute en SQL Server real (sería un defecto de la especificación: sección 6 del prompt); interbloqueos en el claim concurrente.

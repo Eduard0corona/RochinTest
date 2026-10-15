@@ -6,6 +6,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\CartonPrinting.Infrastructure\CartonPrinting.Infrastructure.csproj" />
+    <ProjectReference Include="..\CartonPrinting.Orchestration\CartonPrinting.Orchestration.csproj" />
   </ItemGroup>
 
 </Project>
